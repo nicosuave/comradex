@@ -14,6 +14,7 @@ use comradex::{
     install,
     proxy::App,
     routing::{AffinityStore, Router},
+    service,
     state::Stats,
 };
 use rand::RngCore;
@@ -41,10 +42,21 @@ enum CommandName {
         listener: String,
     },
     Uninstall,
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     Login {
         account: String,
     },
     Stats,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    Install,
+    Uninstall,
+    Status,
 }
 
 #[tokio::main]
@@ -77,6 +89,7 @@ async fn main() -> Result<()> {
             let config = Config::load(&cli.config)?;
             install::uninstall(&state_dir(&config).join("install.json"))
         }
+        CommandName::Service { command } => service_command(&cli.config, command),
         CommandName::Login { account } => login(&cli.config, &account),
         CommandName::Stats => {
             let config = Config::load(&cli.config)?;
@@ -104,6 +117,7 @@ upstream = "https://chatgpt.com/backend-api/codex"
 switch_at = 80
 max_inflight = 64
 max_upgrades = 32
+responses_websocket_mode = "raw"
 installation_secret = "{}"
 affinity_key = "{}"
 
@@ -144,19 +158,23 @@ async fn serve(path: &Path) -> Result<()> {
     let router = Arc::new(Router::new(&config, affinity));
     let stats = Arc::new(Stats::default());
     let app = App::new(config.clone(), router.clone(), stats.clone())?;
-    let mut tasks = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
     for (name, listener) in config.listeners.clone() {
-        tasks.push(tokio::spawn(app.clone().run_listener(name, listener)));
+        tasks.spawn(app.clone().run_listener(name, listener));
     }
     let background_config = config.clone();
     let background_router = router.clone();
     let background_stats = stats.clone();
+    let background_app = app.clone();
     let background = tokio::spawn(async move {
         let mut interval = tokio::time::interval(background_config.snapshot_interval());
         loop {
             interval.tick().await;
             if let Err(e) = background_router.affinity.flush().await {
                 warn!(error = %e, "affinity snapshot failed");
+            }
+            if let Err(e) = background_app.flush_file_owners().await {
+                warn!(error = %e, "file-owner snapshot failed");
             }
             if let Err(e) = background_stats
                 .write(
@@ -169,14 +187,72 @@ async fn serve(path: &Path) -> Result<()> {
             }
         }
     });
-    signal::ctrl_c().await?;
+    let listener_error = tokio::select! {
+        signal = shutdown_signal() => {
+            signal?;
+            None
+        },
+        listener = tasks.join_next() => {
+            Some(match listener {
+                Some(Ok(Ok(()))) => anyhow::anyhow!("listener exited unexpectedly"),
+                Some(Ok(Err(error))) => error.context("listener failed"),
+                Some(Err(error)) => error.into(),
+                None => anyhow::anyhow!("all listeners exited unexpectedly"),
+            })
+        }
+    };
     info!("shutting down");
     background.abort();
-    for task in tasks {
-        task.abort();
-    }
+    let _ = background.await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    app.shutdown_connections().await;
+    router.clear_inflight().await;
     router.affinity.flush().await?;
+    app.flush_file_owners().await?;
     stats.write(state.join("stats.json"), &router).await?;
+    if let Some(error) = listener_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await?;
+        Ok(())
+    }
+}
+
+fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
+    match command {
+        ServiceCommand::Install => {
+            let config = Config::load(config_path)?;
+            let plist = service::install(config_path, &state_dir(&config))?;
+            println!("installed and started {}", plist.display());
+        }
+        ServiceCommand::Uninstall => match service::uninstall()? {
+            Some(path) => println!("stopped service and removed {}", path.display()),
+            None => println!("service is not installed"),
+        },
+        ServiceCommand::Status => {
+            if service::status()? {
+                println!("service is running");
+            } else {
+                println!("service is not running");
+            }
+        }
+    }
     Ok(())
 }
 

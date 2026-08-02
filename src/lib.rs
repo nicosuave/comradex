@@ -3,4 +3,5 @@ pub mod config;
 pub mod install;
 pub mod proxy;
 pub mod routing;
+pub mod service;
 pub mod state;

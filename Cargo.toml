@@ -17,12 +17,14 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "tokio"] }
+libc = "0.2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 toml = "0.9"
 toml_edit = "0.23"
 tracing = "0.1"
