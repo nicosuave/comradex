@@ -8,6 +8,28 @@ The current implementation intentionally supports only native Codex traffic. It 
 
 ## Quick start
 
+Install the latest release with Homebrew:
+
+```sh
+brew install nicosuave/tap/comradex
+```
+
+Or install a prebuilt release with cargo-binstall directly from GitHub:
+
+```sh
+cargo binstall --git https://github.com/nicosuave/comradex comradex
+```
+
+Then create and validate a configuration:
+
+```sh
+comradex init
+comradex check
+comradex serve
+```
+
+To build from source instead:
+
 ```sh
 git clone git@github.com:nicosuave/comradex.git
 cd comradex
