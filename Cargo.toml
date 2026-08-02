@@ -1,0 +1,33 @@
+[package]
+name = "comradex"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A bounded, sticky account-pool router for native Codex traffic"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+blake3 = "1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "tokio"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.9"
+toml_edit = "0.23"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+strip = true

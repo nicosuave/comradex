@@ -1,0 +1,30 @@
+[proxy]
+upstream = "https://chatgpt.com/backend-api/codex"
+switch_at = 80
+max_inflight = 16
+max_upgrades = 8
+state_dir = "/tmp/comradex-state"
+installation_secret = "docker-two-account-secret"
+affinity_key = "docker-two-account-affinity-key-32-bytes"
+
+[listeners.default]
+address = "0.0.0.0:10100"
+pool = "default"
+
+[listeners.reverse]
+address = "0.0.0.0:10101"
+pool = "reverse"
+
+[pools.default]
+members = ["account_a", "account_b"]
+
+[pools.reverse]
+members = ["account_b", "account_a"]
+
+[accounts.account_a]
+kind = "codex_home"
+path = "/accounts/a"
+
+[accounts.account_b]
+kind = "codex_home"
+path = "/accounts/b"

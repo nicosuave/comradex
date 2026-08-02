@@ -1,0 +1,12 @@
+FROM rust:1.96-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates nodejs npm \
+    && npm install --global @openai/codex@0.146.0 \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
+RUN ln -s /usr/local/cargo/bin/cargo /usr/local/bin/cargo \
+    && ln -s /usr/local/cargo/bin/rustc /usr/local/bin/rustc
+
+WORKDIR /work
+ENTRYPOINT ["codex"]

@@ -1,0 +1,5 @@
+/target/
+/comradex.toml
+/state/
+/accounts/
+**/auth.json

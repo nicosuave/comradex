@@ -1,0 +1,18 @@
+[proxy]
+upstream = "https://chatgpt.com/backend-api/codex"
+switch_at = 80
+max_inflight = 16
+max_upgrades = 8
+state_dir = "/tmp/comradex-state"
+installation_secret = "docker-test-route-secret"
+affinity_key = "docker-test-affinity-key-32-bytes-minimum"
+
+[listeners.default]
+address = "0.0.0.0:10100"
+pool = "default"
+
+[pools.default]
+members = ["caller"]
+
+[accounts.caller]
+kind = "inbound"
