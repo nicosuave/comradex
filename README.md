@@ -2,7 +2,7 @@
 
 > Workers of all accounts, unite.
 
-Comradex is a small Rust relay that gives the native Codex App/CLI a sticky, quota-aware collective of ChatGPT accounts without rewriting Codex sessions, rollouts, Responses payloads, SSE events, or WebSocket frames.
+Comradex is a small Rust relay that gives the native Codex App/CLI a sticky, quota-aware collective of ChatGPT accounts without rewriting Codex sessions or rollouts. Raw mode preserves Responses WebSocket bytes; the two frame-aware modes intentionally inspect and, where required for safe recovery, reframe Responses traffic.
 
 The current implementation intentionally supports only native Codex traffic. It has no provider translation, request history, GUI, telemetry, or conversation cache.
 
@@ -22,7 +22,19 @@ In another terminal, install the listener into Codex's existing config:
 cargo run -- install --codex-config "$CODEX_HOME/config.toml"
 ```
 
-This changes only the root `openai_base_url`. It never sets `model_provider` and never reads or writes `sessions/` or `rollouts/`. `uninstall` restores the previous value, but refuses if somebody changed it after installation.
+This changes only the root `openai_base_url`. It preserves a symlinked `config.toml` (including dotfiles-managed configurations), never sets `model_provider`, and never reads or writes `sessions/` or `rollouts/`. Reinstalling updates the Comradex URL without losing the original pre-Comradex value. `uninstall` restores that original value, but refuses if somebody changed it after installation.
+
+On macOS, an installed Comradex binary can manage its own LaunchAgent:
+
+```sh
+comradex --config /absolute/path/to/comradex.toml service install
+comradex --config /absolute/path/to/comradex.toml service status
+comradex service uninstall
+```
+
+The service installer records the exact executable and configuration paths, validates the generated plist, starts the daemon at login, and writes logs beneath Comradex's state directory. Installation waits for launchd to report a running PID and verifies every configured listener with a Comradex-specific HTTP probe; a failed replacement restores the previous Comradex plist and loaded job when possible. It manages only `com.nicosuave.comradex`: it does not inspect, stop, or remove OpenCodex or any other relay. Stop OpenCodex first if it owns the same listener port. Codex configuration installation and service installation remain separate reversible operations.
+
+`service status` reports whether launchd currently has a running Comradex process. `SIGTERM` stops the listeners, aborts and joins tracked HTTP/WebSocket connection tasks, clears in-flight counters, and only then writes final affinity, file-owner, and statistics snapshots. Active requests are terminated rather than gracefully completed during shutdown.
 
 The generated configuration contains the special `caller` account. It forwards the Codex App's inbound `Authorization` and `ChatGPT-Account-Id` headers and never stores or refreshes them.
 
@@ -43,13 +55,23 @@ Then authenticate through the official client:
 cargo run -- login personal_2
 ```
 
-That executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. The daemon reads its `auth.json` for each request, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. Refreshes are single-flight per isolated account and atomically rotate `auth.json`; inbound caller credentials remain unmanaged.
+That executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative account paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`. The daemon reads its `auth.json` for each request, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. Refreshes are single-flight per isolated account and atomically rotate `auth.json`; inbound caller credentials remain unmanaged.
 
 ## Routing contract
 
 Routing recognizes client turn state, accepted Codex session/conversation headers, parent-thread and turn-metadata IDs, request `client_metadata.thread_id`, `previous_response_id`, and `prompt_cache_key`. Values are persisted only as keyed BLAKE3 hashes. Conflicting hard owners and unknown previous-response/turn-state anchors fail closed instead of crossing accounts.
 
-Existing healthy bindings stay put even after usage crosses `switch_at`. The threshold controls only admission of new threads. A pre-output quota response, genuine connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Successful or ambiguous Live Voice creation is never replayed. A managed-account 401 gets one same-account refresh retry; a 401/403 never crosses accounts, and no response is retried after headers or body bytes have reached the client. `Retry-After` and primary/secondary reset windows bound quota cooldowns.
+Uploaded Codex files are account-owned. Comradex records the creating account from successful `/files` responses, pins `/files/{file_id}/uploaded` finalization and Responses requests containing `file_id` to that account, and fails closed for conflicting or partially-known multi-file ownership. Raw file IDs are hashed in a separate bounded `file-owners.json` snapshot and are never persisted directly; account authentication failures do not erase ownership. HTTP requests and the frame-aware WebSocket modes enforce file ownership found in request bodies; raw WebSocket mode intentionally cannot inspect frame-local file IDs.
+
+Responses WebSocket behavior is selected with `proxy.responses_websocket_mode`:
+
+- `raw` is the default and preserves the original handshake-pinned byte relay. One account owns the socket, and Comradex does not inspect its frames.
+- `http_bridge` accepts downstream WebSocket frames and sends each `response.create` through the account-aware HTTP/SSE pipeline. It supersedes an older in-flight turn when a new create arrives and converts bounded, validated SSE or JSON lifecycle events back into WebSocket text frames.
+- `direct` keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend.
+
+Live Voice upgrades are separate from these modes and remain raw, call-bound relays.
+
+Existing healthy bindings stay put even after usage crosses `switch_at`. The threshold controls only admission of new threads. A pre-output quota response, genuine connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry and a 401/403 never crosses accounts. Direct WebSocket mode uses the explicit refresh-then-alternate sequence described above. No response is retried after visible output. `Retry-After` and primary/secondary/tertiary reset windows bound quota cooldowns.
 
 Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file and all bodies have a hard cap. Responses and upgraded streams are forwarded with backpressure and are never retained.
 

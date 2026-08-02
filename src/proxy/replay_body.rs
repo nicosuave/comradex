@@ -26,6 +26,8 @@ pub struct ReplayBody {
     thread_id: Option<String>,
     previous_response_id: Option<String>,
     prompt_cache_key: Option<String>,
+    file_ids: Vec<String>,
+    file_ids_overflow: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,13 +36,16 @@ enum KeyKind {
     ThreadId,
     PreviousResponseId,
     PromptCacheKey,
+    FileId,
+    Type,
     Other,
 }
 
-#[derive(Clone, Copy)]
 struct Container {
     object: bool,
     expect_key: bool,
+    file_id: Option<String>,
+    account_scoped_file: bool,
 }
 
 #[derive(Default)]
@@ -58,17 +63,15 @@ struct MetadataScanner {
     thread_id: Option<String>,
     previous_response_id: Option<String>,
     prompt_cache_key: Option<String>,
+    file_ids: Vec<String>,
+    file_ids_overflow: bool,
     disabled: bool,
 }
 
 impl MetadataScanner {
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            if self.disabled
-                || (self.thread_id.is_some()
-                    && self.previous_response_id.is_some()
-                    && self.prompt_cache_key.is_some())
-            {
+            if self.disabled {
                 return;
             }
             if self.in_string {
@@ -106,6 +109,8 @@ impl MetadataScanner {
                             KeyKind::ThreadId
                                 | KeyKind::PreviousResponseId
                                 | KeyKind::PromptCacheKey
+                                | KeyKind::FileId
+                                | KeyKind::Type
                         )
                     });
                     self.string_is_key = self.capture_value.is_none()
@@ -127,6 +132,8 @@ impl MetadataScanner {
                     self.containers.push(Container {
                         object: true,
                         expect_key: true,
+                        file_id: None,
+                        account_scoped_file: false,
                     });
                     if is_client {
                         self.client_depth = Some(self.containers.len());
@@ -141,13 +148,26 @@ impl MetadataScanner {
                     self.containers.push(Container {
                         object: false,
                         expect_key: false,
+                        file_id: None,
+                        account_scoped_file: false,
                     });
                 }
                 b'}' | b']' => {
                     if self.client_depth == Some(self.containers.len()) {
                         self.client_depth = None;
                     }
-                    self.containers.pop();
+                    if let Some(container) = self.containers.pop()
+                        && container.account_scoped_file
+                        && let Some(file_id) = container.file_id
+                        && !self.file_ids.contains(&file_id)
+                    {
+                        if self.file_ids.len() < 32 {
+                            self.file_ids.push(file_id);
+                        } else {
+                            self.file_ids_overflow = true;
+                            self.disabled = true;
+                        }
+                    }
                     self.pending_value = None;
                     self.key = None;
                 }
@@ -178,6 +198,18 @@ impl MetadataScanner {
                     KeyKind::ThreadId => self.thread_id = value,
                     KeyKind::PreviousResponseId => self.previous_response_id = value,
                     KeyKind::PromptCacheKey => self.prompt_cache_key = value,
+                    KeyKind::FileId => {
+                        if let Some(container) = self.containers.last_mut() {
+                            container.file_id = value;
+                        }
+                    }
+                    KeyKind::Type => {
+                        if let (Some(container), Some(value)) = (self.containers.last_mut(), value)
+                        {
+                            container.account_scoped_file =
+                                matches!(value.as_str(), "input_file" | "input_image");
+                        }
+                    }
                     KeyKind::ClientMetadata | KeyKind::Other => {}
                 }
             }
@@ -192,6 +224,10 @@ impl MetadataScanner {
                 Some(KeyKind::PreviousResponseId)
             } else if at_root && !self.token_overflow && self.token == b"prompt_cache_key" {
                 Some(KeyKind::PromptCacheKey)
+            } else if !self.token_overflow && self.token == b"file_id" {
+                Some(KeyKind::FileId)
+            } else if !self.token_overflow && self.token == b"type" {
+                Some(KeyKind::Type)
             } else {
                 Some(KeyKind::Other)
             };
@@ -240,6 +276,38 @@ enum Storage {
 }
 
 impl ReplayBody {
+    pub fn from_bytes(
+        bytes: Bytes,
+        hard_limit: usize,
+        global_limit: usize,
+        stats: Arc<Stats>,
+    ) -> Result<Self> {
+        if bytes.len() > hard_limit {
+            bail!("request body exceeds configured limit")
+        }
+        let previous = stats
+            .active_spool_bytes
+            .fetch_add(bytes.len(), Ordering::AcqRel);
+        if previous.saturating_add(bytes.len()) > global_limit {
+            stats
+                .active_spool_bytes
+                .fetch_sub(bytes.len(), Ordering::AcqRel);
+            bail!("global replay spool limit exceeded")
+        }
+        let mut metadata = MetadataScanner::default();
+        metadata.feed(&bytes);
+        Ok(Self {
+            len: bytes.len(),
+            storage: Storage::Memory(bytes),
+            stats,
+            thread_id: metadata.thread_id,
+            previous_response_id: metadata.previous_response_id,
+            prompt_cache_key: metadata.prompt_cache_key,
+            file_ids: metadata.file_ids,
+            file_ids_overflow: metadata.file_ids_overflow,
+        })
+    }
+
     pub async fn read(
         incoming: Incoming,
         memory_limit: usize,
@@ -298,6 +366,8 @@ impl ReplayBody {
             thread_id: metadata.thread_id,
             previous_response_id: metadata.previous_response_id,
             prompt_cache_key: metadata.prompt_cache_key,
+            file_ids: metadata.file_ids,
+            file_ids_overflow: metadata.file_ids_overflow,
         })
     }
 
@@ -311,6 +381,14 @@ impl ReplayBody {
 
     pub fn prompt_cache_key(&self) -> Option<&str> {
         self.prompt_cache_key.as_deref()
+    }
+
+    pub fn file_ids(&self) -> &[String] {
+        &self.file_ids
+    }
+
+    pub fn file_ids_overflow(&self) -> bool {
+        self.file_ids_overflow
     }
 
     pub fn body(&mut self, attempt: usize) -> Result<ProxyBody> {
@@ -351,6 +429,10 @@ pub fn json_body(value: serde_json::Value) -> ProxyBody {
         .boxed()
 }
 
+pub fn bytes_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes).map_err(never_to_io).boxed()
+}
+
 fn never_to_io(never: std::convert::Infallible) -> std::io::Error {
     match never {}
 }
@@ -372,5 +454,10 @@ mod tests {
         scanner.feed(br#"{"previous_response_id":"resp_123","prompt_cache_key":"cache_456"}"#);
         assert_eq!(scanner.previous_response_id.as_deref(), Some("resp_123"));
         assert_eq!(scanner.prompt_cache_key.as_deref(), Some("cache_456"));
+        let mut scanner = MetadataScanner::default();
+        scanner.feed(
+            br#"{"input":[{"type":"input_file","file_id":"file_1"},{"file_id":"file_2","type":"input_image"},{"type":"function_call_output","output":{"file_id":"not_an_upload"}}]}"#,
+        );
+        assert_eq!(scanner.file_ids, ["file_1", "file_2"]);
     }
 }

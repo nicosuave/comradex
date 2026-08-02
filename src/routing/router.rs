@@ -8,6 +8,7 @@ use std::{
 };
 
 use tokio::sync::Mutex;
+use tracing::error;
 
 use crate::{
     config::{Config, PoolConfig},
@@ -26,7 +27,6 @@ struct AccountRuntime {
     usage: Option<u8>,
     inflight: u64,
     last_assigned: u64,
-    generation: u64,
     needs_login: bool,
     quota_until: Option<Instant>,
     avoid_until: Option<Instant>,
@@ -69,6 +69,10 @@ impl Router {
             Some(key) => self.affinity.get(key).await,
             None => None,
         };
+        let binding_epoch = match &binding {
+            Some(binding) => Some(self.affinity.account_epoch(&binding.account_id).await),
+            None => None,
+        };
         let mut accounts = self.accounts.lock().await;
         for runtime in accounts.values_mut() {
             if runtime.needs_login && runtime.avoid_until.is_some_and(|until| until <= now) {
@@ -79,7 +83,7 @@ impl Router {
             let eligible = exclude != Some(binding.account_id.as_str())
                 && pool.members.contains(&binding.account_id)
                 && accounts.get(&binding.account_id).is_some_and(|a| {
-                    a.generation == binding.account_generation
+                    binding_epoch == Some(binding.account_generation)
                         && !a.needs_login
                         && a.quota_until.is_none_or(|v| v <= now)
                 });
@@ -125,16 +129,17 @@ impl Router {
                     .cloned()
             })?;
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let generation = {
+        {
             let a = accounts.get_mut(&selected)?;
             a.last_assigned = seq;
-            a.generation
-        };
+        }
+        drop(accounts);
         self.active
             .lock()
             .await
             .insert(pool_name.to_owned(), selected.clone());
         if let Some(key) = thread.clone() {
+            let generation = self.affinity.account_epoch(&selected).await;
             self.affinity.put(key, selected.clone(), generation).await;
         }
         Some(Selection {
@@ -151,15 +156,10 @@ impl Router {
     }
 
     pub async fn bind(&self, key: ThreadKey, account: &str) -> bool {
-        let generation = self
-            .accounts
-            .lock()
-            .await
-            .get(account)
-            .map(|runtime| runtime.generation);
-        let Some(generation) = generation else {
+        if !self.accounts.lock().await.contains_key(account) {
             return false;
-        };
+        }
+        let generation = self.affinity.account_epoch(account).await;
         self.affinity.put(key, account.to_owned(), generation).await;
         true
     }
@@ -184,6 +184,12 @@ impl Router {
             a.inflight = a.inflight.saturating_sub(1);
         }
     }
+
+    pub async fn clear_inflight(&self) {
+        for account in self.accounts.lock().await.values_mut() {
+            account.inflight = 0;
+        }
+    }
     pub async fn quota_failure(&self, account: &str, headers: &hyper::HeaderMap) {
         let delay = quota_delay(headers);
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
@@ -199,9 +205,11 @@ impl Router {
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             a.needs_login = true;
             a.avoid_until = Some(Instant::now() + Duration::from_secs(60));
-            a.generation += 1;
         }
         self.affinity.invalidate_account(account).await;
+        if let Err(error) = self.affinity.flush().await {
+            error!(%error, account, "failed to persist account affinity invalidation");
+        }
     }
     pub async fn observe_headers(&self, account: &str, headers: &hyper::HeaderMap) {
         let candidates = [

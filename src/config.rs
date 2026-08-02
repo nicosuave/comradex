@@ -43,6 +43,15 @@ fn default_flush_seconds() -> u64 {
     5
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesWebsocketMode {
+    #[default]
+    Raw,
+    HttpBridge,
+    Direct,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -62,6 +71,8 @@ pub struct ProxyConfig {
     pub max_inflight: usize,
     #[serde(default = "default_upgrades")]
     pub max_upgrades: usize,
+    #[serde(default)]
+    pub responses_websocket_mode: ResponsesWebsocketMode,
     #[serde(default = "default_replay_memory")]
     pub replay_memory_bytes: usize,
     #[serde(default = "default_request_limit")]
@@ -91,6 +102,7 @@ impl Default for ProxyConfig {
             switch_at: default_switch(),
             max_inflight: default_inflight(),
             max_upgrades: default_upgrades(),
+            responses_websocket_mode: ResponsesWebsocketMode::Raw,
             replay_memory_bytes: default_replay_memory(),
             max_request_bytes: default_request_limit(),
             max_spool_bytes: default_global_spool(),
@@ -125,12 +137,33 @@ pub enum AccountConfig {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let config_path =
+            fs::canonicalize(path).with_context(|| format!("resolve config {}", path.display()))?;
+        let text = fs::read_to_string(&config_path)
+            .with_context(|| format!("read {}", config_path.display()))?;
         let mut value: Self = toml::from_str(&text).context("parse config")?;
-        value.validate()?;
-        if value.proxy.state_dir.is_none() {
-            value.proxy.state_dir = Some(path.parent().unwrap_or(Path::new(".")).join("state"));
+        let config_dir = config_path.parent().unwrap_or(Path::new("."));
+        let state_dir = value
+            .proxy
+            .state_dir
+            .take()
+            .unwrap_or_else(|| PathBuf::from("state"));
+        value.proxy.state_dir = Some(if state_dir.is_absolute() {
+            state_dir
+        } else {
+            config_dir.join(state_dir)
+        });
+        for account in value.accounts.values_mut() {
+            if let AccountConfig::CodexHome { path } = account {
+                if path.as_os_str().is_empty() {
+                    bail!("codex_home account path must not be empty")
+                }
+                if !path.is_absolute() {
+                    *path = config_dir.join(&*path);
+                }
+            }
         }
+        value.validate()?;
         Ok(value)
     }
 
@@ -143,6 +176,22 @@ impl Config {
         }
         if !(1..=100).contains(&self.proxy.switch_at) {
             bail!("proxy.switch_at must be 1..=100")
+        }
+        if self.accounts.len() > 512 {
+            bail!("at most 512 accounts are supported")
+        }
+        for (name, account) in &self.accounts {
+            if name.len() > 256 {
+                bail!("account name exceeds the 256-byte limit")
+            }
+            if let AccountConfig::CodexHome { path } = account {
+                if path.as_os_str().is_empty() {
+                    bail!("account {name} has an empty codex_home path")
+                }
+                if !path.is_absolute() {
+                    bail!("account {name} codex_home path must be absolute after loading")
+                }
+            }
         }
         if self.listeners.is_empty() {
             bail!("at least one listener is required")
@@ -165,5 +214,100 @@ impl Config {
 
     pub fn snapshot_interval(&self) -> Duration {
         Duration::from_secs(self.proxy.snapshot_interval_seconds.max(1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_text(state_dir: Option<&str>) -> String {
+        let state_dir = state_dir
+            .map(|path| format!("state_dir = {path:?}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"[proxy]
+installation_secret = "0123456789abcdef"
+affinity_key = "0123456789abcdef0123456789abcdef"
+{state_dir}
+[listeners.default]
+address = "127.0.0.1:10100"
+pool = "default"
+
+[pools.default]
+members = ["caller"]
+
+[accounts.caller]
+kind = "inbound"
+"#
+        )
+    }
+
+    #[test]
+    fn relative_state_dir_is_resolved_from_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("nested");
+        fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("comradex.toml");
+        fs::write(&path, config_text(Some("state/custom"))).unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            config.proxy.state_dir.unwrap(),
+            fs::canonicalize(&config_dir).unwrap().join("state/custom")
+        );
+    }
+
+    #[test]
+    fn default_state_dir_is_resolved_from_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        fs::write(&path, config_text(None)).unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            config.proxy.state_dir.unwrap(),
+            fs::canonicalize(dir.path()).unwrap().join("state")
+        );
+    }
+
+    #[test]
+    fn relative_account_home_is_resolved_from_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let text = config_text(None)
+            .replace("members = [\"caller\"]", "members = [\"managed\"]")
+            .replace(
+                "[accounts.caller]\nkind = \"inbound\"",
+                "[accounts.managed]\nkind = \"codex_home\"\npath = \"accounts/managed\"",
+            );
+        fs::write(&path, text).unwrap();
+
+        let config = Config::load(&path).unwrap();
+        let AccountConfig::CodexHome { path: account_home } = &config.accounts["managed"] else {
+            panic!("managed account kind changed")
+        };
+        assert_eq!(
+            account_home,
+            &fs::canonicalize(dir.path())
+                .unwrap()
+                .join("accounts/managed")
+        );
+    }
+
+    #[test]
+    fn empty_account_home_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let text = config_text(None)
+            .replace("members = [\"caller\"]", "members = [\"managed\"]")
+            .replace(
+                "[accounts.caller]\nkind = \"inbound\"",
+                "[accounts.managed]\nkind = \"codex_home\"\npath = \"\"",
+            );
+        fs::write(&path, text).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
     }
 }

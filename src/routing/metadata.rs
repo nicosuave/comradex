@@ -14,13 +14,14 @@ pub enum AffinityKind {
     BodyThread,
     PreviousResponse,
     PromptCache,
+    File,
 }
 
 impl AffinityKind {
     pub fn is_hard_continuity(self) -> bool {
         matches!(
             self,
-            Self::TurnState | Self::Session | Self::PreviousResponse
+            Self::TurnState | Self::Session | Self::PreviousResponse | Self::File
         )
     }
 
@@ -31,6 +32,7 @@ impl AffinityKind {
             Self::ParentThread | Self::TurnMetadata | Self::BodyThread => "thread",
             Self::PreviousResponse => "previous-response",
             Self::PromptCache => "prompt-cache",
+            Self::File => "file",
         }
     }
 }
@@ -58,6 +60,7 @@ pub fn affinity_values(
     body_thread_id: Option<&str>,
     previous_response_id: Option<&str>,
     prompt_cache_key: Option<&str>,
+    file_ids: &[String],
 ) -> Vec<AffinityValue> {
     let mut values = Vec::new();
     push_header(
@@ -98,6 +101,9 @@ pub fn affinity_values(
     }
     if let Some(value) = prompt_cache_key {
         push(&mut values, AffinityKind::PromptCache, value.to_owned());
+    }
+    for file_id in file_ids {
+        push(&mut values, AffinityKind::File, file_id.clone());
     }
     values
 }
@@ -194,12 +200,19 @@ mod tests {
         );
 
         h.insert("x-codex-turn-state", HeaderValue::from_static("opaque"));
-        let values = affinity_values(&h, Some("body"), Some("resp_1"), Some("cache_1"));
+        let values = affinity_values(
+            &h,
+            Some("body"),
+            Some("resp_1"),
+            Some("cache_1"),
+            &["file_1".into()],
+        );
         assert_eq!(values[0].kind, AffinityKind::TurnState);
         assert!(
             values
                 .iter()
                 .any(|v| v.kind == AffinityKind::PreviousResponse)
         );
+        assert!(values.iter().any(|v| v.kind == AffinityKind::File));
     }
 }
