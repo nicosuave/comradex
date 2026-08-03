@@ -55,8 +55,11 @@ On macOS, an installed Comradex binary can manage its own LaunchAgent:
 ```sh
 comradex service install
 comradex service status
+comradex service restart
 comradex service uninstall
 ```
+
+The daemon reads `comradex.toml` once at startup, so after editing it (adding an account, changing pools or listeners) run `comradex service restart`. It validates the edited configuration first — a broken edit fails the restart and leaves the running daemon untouched — then bounces the LaunchAgent and waits for every listener to answer a health probe. The config path comes from the installed plist, so it restarts against the configuration the service actually uses regardless of `--config`.
 
 The service installer records the exact executable and configuration paths, validates the generated plist, starts the daemon at login, and writes logs beneath Comradex's state directory. Installation waits for launchd to report a running PID and verifies every configured listener with a Comradex-specific HTTP probe; a failed replacement restores the previous Comradex plist and loaded job when possible. It manages only `com.nicosuave.comradex`: it does not inspect, stop, or remove OpenCodex or any other relay. Stop OpenCodex first if it owns the same listener port. Codex configuration installation and service installation remain separate reversible operations.
 

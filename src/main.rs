@@ -73,6 +73,9 @@ enum ServiceCommand {
     Install,
     Uninstall,
     Status,
+    /// Restart the daemon so it reloads comradex.toml (needed after config
+    /// edits such as adding an account)
+    Restart,
 }
 
 #[tokio::main]
@@ -318,6 +321,10 @@ fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
             } else {
                 println!("service is not running");
             }
+        }
+        ServiceCommand::Restart => {
+            service::restart()?;
+            println!("service restarted");
         }
     }
     Ok(())

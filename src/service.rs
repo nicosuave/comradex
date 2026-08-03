@@ -221,6 +221,70 @@ pub fn status() -> Result<bool> {
     is_running(&launchctl_domain())
 }
 
+/// Restart the installed LaunchAgent so the daemon reloads its configuration.
+/// The config path and readiness nonce come from the installed plist rather
+/// than the CLI, and the configuration is validated before the daemon is
+/// bounced so a broken edit fails here instead of taking the service down.
+pub fn restart() -> Result<()> {
+    platform_check()?;
+    let plist_path = plist_path()?;
+    let plist = match fs::read_to_string(&plist_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("service is not installed (run `comradex service install`)")
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
+    };
+    let config_path = plist_program_config(&plist)
+        .with_context(|| format!("no --config argument recorded in {}", plist_path.display()))?;
+    let config = crate::config::Config::load(&config_path)?;
+    let listener_addresses: Vec<_> = config
+        .listeners
+        .values()
+        .map(|listener| listener.address)
+        .collect();
+    let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
+    let domain = launchctl_domain();
+    if is_loaded(&domain)? {
+        kickstart(&domain)?;
+    } else {
+        bootstrap(&domain, &plist_path)?;
+    }
+    match &service_nonce {
+        Some(nonce) => wait_until_ready(&domain, &listener_addresses, Some(nonce), READY_TIMEOUT),
+        None => wait_until_ready(&domain, &[], None, READY_TIMEOUT),
+    }
+}
+
+fn plist_program_config(plist: &str) -> Option<PathBuf> {
+    plist_string_after(plist, "<string>--config</string><string>").map(PathBuf::from)
+}
+
+fn plist_string_after(plist: &str, marker: &str) -> Option<String> {
+    let start = plist.find(marker)? + marker.len();
+    let end = plist[start..].find("</string>")?;
+    Some(xml_unescape(&plist[start..start + end]))
+}
+
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn kickstart(domain: &str) -> Result<()> {
+    let status = Command::new("launchctl")
+        .args(["kickstart", "-k", &format!("{domain}/{LABEL}")])
+        .status()
+        .context("launch launchctl kickstart")?;
+    if !status.success() {
+        bail!("launchctl kickstart exited with {status}")
+    }
+    Ok(())
+}
+
 fn is_loaded(domain: &str) -> Result<bool> {
     Ok(launchctl_print(domain)?.is_some())
 }
@@ -408,6 +472,24 @@ mod tests {
     #[test]
     fn xml_escapes_paths() {
         assert_eq!(xml(Path::new("a&<b>\"c'")), "a&amp;&lt;b&gt;&quot;c&apos;");
+    }
+
+    #[test]
+    fn restart_reads_config_path_and_nonce_from_rendered_plist() {
+        let config = Path::new("/tmp/config<comradex>&'\".toml");
+        let plist = render_plist(
+            Path::new("/usr/local/bin/comradex"),
+            config,
+            Path::new("/tmp"),
+            Path::new("/tmp/out.log"),
+            Path::new("/tmp/err.log"),
+            "nonce123",
+        );
+        assert_eq!(plist_program_config(&plist).unwrap(), config);
+        assert_eq!(
+            plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>").unwrap(),
+            "nonce123"
+        );
     }
 
     #[test]
