@@ -48,6 +48,14 @@ comradex install
 
 This edits `$CODEX_HOME/config.toml` (falling back to `~/.codex/config.toml`; override with `--codex-config`) and changes only the root `openai_base_url`. It preserves a symlinked `config.toml` (including dotfiles-managed configurations), never sets `model_provider`, and never reads or writes `sessions/` or `rollouts/`. Reinstalling updates the Comradex URL without losing the original pre-Comradex value. `uninstall` restores that original value, but refuses if somebody changed it after installation.
 
+The single line it writes looks like:
+
+```toml
+openai_base_url = "http://127.0.0.1:10100/<installation_secret>/v1"
+```
+
+The address is the chosen listener's (`--listener` selects which listener — and therefore which pool — serves the traffic), and `<installation_secret>` is the random per-installation token `init` generated into `comradex.toml`. Codex treats the whole thing as an ordinary base URL, so every request it makes arrives with the secret as a path prefix. The daemon rejects any request whose path does not start with `/<installation_secret>/v1`: the listener binds to loopback, but any local process can open a loopback port, and the secret prefix is what stops other software from discovering an open relay to your accounts. Comradex strips the prefix, applies pool routing to pick an account, swaps in that account's credentials, and forwards the request (path, query, and body intact) to `proxy.upstream` — `https://chatgpt.com/backend-api/codex` by default. The original `openai_base_url` is kept in `state/install.json` as the recovery record `uninstall` restores from.
+
 Rewriting the config on disk is not enough while long-lived `codex app-server` processes (the Codex desktop app's background host, or CLI hosts) keep the previous `openai_base_url` in memory. `install` and `uninstall` warn when such processes are running; pass `--restart-codex`, or run `comradex restart-codex`, to send SIGTERM to exactly those processes (active turns may be interrupted). Matching is narrow — a Codex binary running the `app-server` subcommand, or a `codex-code-mode-host` entrypoint, owned by the current user — never a broad `*codex*` pattern, and never SIGKILL. The desktop app respawns its app-server automatically.
 
 On macOS, an installed Comradex binary can manage its own LaunchAgent:
