@@ -182,7 +182,7 @@ HTTP requests and the frame-aware WebSocket modes enforce file ownership found i
 
 Existing healthy bindings stay put even after usage crosses `switch_at`; the threshold controls only admission of new threads.
 
-A pre-output quota response, genuine connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry, and a 401/403 never crosses accounts. No response is retried after visible output. `Retry-After` and primary, secondary, and tertiary reset windows bound quota cooldowns.
+A pre-output quota response, account-scoped connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Shared DNS and network-reachability failures remain account-neutral and do not rotate credentials. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry, and a 401/403 never crosses accounts. No response is retried after visible output. When no alternate is eligible, the original upstream rejection and its `Retry-After` or reset headers are preserved; primary, secondary, and tertiary reset windows bound quota cooldowns.
 
 Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file, and all bodies have a hard cap. Responses and upgraded streams are forwarded with backpressure and are never retained.
 
@@ -192,7 +192,7 @@ Select behavior with `proxy.responses_websocket_mode`:
 
 - `raw` is the default and preserves the original handshake-pinned byte relay. One account owns the socket, and Comradex does not inspect its frames.
 - `http_bridge` accepts downstream WebSocket frames and sends each `response.create` through the account-aware HTTP/SSE pipeline. It supersedes an older in-flight turn when a new create arrives and converts bounded, validated SSE or JSON lifecycle events back into WebSocket text frames.
-- `direct` keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend.
+- `direct` keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend. If safe internal replay is unavailable, it preserves Codex's canonical `previous_response_not_found` retry classifier while removing account-scoped details.
 
 Direct mode uses the explicit refresh-then-alternate sequence above. Live Voice upgrades are separate from these modes and remain raw, call-bound relays.
 
