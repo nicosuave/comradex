@@ -657,12 +657,14 @@ impl App {
                         }
                     }
                     if retry && attempt == 0 && !hard_owner {
-                        selected = self
+                        let alternate = self
                             .router
                             .select(&listener.pool, pool, None, Some(&account))
-                            .await
-                            .context("no alternate account")?;
-                        continue;
+                            .await;
+                        if let Some(alternate) = alternate {
+                            selected = alternate;
+                            continue;
+                        }
                     }
                     request_lease.disarm();
                     return Ok(map_http_response_leased(
@@ -673,6 +675,10 @@ impl App {
                     ));
                 }
                 Err(e) => {
+                    if is_account_neutral_connect_failure(&e) {
+                        warn!(account, error = %e, "shared upstream network failure");
+                        return Err(e);
+                    }
                     if attempt == 0
                         && is_connect_failure(&e)
                         && !hard_owner
@@ -1508,21 +1514,9 @@ impl App {
                                         .unwrap_or("");
                                     client
                                         .send(Message::Text(
-                                            serde_json::json!({
-                                                "type": "response.failed",
-                                                "response": {
-                                                    "id": response_id,
-                                                    "status": "failed",
-                                                    "error": {
-                                                        "type": "server_error",
-                                                        "code": "stream_incomplete",
-                                                        "message": "upstream continuity could not be resumed; retry the task",
-                                                        "retryable": true
-                                                    }
-                                                }
-                                            })
-                                            .to_string()
-                                            .into(),
+                                            previous_response_not_found_event(response_id)
+                                                .to_string()
+                                                .into(),
                                         ))
                                         .await?;
                                     let _ = protocol.settle(turn_id, Settlement::Failed);
@@ -1534,12 +1528,11 @@ impl App {
                                 // Never expose account-scoped continuity identifiers from an
                                 // unassociated upstream miss. It may belong to another in-flight
                                 // request, so keep our pending turns alive.
-                                send_direct_error(
-                                    &mut client,
-                                    "stream_incomplete",
-                                    "upstream continuity could not be resumed",
-                                )
-                                .await?;
+                                client
+                                    .send(Message::Text(
+                                        previous_response_not_found_error().to_string().into(),
+                                    ))
+                                    .await?;
                                 continue;
                             }
                             if association.event_type.as_deref() == Some("response.created") {
@@ -2359,6 +2352,31 @@ fn is_connect_failure(error: &anyhow::Error) -> bool {
         .is_some_and(hyper_util::client::legacy::Error::is_connect)
 }
 
+fn is_account_neutral_connect_failure(error: &anyhow::Error) -> bool {
+    is_connect_failure(error)
+        // HttpConnector wraps resolver failures in its private ConnectError with this
+        // fixed label; the nested io::Error has no portable kind or raw OS code.
+        && (error.chain().any(|source| source.to_string() == "dns error")
+            || error
+                .chain()
+                .filter_map(|source| source.downcast_ref::<std::io::Error>())
+                .any(is_shared_network_io_error))
+}
+
+fn is_shared_network_io_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::AddrNotAvailable
+    ) {
+        return true;
+    }
+    error.raw_os_error().is_some_and(|code| {
+        code == libc::ENETDOWN || code == libc::ENETUNREACH || code == libc::EHOSTUNREACH
+    })
+}
+
 fn map_http_response(response: Response<Incoming>) -> Response<ProxyBody> {
     let (mut parts, body) = response.into_parts();
     headers::strip_hop_by_hop(&mut parts.headers);
@@ -2661,6 +2679,33 @@ async fn send_direct_error(
         ))
         .await?;
     Ok(())
+}
+
+fn previous_response_not_found_event(response_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "status": "failed",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "previous_response_not_found",
+                "message": "Previous response was not found. Retrying the full request.",
+                "retryable": true
+            }
+        }
+    })
+}
+
+fn previous_response_not_found_error() -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": "previous_response_not_found",
+            "message": "Previous response was not found. Retrying the full request."
+        }
+    })
 }
 
 fn direct_failure_turns(
@@ -3072,6 +3117,47 @@ mod tests {
     }
 
     #[test]
+    fn only_shared_reachability_errors_are_account_neutral() {
+        for kind in [
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(is_shared_network_io_error(&std::io::Error::from(kind)));
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert!(!is_shared_network_io_error(&std::io::Error::from(kind)));
+        }
+        assert!(is_shared_network_io_error(
+            &std::io::Error::from_raw_os_error(libc::ENETUNREACH,)
+        ));
+    }
+
+    #[test]
+    fn stale_anchor_errors_keep_the_codex_retry_classifier() {
+        let associated = previous_response_not_found_event("resp_current");
+        assert_eq!(
+            associated
+                .pointer("/response/error/code")
+                .and_then(serde_json::Value::as_str),
+            Some("previous_response_not_found")
+        );
+        let unassociated = previous_response_not_found_error();
+        assert_eq!(
+            unassociated
+                .pointer("/error/code")
+                .and_then(serde_json::Value::as_str),
+            Some("previous_response_not_found")
+        );
+        assert!(!associated.to_string().contains("previous_response_id"));
+        assert!(!unassociated.to_string().contains("previous_response_id"));
+    }
+
+    #[test]
     fn file_finalization_requires_explicit_success_status() {
         assert!(is_authoritative_file_finalize_success(
             br#"{"status":"success"}"#
@@ -3244,6 +3330,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_quota_response_when_no_alternate_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_task = calls.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let calls = calls_task.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_req: Request<Incoming>| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::TOO_MANY_REQUESTS)
+                                    .header("retry-after", "17")
+                                    .header("x-codex-primary-reset-after-seconds", "23")
+                                    .body(Full::new(Bytes::from_static(b"quota")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::Raw,
+        )
+        .await;
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "http://{proxy_addr}/0123456789abcdef/v1/responses/compact"
+            ))
+            .header(AUTHORIZATION, "Bearer caller-token")
+            .body(Full::new(Bytes::from_static(br#"{"input":"compact"}"#)))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "17");
+        assert_eq!(
+            response.headers()["x-codex-primary-reset-after-seconds"],
+            "23"
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "quota"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn dns_failure_does_not_make_the_account_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proxy_addr, proxy_task, router) = start_caller_proxy_with_router(
+            dir.path(),
+            "http://comradex-account-neutral.invalid/backend-api/codex".into(),
+            ResponsesWebsocketMode::Raw,
+        )
+        .await;
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "http://{proxy_addr}/0123456789abcdef/v1/responses/compact"
+            ))
+            .header(AUTHORIZATION, "Bearer caller-token")
+            .body(Full::new(Bytes::from_static(br#"{"input":"compact"}"#)))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            router
+                .select(
+                    "default",
+                    &PoolConfig {
+                        members: vec!["caller".into()],
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .is_some()
+        );
+
+        proxy_task.abort();
+    }
+
+    #[tokio::test]
     async fn uploaded_file_routes_finalize_and_responses_to_creator() {
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
@@ -3389,6 +3577,19 @@ mod tests {
         upstream: String,
         mode: ResponsesWebsocketMode,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+        let (address, task, _) = start_caller_proxy_with_router(dir, upstream, mode).await;
+        (address, task)
+    }
+
+    async fn start_caller_proxy_with_router(
+        dir: &std::path::Path,
+        upstream: String,
+        mode: ResponsesWebsocketMode,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<Router>,
+    ) {
         let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_tcp.local_addr().unwrap();
         let listener = ListenerConfig {
@@ -3424,9 +3625,9 @@ mod tests {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new(config, router, Arc::new(Stats::default())).unwrap();
+        let app = App::new(config, router.clone(), Arc::new(Stats::default())).unwrap();
         let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
-        (proxy_addr, task)
+        (proxy_addr, task, router)
     }
 
     async fn connect_test_websocket(address: std::net::SocketAddr) -> WebSocketStream<TcpStream> {
