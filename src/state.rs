@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::routing::Router;
 
@@ -19,16 +19,16 @@ pub struct Stats {
     pub active_spool_bytes: AtomicUsize,
 }
 
-#[derive(Serialize)]
-struct StatsSnapshot {
-    inflight_http: usize,
-    open_upgrades: usize,
-    affinity_entries: usize,
-    affinity_bytes: usize,
-    active_spool_bytes: usize,
-    quota_records: usize,
-    health_records: usize,
-    refresh_inflight: usize,
+#[derive(Serialize, Deserialize)]
+pub struct StatsSnapshot {
+    pub inflight_http: usize,
+    pub open_upgrades: usize,
+    pub affinity_entries: usize,
+    pub affinity_bytes: usize,
+    pub active_spool_bytes: usize,
+    pub quota_records: usize,
+    pub health_records: usize,
+    pub refresh_inflight: usize,
 }
 
 impl Stats {

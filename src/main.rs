@@ -69,7 +69,12 @@ enum CommandName {
     Login {
         account: String,
     },
-    Stats,
+    /// Show configuration, service, Codex wiring, accounts, and live traffic
+    Status {
+        /// Print the raw stats snapshot as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -155,15 +160,7 @@ async fn main() -> Result<()> {
         CommandName::Account { command } => account_command(&config_path, command),
         CommandName::Service { command } => service_command(&config_path, command),
         CommandName::Login { account } => login(&config_path, &account),
-        CommandName::Stats => {
-            let config = load_config(&config_path)?;
-            println!(
-                "{}",
-                fs::read_to_string(state_dir(&config).join("stats.json"))
-                    .context("daemon has not written stats yet")?
-            );
-            Ok(())
-        }
+        CommandName::Status { json } => status(&config_path, json),
     }
 }
 
@@ -224,9 +221,9 @@ address = "127.0.0.1:10100"
 pool = "default"
 
 [pools.default]
-members = ["caller"]
+members = ["app"]
 
-[accounts.caller]
+[accounts.app]
 kind = "inbound"
 "#,
         URL_SAFE_NO_PAD.encode(secret),
@@ -373,6 +370,105 @@ fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) 
     Ok(())
 }
 
+fn status(config_path: &Path, json: bool) -> Result<()> {
+    let config = load_config(config_path)?;
+    let state = state_dir(&config);
+    let snapshot = fs::read(state.join("stats.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<comradex::state::StatsSnapshot>(&bytes).ok());
+    if json {
+        let snapshot = snapshot.context("daemon has not written stats yet")?;
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        return Ok(());
+    }
+
+    println!("config   {}", config_path.display());
+    println!(
+        "         {} listener(s), {} pool(s), {} account(s)",
+        config.listeners.len(),
+        config.pools.len(),
+        config.accounts.len()
+    );
+
+    let service = match (service::installed(), service::status()) {
+        (Ok(true), Ok(true)) => "running".to_owned(),
+        (Ok(true), Ok(false)) => "installed but not running".to_owned(),
+        (Ok(false), _) => "not installed (run `comradex service install`)".to_owned(),
+        (Err(error), _) | (_, Err(error)) => format!("unknown ({error})"),
+    };
+    println!("service  {service}");
+
+    match install::installed_record(&state.join("install.json")) {
+        Some(record) => println!(
+            "codex    routed through Comradex via {}",
+            record.codex_config.display()
+        ),
+        None => println!("codex    not routed through Comradex (run `comradex install`)"),
+    }
+
+    println!("\naccounts");
+    let width = config.accounts.keys().map(String::len).max().unwrap_or(0);
+    for (name, account) in &config.accounts {
+        let pools: Vec<&str> = config
+            .pools
+            .iter()
+            .filter(|(_, pool)| pool.members.iter().any(|member| member == name))
+            .map(|(pool_name, _)| pool_name.as_str())
+            .collect();
+        let pools = if pools.is_empty() {
+            "unused".to_owned()
+        } else {
+            format!("pool {}", pools.join(", "))
+        };
+        println!("  {name:width$}  {:24}  {pools}", account_state(account));
+    }
+
+    println!("\ntraffic");
+    match snapshot {
+        Some(stats) => {
+            println!(
+                "  {} request(s) in flight, {} open connection(s)",
+                stats.inflight_http, stats.open_upgrades
+            );
+            println!(
+                "  {} sticky conversation(s) remembered ({})",
+                stats.affinity_entries,
+                human_bytes(stats.affinity_bytes)
+            );
+            if stats.active_spool_bytes > 0 {
+                println!(
+                    "  {} buffered on disk",
+                    human_bytes(stats.active_spool_bytes)
+                );
+            }
+        }
+        None => println!("  no snapshot yet (the daemon writes one every few seconds)"),
+    }
+    Ok(())
+}
+
+/// Short, plain-language state for one account.
+fn account_state(account: &comradex::config::AccountConfig) -> String {
+    match account {
+        comradex::config::AccountConfig::Inbound => "Codex App login".to_owned(),
+        comradex::config::AccountConfig::CodexHome { path } => {
+            if path.join("auth.json").exists() {
+                "signed in".to_owned()
+            } else {
+                "not signed in".to_owned()
+            }
+        }
+    }
+}
+
+fn human_bytes(bytes: usize) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.0),
+    }
+}
+
 fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
     match command {
         AccountCommand::Add {
@@ -409,20 +505,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
                 } else {
                     pools.join(", ")
                 };
-                let detail = match account {
-                    comradex::config::AccountConfig::Inbound => {
-                        "your Codex App login, forwarded as-is (Comradex never stores it)".into()
-                    }
-                    comradex::config::AccountConfig::CodexHome { path } => {
-                        if path.join("auth.json").exists() {
-                            format!("signed in, credentials at {}", path.display())
-                        } else {
-                            format!("not signed in yet - run `comradex login {name}`")
-                        }
-                    }
-                };
-                println!("{name:width$}  {detail}");
-                println!("{:width$}  pools: {pools}", "");
+                println!("{name:width$}  {:16}  pool {pools}", account_state(account));
             }
             Ok(())
         }
@@ -552,7 +635,7 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
         .get(account_name)
         .with_context(|| format!("unknown account {account_name}"))?;
     let comradex::config::AccountConfig::CodexHome { path } = account else {
-        bail!("inbound caller account is owned by Codex App and cannot be logged in here")
+        bail!("this is the Codex App's own login and cannot be logged in here")
     };
     fs::create_dir_all(path)?;
     let status = Command::new("codex")

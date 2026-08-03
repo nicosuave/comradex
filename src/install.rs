@@ -8,10 +8,15 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, value};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct InstallRecord {
-    codex_config: PathBuf,
-    installed_url: String,
-    previous_url: Option<String>,
+pub struct InstallRecord {
+    pub codex_config: PathBuf,
+    pub installed_url: String,
+    pub previous_url: Option<String>,
+}
+
+/// The Codex configuration Comradex is currently installed into, if any.
+pub fn installed_record(record_path: &Path) -> Option<InstallRecord> {
+    read_install_record(record_path).ok().flatten()
 }
 
 pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<()> {

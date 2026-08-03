@@ -73,7 +73,7 @@ The service installer records the exact executable and configuration paths, vali
 
 `service status` reports whether launchd currently has a running Comradex process. `SIGTERM` stops the listeners, aborts and joins tracked HTTP/WebSocket connection tasks, clears in-flight counters, and only then writes final affinity, file-owner, and statistics snapshots. Active requests are terminated rather than gracefully completed during shutdown.
 
-The generated configuration contains the special `caller` account. It forwards the Codex App's inbound `Authorization` and `ChatGPT-Account-Id` headers and never stores or refreshes them.
+The generated configuration contains the special `app` account. It forwards the Codex App's inbound `Authorization` and `ChatGPT-Account-Id` headers and never stores or refreshes them.
 
 Add a managed account in one step:
 
@@ -91,7 +91,7 @@ kind = "codex_home"
 path = "/absolute/path/to/comradex/accounts/personal-2"
 
 [pools.default]
-members = ["caller", "personal_2"]
+members = ["app", "personal_2"]
 ```
 
 Then authenticate through the official client:
@@ -100,7 +100,7 @@ Then authenticate through the official client:
 comradex login personal_2
 ```
 
-That executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative account paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`. The daemon reads its `auth.json` for each request, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. Refreshes are single-flight per isolated account and atomically rotate `auth.json`; inbound caller credentials remain unmanaged.
+That executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative account paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`. The daemon reads its `auth.json` for each request, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. Refreshes are single-flight per isolated account and atomically rotate `auth.json`; the Codex App's own credentials remain unmanaged.
 
 ## Routing contract
 
