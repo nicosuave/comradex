@@ -396,6 +396,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
         }
         AccountCommand::List => {
             let config = load_config(config_path)?;
+            let width = config.accounts.keys().map(String::len).max().unwrap_or(0);
             for (name, account) in &config.accounts {
                 let pools: Vec<&str> = config
                     .pools
@@ -403,18 +404,25 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
                     .filter(|(_, pool)| pool.members.iter().any(|member| member == name))
                     .map(|(pool_name, _)| pool_name.as_str())
                     .collect();
+                let pools = if pools.is_empty() {
+                    "none (unused)".to_owned()
+                } else {
+                    pools.join(", ")
+                };
                 let detail = match account {
-                    comradex::config::AccountConfig::Inbound => "inbound (caller-owned)".into(),
+                    comradex::config::AccountConfig::Inbound => {
+                        "your Codex App login, forwarded as-is (Comradex never stores it)".into()
+                    }
                     comradex::config::AccountConfig::CodexHome { path } => {
-                        let state = if path.join("auth.json").exists() {
-                            "logged in"
+                        if path.join("auth.json").exists() {
+                            format!("signed in, credentials at {}", path.display())
                         } else {
-                            "not logged in"
-                        };
-                        format!("codex_home {} ({state})", path.display())
+                            format!("not signed in yet - run `comradex login {name}`")
+                        }
                     }
                 };
-                println!("{name}: {detail}, pools: [{}]", pools.join(", "));
+                println!("{name:width$}  {detail}");
+                println!("{:width$}  pools: {pools}", "");
             }
             Ok(())
         }
