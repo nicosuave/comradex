@@ -67,7 +67,15 @@ The service installer records the exact executable and configuration paths, vali
 
 The generated configuration contains the special `caller` account. It forwards the Codex App's inbound `Authorization` and `ChatGPT-Account-Id` headers and never stores or refreshes them.
 
-Add isolated accounts and pools manually:
+Add a managed account in one step:
+
+```sh
+comradex account add personal_2
+```
+
+That appends a `codex_home` account (home directory `accounts/personal_2` next to the config), adds it to the pool (`--pool` to choose another), validates the edited configuration through the full loader before persisting it, restarts the daemon if the service is installed, and runs the interactive device login (`--no-login` to defer it). `comradex account list` shows each account's login state; `comradex account remove <name>` takes it out of the configuration and every pool, keeping the credentials directory unless `--purge` is passed.
+
+The equivalent manual configuration:
 
 ```toml
 [accounts.personal_2]
@@ -81,7 +89,7 @@ members = ["caller", "personal_2"]
 Then authenticate through the official client:
 
 ```sh
-cargo run -- login personal_2
+comradex login personal_2
 ```
 
 That executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative account paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`. The daemon reads its `auth.json` for each request, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. Refreshes are single-flight per isolated account and atomically rotate `auth.json`; inbound caller credentials remain unmanaged.

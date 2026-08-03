@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod auth;
 pub mod codex_process;
 pub mod config;

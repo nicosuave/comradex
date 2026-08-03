@@ -221,6 +221,11 @@ pub fn status() -> Result<bool> {
     is_running(&launchctl_domain())
 }
 
+pub fn installed() -> Result<bool> {
+    platform_check()?;
+    Ok(plist_path()?.exists())
+}
+
 /// Restart the installed LaunchAgent so the daemon reloads its configuration.
 /// The config path and readiness nonce come from the installed plist rather
 /// than the CLI, and the configuration is validated before the daemon is

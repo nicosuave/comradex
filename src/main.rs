@@ -58,6 +58,10 @@ enum CommandName {
     /// SIGTERM running Codex app-server processes (the desktop app respawns
     /// its app-server); needed after openai_base_url changes on disk
     RestartCodex,
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -66,6 +70,29 @@ enum CommandName {
         account: String,
     },
     Stats,
+}
+
+#[derive(Subcommand)]
+enum AccountCommand {
+    /// Add a managed account: create its isolated codex_home, add it to a
+    /// pool, log it in, and restart the daemon
+    Add {
+        name: String,
+        #[arg(long, default_value = "default")]
+        pool: String,
+        /// Skip the interactive device login (run `comradex login <name>` later)
+        #[arg(long)]
+        no_login: bool,
+    },
+    /// List configured accounts and their login state
+    List,
+    /// Remove an account from the configuration and all pools
+    Remove {
+        name: String,
+        /// Also delete the account's codex_home directory (credentials)
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -125,6 +152,7 @@ async fn main() -> Result<()> {
             handle_running_codex(restart_codex)
         }
         CommandName::RestartCodex => handle_running_codex(true),
+        CommandName::Account { command } => account_command(&config_path, command),
         CommandName::Service { command } => service_command(&config_path, command),
         CommandName::Login { account } => login(&config_path, &account),
         CommandName::Stats => {
@@ -342,6 +370,116 @@ fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) 
     );
     install::install(codex_config, &state_dir(&config).join("install.json"), &url)?;
     println!("installed openai_base_url = {url}");
+    Ok(())
+}
+
+fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
+    match command {
+        AccountCommand::Add {
+            name,
+            pool,
+            no_login,
+        } => {
+            load_config(config_path)?;
+            let text = fs::read_to_string(config_path)
+                .with_context(|| format!("read {}", config_path.display()))?;
+            let updated = comradex::accounts::add_account(&text, &name, &pool)?;
+            write_config_validated(config_path, &updated)?;
+            println!("added account {name} to pool {pool}");
+            reload_daemon()?;
+            if no_login {
+                println!("run `comradex login {name}` to log the account in");
+            } else {
+                login(config_path, &name)?;
+            }
+            Ok(())
+        }
+        AccountCommand::List => {
+            let config = load_config(config_path)?;
+            for (name, account) in &config.accounts {
+                let pools: Vec<&str> = config
+                    .pools
+                    .iter()
+                    .filter(|(_, pool)| pool.members.iter().any(|member| member == name))
+                    .map(|(pool_name, _)| pool_name.as_str())
+                    .collect();
+                let detail = match account {
+                    comradex::config::AccountConfig::Inbound => "inbound (caller-owned)".into(),
+                    comradex::config::AccountConfig::CodexHome { path } => {
+                        let state = if path.join("auth.json").exists() {
+                            "logged in"
+                        } else {
+                            "not logged in"
+                        };
+                        format!("codex_home {} ({state})", path.display())
+                    }
+                };
+                println!("{name}: {detail}, pools: [{}]", pools.join(", "));
+            }
+            Ok(())
+        }
+        AccountCommand::Remove { name, purge } => {
+            let config = load_config(config_path)?;
+            let text = fs::read_to_string(config_path)
+                .with_context(|| format!("read {}", config_path.display()))?;
+            let (updated, _) = comradex::accounts::remove_account(&text, &name)?;
+            write_config_validated(config_path, &updated)?;
+            println!("removed account {name}");
+            reload_daemon()?;
+            // Resolve the home from the already-loaded config so relative
+            // paths are anchored to the config directory, not the CWD.
+            if let Some(comradex::config::AccountConfig::CodexHome { path }) =
+                config.accounts.get(&name)
+            {
+                if purge {
+                    match fs::remove_dir_all(path) {
+                        Ok(()) => println!("deleted {}", path.display()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("delete {}", path.display()));
+                        }
+                    }
+                } else if path.exists() {
+                    println!(
+                        "credentials kept at {} (pass --purge to delete them)",
+                        path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Persist an edited configuration only after the full loader accepts it: the
+/// candidate is written next to the config so relative paths resolve
+/// identically, validated with Config::load, then swapped into place.
+fn write_config_validated(config_path: &Path, text: &str) -> Result<()> {
+    let parent = config_path.parent().unwrap_or(Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .suffix(".toml")
+        .tempfile_in(parent)?;
+    std::io::Write::write_all(&mut temp, text.as_bytes())?;
+    temp.as_file().sync_all()?;
+    Config::load(temp.path()).context("validate updated configuration")?;
+    if let Ok(metadata) = fs::metadata(config_path) {
+        temp.as_file().set_permissions(metadata.permissions())?;
+    }
+    temp.persist(config_path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Bounce the daemon after a config change when it is installed as a service;
+/// otherwise leave a reminder. Login is not needed before the restart because
+/// the daemon re-reads each account's auth.json per request.
+fn reload_daemon() -> Result<()> {
+    if service::installed().unwrap_or(false) {
+        service::restart()?;
+        println!("service restarted");
+    } else {
+        println!("restart the comradex daemon to pick up the configuration change");
+    }
     Ok(())
 }
 
