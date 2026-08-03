@@ -102,17 +102,20 @@ pub fn uninstall(record_path: &Path) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    use std::io::Write;
-    temp.write_all(bytes)?;
-    if let Ok(metadata) = fs::metadata(path) {
-        temp.as_file().set_permissions(metadata.permissions())?;
-    }
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    let write = || -> Result<()> {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        use std::io::Write;
+        temp.write_all(bytes)?;
+        if let Ok(metadata) = fs::metadata(path) {
+            temp.as_file().set_permissions(metadata.permissions())?;
+        }
+        temp.as_file().sync_all()?;
+        temp.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    };
+    write().with_context(|| format!("write {}", path.display()))
 }
 
 fn resolve_destination(path: &Path) -> Result<PathBuf> {

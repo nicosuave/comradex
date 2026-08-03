@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod codex_process;
 pub mod config;
 pub mod install;
 pub mod proxy;

@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use comradex::{
+    codex_process::{self, ProcessControl, SystemProcesses},
     config::Config,
     install,
     proxy::App,
@@ -24,8 +25,9 @@ use tracing::{info, warn};
 #[derive(Parser)]
 #[command(name = "comradex", version, about)]
 struct Cli {
-    #[arg(long, default_value = "comradex.toml", global = true)]
-    config: PathBuf,
+    /// Comradex configuration file [default: ~/.config/comradex/comradex.toml]
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: CommandName,
 }
@@ -36,12 +38,26 @@ enum CommandName {
     Check,
     Serve,
     Install {
+        /// Codex config.toml to point at Comradex
+        /// [default: $CODEX_HOME/config.toml, or ~/.codex/config.toml]
         #[arg(long)]
-        codex_config: PathBuf,
+        codex_config: Option<PathBuf>,
         #[arg(long, default_value = "default")]
         listener: String,
+        /// SIGTERM running Codex app-server processes so they pick up the new
+        /// openai_base_url (active turns may be interrupted)
+        #[arg(long)]
+        restart_codex: bool,
     },
-    Uninstall,
+    Uninstall {
+        /// SIGTERM running Codex app-server processes so they pick up the
+        /// restored openai_base_url (active turns may be interrupted)
+        #[arg(long)]
+        restart_codex: bool,
+    },
+    /// SIGTERM running Codex app-server processes (the desktop app respawns
+    /// its app-server); needed after openai_base_url changes on disk
+    RestartCodex,
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -68,10 +84,14 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    let config_path = match cli.config {
+        Some(path) => path,
+        None => default_config_path(std::env::var_os("HOME"))?,
+    };
     match cli.command {
-        CommandName::Init => init(&cli.config),
+        CommandName::Init => init(&config_path),
         CommandName::Check => {
-            let c = Config::load(&cli.config)?;
+            let c = load_config(&config_path)?;
             println!(
                 "valid: {} listeners, {} pools, {} accounts",
                 c.listeners.len(),
@@ -80,19 +100,32 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        CommandName::Serve => serve(&cli.config).await,
+        CommandName::Serve => serve(&config_path).await,
         CommandName::Install {
             codex_config,
             listener,
-        } => install_config(&cli.config, &codex_config, &listener),
-        CommandName::Uninstall => {
-            let config = Config::load(&cli.config)?;
-            install::uninstall(&state_dir(&config).join("install.json"))
+            restart_codex,
+        } => {
+            let codex_config = match codex_config {
+                Some(path) => path,
+                None => default_codex_config_path(
+                    std::env::var_os("CODEX_HOME"),
+                    std::env::var_os("HOME"),
+                )?,
+            };
+            install_config(&config_path, &codex_config, &listener)?;
+            handle_running_codex(restart_codex)
         }
-        CommandName::Service { command } => service_command(&cli.config, command),
-        CommandName::Login { account } => login(&cli.config, &account),
+        CommandName::Uninstall { restart_codex } => {
+            let config = load_config(&config_path)?;
+            install::uninstall(&state_dir(&config).join("install.json"))?;
+            handle_running_codex(restart_codex)
+        }
+        CommandName::RestartCodex => handle_running_codex(true),
+        CommandName::Service { command } => service_command(&config_path, command),
+        CommandName::Login { account } => login(&config_path, &account),
         CommandName::Stats => {
-            let config = Config::load(&cli.config)?;
+            let config = load_config(&config_path)?;
             println!(
                 "{}",
                 fs::read_to_string(state_dir(&config).join("stats.json"))
@@ -103,9 +136,43 @@ async fn main() -> Result<()> {
     }
 }
 
+fn default_config_path(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    let home = home
+        .filter(|value| !value.is_empty())
+        .context("HOME is not set; pass --config")?;
+    Ok(PathBuf::from(home).join(".config/comradex/comradex.toml"))
+}
+
+fn default_codex_config_path(
+    codex_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if let Some(codex_home) = codex_home.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(codex_home).join("config.toml"));
+    }
+    let home = home
+        .filter(|value| !value.is_empty())
+        .context("neither CODEX_HOME nor HOME is set; pass --codex-config")?;
+    Ok(PathBuf::from(home).join(".codex/config.toml"))
+}
+
+fn load_config(path: &Path) -> Result<Config> {
+    if !path.exists() {
+        bail!(
+            "no configuration at {} (run `comradex init` to create it, or pass --config)",
+            path.display()
+        )
+    }
+    Config::load(path)
+}
+
 fn init(path: &Path) -> Result<()> {
     if path.exists() {
         bail!("{} already exists", path.display())
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create config directory {}", parent.display()))?;
     }
     let mut secret = [0u8; 16];
     let mut key = [0u8; 32];
@@ -145,7 +212,7 @@ kind = "inbound"
 }
 
 async fn serve(path: &Path) -> Result<()> {
-    let config = Arc::new(Config::load(path)?);
+    let config = Arc::new(load_config(path)?);
     let state = state_dir(&config);
     fs::create_dir_all(&state)?;
     let affinity = Arc::new(AffinityStore::load(
@@ -237,7 +304,7 @@ async fn shutdown_signal() -> Result<()> {
 fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
     match command {
         ServiceCommand::Install => {
-            let config = Config::load(config_path)?;
+            let config = load_config(config_path)?;
             let plist = service::install(config_path, &state_dir(&config))?;
             println!("installed and started {}", plist.display());
         }
@@ -257,7 +324,7 @@ fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
 }
 
 fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) -> Result<()> {
-    let config = Config::load(config_path)?;
+    let config = load_config(config_path)?;
     let listener = config
         .listeners
         .get(listener_name)
@@ -271,8 +338,62 @@ fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) 
     Ok(())
 }
 
+/// Rewriting openai_base_url on disk is not enough while long-lived Codex
+/// app-server processes keep the old value in memory: warn by default, SIGTERM
+/// them when requested.
+fn handle_running_codex(restart: bool) -> Result<()> {
+    let control = SystemProcesses;
+    let processes = control.list()?;
+    if processes.is_empty() {
+        if restart {
+            println!("no Codex app-server processes are running");
+        }
+        return Ok(());
+    }
+    let pids = processes
+        .iter()
+        .map(|process| process.pid.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !restart {
+        eprintln!(
+            "warning: {} Codex app-server process(es) still running (PID {pids}); \
+             they keep using the previous openai_base_url until restarted. \
+             Run `comradex restart-codex` (active turns may be interrupted).",
+            processes.len()
+        );
+        return Ok(());
+    }
+    println!("stopping Codex app-server process(es) {pids} (active turns may be interrupted)");
+    let outcome = codex_process::restart(&processes, &control);
+    if !outcome.stopped.is_empty() {
+        let stopped = outcome
+            .stopped
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("stopped PID {stopped}; the Codex App respawns its app-server automatically");
+    }
+    for (pid, error) in &outcome.failed {
+        eprintln!("failed to stop PID {pid}: {error}");
+    }
+    if !outcome.surviving.is_empty() {
+        let surviving = outcome
+            .surviving
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "PID {surviving} still running after SIGTERM; stop them manually if Codex keeps using the old URL"
+        );
+    }
+    Ok(())
+}
+
 fn login(config_path: &Path, account_name: &str) -> Result<()> {
-    let config = Config::load(config_path)?;
+    let config = load_config(config_path)?;
     let account = config
         .accounts
         .get(account_name)
@@ -295,4 +416,46 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
 
 fn state_dir(config: &Config) -> PathBuf {
     config.proxy.state_dir.clone().expect("filled by load")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn config_path_defaults_to_user_config_directory() {
+        let path = default_config_path(Some(OsString::from("/Users/example"))).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/example/.config/comradex/comradex.toml")
+        );
+    }
+
+    #[test]
+    fn config_path_requires_home_when_flag_is_absent() {
+        assert!(default_config_path(None).is_err());
+        assert!(default_config_path(Some(OsString::new())).is_err());
+    }
+
+    #[test]
+    fn codex_config_prefers_codex_home() {
+        let path = default_codex_config_path(
+            Some(OsString::from("/custom/codex")),
+            Some(OsString::from("/Users/example")),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/custom/codex/config.toml"));
+    }
+
+    #[test]
+    fn codex_config_falls_back_to_home_and_rejects_empty_codex_home() {
+        let path = default_codex_config_path(
+            Some(OsString::new()),
+            Some(OsString::from("/Users/example")),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/Users/example/.codex/config.toml"));
+        assert!(default_codex_config_path(None, None).is_err());
+    }
 }

@@ -28,6 +28,8 @@ comradex check
 comradex serve
 ```
 
+Every command reads `~/.config/comradex/comradex.toml` by default; `init` creates it there. Pass `--config <path>` to use a different location.
+
 To build from source instead:
 
 ```sh
@@ -41,16 +43,18 @@ cargo run -- serve
 In another terminal, install the listener into Codex's existing config:
 
 ```sh
-cargo run -- install --codex-config "$CODEX_HOME/config.toml"
+comradex install
 ```
 
-This changes only the root `openai_base_url`. It preserves a symlinked `config.toml` (including dotfiles-managed configurations), never sets `model_provider`, and never reads or writes `sessions/` or `rollouts/`. Reinstalling updates the Comradex URL without losing the original pre-Comradex value. `uninstall` restores that original value, but refuses if somebody changed it after installation.
+This edits `$CODEX_HOME/config.toml` (falling back to `~/.codex/config.toml`; override with `--codex-config`) and changes only the root `openai_base_url`. It preserves a symlinked `config.toml` (including dotfiles-managed configurations), never sets `model_provider`, and never reads or writes `sessions/` or `rollouts/`. Reinstalling updates the Comradex URL without losing the original pre-Comradex value. `uninstall` restores that original value, but refuses if somebody changed it after installation.
+
+Rewriting the config on disk is not enough while long-lived `codex app-server` processes (the Codex desktop app's background host, or CLI hosts) keep the previous `openai_base_url` in memory. `install` and `uninstall` warn when such processes are running; pass `--restart-codex`, or run `comradex restart-codex`, to send SIGTERM to exactly those processes (active turns may be interrupted). Matching is narrow — a Codex binary running the `app-server` subcommand, or a `codex-code-mode-host` entrypoint, owned by the current user — never a broad `*codex*` pattern, and never SIGKILL. The desktop app respawns its app-server automatically.
 
 On macOS, an installed Comradex binary can manage its own LaunchAgent:
 
 ```sh
-comradex --config /absolute/path/to/comradex.toml service install
-comradex --config /absolute/path/to/comradex.toml service status
+comradex service install
+comradex service status
 comradex service uninstall
 ```
 
