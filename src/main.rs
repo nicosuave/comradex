@@ -66,9 +66,6 @@ enum CommandName {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    Login {
-        account: String,
-    },
     /// Show configuration, service, Codex wiring, accounts, and live traffic
     Status {
         /// Print the raw stats snapshot as JSON
@@ -85,12 +82,14 @@ enum AccountCommand {
         name: String,
         #[arg(long, default_value = "default")]
         pool: String,
-        /// Skip the interactive device login (run `comradex login <name>` later)
+        /// Skip the interactive sign-in (run `comradex account login <name>` later)
         #[arg(long)]
         no_login: bool,
     },
-    /// List configured accounts and their login state
+    /// List configured accounts and their sign-in state
     List,
+    /// Sign an account in through the official Codex device flow
+    Login { name: String },
     /// Remove an account from the configuration and all pools
     Remove {
         name: String,
@@ -159,7 +158,6 @@ async fn main() -> Result<()> {
         CommandName::RestartCodex => handle_running_codex(true),
         CommandName::Account { command } => account_command(&config_path, command),
         CommandName::Service { command } => service_command(&config_path, command),
-        CommandName::Login { account } => login(&config_path, &account),
         CommandName::Status { json } => status(&config_path, json),
     }
 }
@@ -484,12 +482,13 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             println!("added account {name} to pool {pool}");
             reload_daemon()?;
             if no_login {
-                println!("run `comradex login {name}` to log the account in");
+                println!("run `comradex account login {name}` to sign the account in");
             } else {
                 login(config_path, &name)?;
             }
             Ok(())
         }
+        AccountCommand::Login { name } => login(config_path, &name),
         AccountCommand::List => {
             let config = load_config(config_path)?;
             let width = config.accounts.keys().map(String::len).max().unwrap_or(0);

@@ -97,7 +97,7 @@ members = ["app", "personal_2"]
 Then authenticate through the official client:
 
 ```sh
-comradex login personal_2
+comradex account login personal_2
 ```
 
 That executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative account paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`. The daemon reads its `auth.json` for each request, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. Refreshes are single-flight per isolated account and atomically rotate `auth.json`; the Codex App's own credentials remain unmanaged.
