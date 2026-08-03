@@ -28,8 +28,10 @@ pub fn install(config_path: &Path, state_dir: &Path) -> Result<PathBuf> {
     if listener_addresses.iter().any(|address| address.port() == 0) {
         bail!("service installation requires fixed non-zero listener ports")
     }
-    let executable = fs::canonicalize(std::env::current_exe()?)
-        .context("resolve current Comradex executable")?;
+    let executable = stable_executable_path(
+        fs::canonicalize(std::env::current_exe()?)
+            .context("resolve current Comradex executable")?,
+    );
     let plist_path = plist_path()?;
     let parent = plist_path
         .parent()
@@ -242,6 +244,13 @@ pub fn restart() -> Result<()> {
     };
     let config_path = plist_program_config(&plist)
         .with_context(|| format!("no --config argument recorded in {}", plist_path.display()))?;
+    if let Some(executable) = plist_executable(&plist).filter(|path| !path.exists()) {
+        bail!(
+            "the service executable {} no longer exists (removed by an upgrade?); \
+             run `comradex service install` to re-point the service at the current binary",
+            executable.display()
+        )
+    }
     let config = crate::config::Config::load(&config_path)?;
     let listener_addresses: Vec<_> = config
         .listeners
@@ -263,6 +272,42 @@ pub fn restart() -> Result<()> {
 
 fn plist_program_config(plist: &str) -> Option<PathBuf> {
     plist_string_after(plist, "<string>--config</string><string>").map(PathBuf::from)
+}
+
+fn plist_executable(plist: &str) -> Option<PathBuf> {
+    let array = plist.split("<key>ProgramArguments</key>").nth(1)?;
+    plist_string_after(array, "<string>").map(PathBuf::from)
+}
+
+/// Homebrew keg paths (`<prefix>/Cellar/<formula>/<version>/...`) are deleted
+/// when the formula is upgraded, which strands the LaunchAgent with a missing
+/// executable. Prefer the version-independent `<prefix>/opt/<formula>/...`
+/// symlink when it resolves to the same binary.
+fn stable_executable_path(canonical: PathBuf) -> PathBuf {
+    let components: Vec<_> = canonical.components().collect();
+    let Some(cellar) = components
+        .iter()
+        .position(|component| component.as_os_str() == "Cellar")
+    else {
+        return canonical;
+    };
+    // <prefix>/Cellar/<formula>/<version>/<rest...>
+    if components.len() < cellar + 4 {
+        return canonical;
+    }
+    let mut candidate = PathBuf::new();
+    for component in &components[..cellar] {
+        candidate.push(component);
+    }
+    candidate.push("opt");
+    candidate.push(components[cellar + 1]);
+    for component in &components[cellar + 3..] {
+        candidate.push(component);
+    }
+    match fs::canonicalize(&candidate) {
+        Ok(resolved) if resolved == canonical => candidate,
+        _ => canonical,
+    }
 }
 
 fn plist_string_after(plist: &str, marker: &str) -> Option<String> {
@@ -477,6 +522,54 @@ mod tests {
     #[test]
     fn xml_escapes_paths() {
         assert_eq!(xml(Path::new("a&<b>\"c'")), "a&amp;&lt;b&gt;&quot;c&apos;");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_keg_paths_are_rewritten_to_the_stable_opt_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = fs::canonicalize(dir.path()).unwrap();
+        let keg_bin = prefix.join("Cellar/comradex/0.4.0/bin");
+        fs::create_dir_all(&keg_bin).unwrap();
+        fs::write(keg_bin.join("comradex"), b"").unwrap();
+        fs::create_dir_all(prefix.join("opt")).unwrap();
+        symlink(
+            prefix.join("Cellar/comradex/0.4.0"),
+            prefix.join("opt/comradex"),
+        )
+        .unwrap();
+
+        let canonical = keg_bin.join("comradex");
+        assert_eq!(
+            stable_executable_path(canonical.clone()),
+            prefix.join("opt/comradex/bin/comradex")
+        );
+
+        // A retargeted or missing opt symlink keeps the canonical path.
+        fs::remove_file(prefix.join("opt/comradex")).unwrap();
+        assert_eq!(stable_executable_path(canonical.clone()), canonical);
+
+        // Non-Homebrew paths pass through untouched.
+        let plain = PathBuf::from("/usr/local/bin/comradex");
+        assert_eq!(stable_executable_path(plain.clone()), plain);
+    }
+
+    #[test]
+    fn plist_executable_is_the_first_program_argument() {
+        let plist = render_plist(
+            Path::new("/opt/homebrew/opt/comradex/bin/comradex"),
+            Path::new("/tmp/comradex.toml"),
+            Path::new("/tmp"),
+            Path::new("/tmp/out.log"),
+            Path::new("/tmp/err.log"),
+            "nonce123",
+        );
+        assert_eq!(
+            plist_executable(&plist).unwrap(),
+            PathBuf::from("/opt/homebrew/opt/comradex/bin/comradex")
+        );
     }
 
     #[test]
