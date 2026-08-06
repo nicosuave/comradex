@@ -472,6 +472,14 @@ impl App {
         let mut hard_owner = false;
         let mut known_file_owners = 0usize;
         let mut missing_hard_owner = false;
+        let soft_routing_key = affinity_keys
+            .iter()
+            .filter_map(|(kind, key)| {
+                kind.soft_routing_priority()
+                    .map(|priority| (priority, key.clone()))
+            })
+            .min_by_key(|(priority, _)| *priority)
+            .map(|(_, key)| key);
         for (kind, key) in &affinity_keys {
             let binding = if *kind == metadata::AffinityKind::File {
                 self.file_owners.get(key).await
@@ -487,6 +495,13 @@ impl App {
                 }
                 continue;
             };
+            // Session, cache, and thread aliases are routing preferences, not
+            // proof that request state belongs to an account. In particular,
+            // WebSocket handshake headers can outlive the response.create
+            // conversation carried in the frame body.
+            if !kind.is_hard_continuity() {
+                continue;
+            }
             if bound_account
                 .as_ref()
                 .is_some_and(|account| account != &binding.account_id)
@@ -497,7 +512,7 @@ impl App {
                     "request continuity keys resolve to different accounts",
                 ));
             }
-            hard_owner |= kind.is_hard_continuity();
+            hard_owner = true;
             if *kind == metadata::AffinityKind::File {
                 known_file_owners += 1;
             }
@@ -530,7 +545,7 @@ impl App {
             }
         } else {
             self.router
-                .select(&listener.pool, pool, None, None)
+                .select(&listener.pool, pool, soft_routing_key, None)
                 .await
                 .context("no eligible account")?
         };
@@ -3630,6 +3645,92 @@ mod tests {
         (proxy_addr, task, router)
     }
 
+    async fn start_two_account_proxy(
+        dir: &std::path::Path,
+        upstream: String,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<Router>,
+    ) {
+        let account_a = dir.join("a");
+        let account_b = dir.join("b");
+        fs::create_dir_all(&account_a).unwrap();
+        fs::create_dir_all(&account_b).unwrap();
+        fs::write(
+            account_a.join("auth.json"),
+            r#"{"tokens":{"access_token":"token-a"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            account_b.join("auth.json"),
+            r#"{"tokens":{"access_token":"token-b"}}"#,
+        )
+        .unwrap();
+
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_tcp.local_addr().unwrap();
+        let listener = ListenerConfig {
+            address: proxy_addr,
+            pool: "default".into(),
+        };
+        let config = Arc::new(Config {
+            proxy: ProxyConfig {
+                upstream,
+                responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
+                installation_secret: "0123456789abcdef".into(),
+                affinity_key: "0123456789abcdef0123456789abcdef".into(),
+                state_dir: Some(dir.join("state")),
+                ..ProxyConfig::default()
+            },
+            listeners: BTreeMap::from([("default".into(), listener.clone())]),
+            pools: BTreeMap::from([(
+                "default".into(),
+                PoolConfig {
+                    members: vec!["a".into(), "b".into()],
+                },
+            )]),
+            accounts: BTreeMap::from([
+                ("a".into(), AccountConfig::CodexHome { path: account_a }),
+                ("b".into(), AccountConfig::CodexHome { path: account_b }),
+            ]),
+        });
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.join("affinity.json"),
+                &config.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(Router::new(&config, affinity));
+        let app = App::new(config, router.clone(), Arc::new(Stats::default())).unwrap();
+        let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
+        (proxy_addr, task, router)
+    }
+
+    async fn connect_test_websocket_with_headers(
+        address: std::net::SocketAddr,
+        extra_headers: &[(&str, &str)],
+    ) -> WebSocketStream<TcpStream> {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let mut request = format!("ws://{address}/0123456789abcdef/v1/responses")
+            .into_client_request()
+            .unwrap();
+        for (name, value) in extra_headers {
+            request.headers_mut().insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let (websocket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+        websocket
+    }
+
     async fn connect_test_websocket(address: std::net::SocketAddr) -> WebSocketStream<TcpStream> {
         let stream = TcpStream::connect(address).await.unwrap();
         let mut request = format!("ws://{address}/0123456789abcdef/v1/responses")
@@ -3802,6 +3903,170 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&completed).unwrap()["type"],
             "response.completed"
         );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_bridge_routes_fresh_frame_conversations_after_usage_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_seen = seen.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let seen = upstream_seen.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            let authorization =
+                                req.headers()[AUTHORIZATION].to_str().unwrap().to_owned();
+                            seen.lock().unwrap().push(authorization);
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .header("x-codex-primary-used-percent", "100")
+                                    .body(Full::new(Bytes::from_static(
+                                        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"status\":\"completed\"}}\n\n",
+                                    )))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task, _) = start_two_account_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        )
+        .await;
+        let mut websocket = connect_test_websocket_with_headers(
+            proxy_addr,
+            &[("session-id", "reused-client-session")],
+        )
+        .await;
+
+        for thread in ["fresh-thread-a", "fresh-thread-b"] {
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type":"response.create",
+                        "client_metadata":{"thread_id":thread},
+                        "prompt_cache_key":"reused-client-cache",
+                        "input":[]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            for expected in ["response.created", "response.completed"] {
+                let message = websocket
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap();
+                let event: serde_json::Value = serde_json::from_str(&message).unwrap();
+                assert_eq!(event["type"], expected);
+            }
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["Bearer token-a".to_owned(), "Bearer token-b".to_owned()]
+        );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_bridge_preserves_hard_turn_state_owner_for_fresh_frame_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_seen = seen.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let seen = upstream_seen.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .unwrap()
+                                .push(req.headers()[AUTHORIZATION].to_str().unwrap().to_owned());
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .body(Full::new(Bytes::from_static(
+                                        b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\",\"status\":\"completed\"}}\n\n",
+                                    )))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task, router) = start_two_account_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        )
+        .await;
+        let turn_key = router.affinity.key("turn-state:owned-turn");
+        assert!(router.bind(turn_key, "a").await);
+        let mut exhausted = hyper::HeaderMap::new();
+        exhausted.insert(
+            "x-codex-primary-used-percent",
+            hyper::header::HeaderValue::from_static("100"),
+        );
+        router.observe_headers("a", &exhausted).await;
+
+        let mut websocket = connect_test_websocket_with_headers(
+            proxy_addr,
+            &[("x-codex-turn-state", "owned-turn")],
+        )
+        .await;
+        websocket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"response.create",
+                    "client_metadata":{"thread_id":"brand-new-thread"},
+                    "input":[]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let event = websocket
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&event).unwrap()["type"],
+            "response.completed"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["Bearer token-a".to_owned()]);
         proxy_task.abort();
         upstream_task.abort();
     }
