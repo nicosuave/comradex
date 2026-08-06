@@ -64,6 +64,30 @@ impl Router {
         thread: Option<ThreadKey>,
         exclude: Option<&str>,
     ) -> Option<Selection> {
+        self.select_with_preference(pool_name, pool, thread, exclude, None)
+            .await
+    }
+
+    /// Selects an account for fresh work while preferring an existing transport account only
+    /// while it remains below the normal rotation threshold.
+    pub async fn select_preferred(
+        &self,
+        pool_name: &str,
+        pool: &PoolConfig,
+        preferred: &str,
+    ) -> Option<Selection> {
+        self.select_with_preference(pool_name, pool, None, None, Some(preferred))
+            .await
+    }
+
+    async fn select_with_preference(
+        &self,
+        pool_name: &str,
+        pool: &PoolConfig,
+        thread: Option<ThreadKey>,
+        exclude: Option<&str>,
+        preferred: Option<&str>,
+    ) -> Option<Selection> {
         let now = Instant::now();
         let binding = match &thread {
             Some(key) => self.affinity.get(key).await,
@@ -96,27 +120,35 @@ impl Router {
             }
         }
         let active_id = self.active.lock().await.get(pool_name).cloned();
-        let eligible = |id: &&String| {
-            exclude != Some(id.as_str())
-                && accounts.get(*id).is_some_and(|a| {
+        let eligible = |id: &str| {
+            exclude != Some(id)
+                && accounts.get(id).is_some_and(|a| {
                     !a.needs_login
                         && a.quota_until.is_none_or(|v| v <= now)
                         && a.avoid_until.is_none_or(|v| v <= now)
                 })
         };
-        let selected = active_id
+        let below_switch_at = |id: &str| {
+            accounts
+                .get(id)
+                .and_then(|account| account.usage)
+                .is_none_or(|usage| usage < self.switch_at)
+        };
+        let selected = preferred
             .filter(|id| {
-                pool.members.contains(id)
-                    && eligible(&id)
-                    && accounts
-                        .get(id)
-                        .and_then(|a| a.usage)
-                        .is_none_or(|u| u < self.switch_at)
+                pool.members.iter().any(|member| member == *id)
+                    && eligible(id)
+                    && below_switch_at(id)
+            })
+            .map(str::to_owned)
+            .or_else(|| {
+                active_id
+                    .filter(|id| pool.members.contains(id) && eligible(id) && below_switch_at(id))
             })
             .or_else(|| {
                 pool.members
                     .iter()
-                    .filter(eligible)
+                    .filter(|id| eligible(id))
                     .min_by_key(|id| {
                         let a = &accounts[*id];
                         let (tier, usage) = match a.usage {
@@ -329,6 +361,36 @@ mod tests {
             .select("default", pool, Some(affinity.key("thread-two")), None)
             .await
             .unwrap();
+        assert_eq!(fresh.account_id, "b");
+    }
+
+    #[tokio::test]
+    async fn exhausted_transport_preference_does_not_pin_fresh_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        let first = router.select("default", pool, None, None).await.unwrap();
+        assert_eq!(first.account_id, "a");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        router.observe_headers("a", &headers).await;
+
+        let fresh = router.select_preferred("default", pool, "a").await.unwrap();
         assert_eq!(fresh.account_id, "b");
     }
 
