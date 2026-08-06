@@ -46,8 +46,8 @@ fn default_flush_seconds() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesWebsocketMode {
-    #[default]
     Raw,
+    #[default]
     HttpBridge,
     Direct,
 }
@@ -102,7 +102,7 @@ impl Default for ProxyConfig {
             switch_at: default_switch(),
             max_inflight: default_inflight(),
             max_upgrades: default_upgrades(),
-            responses_websocket_mode: ResponsesWebsocketMode::Raw,
+            responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
             replay_memory_bytes: default_replay_memory(),
             max_request_bytes: default_request_limit(),
             max_spool_bytes: default_global_spool(),
@@ -220,6 +220,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_websocket_mode_defaults_to_http_bridge() {
+        assert_eq!(
+            ResponsesWebsocketMode::default(),
+            ResponsesWebsocketMode::HttpBridge
+        );
+        assert_eq!(
+            ProxyConfig::default().responses_websocket_mode,
+            ResponsesWebsocketMode::HttpBridge
+        );
+    }
 
     fn config_text(state_dir: Option<&str>) -> String {
         let state_dir = state_dir

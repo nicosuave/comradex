@@ -190,8 +190,8 @@ Requests up to 256 KiB are replayed from memory by default; larger requests use 
 
 Select behavior with `proxy.responses_websocket_mode`:
 
-- `raw` is the default and preserves the original handshake-pinned byte relay. One account owns the socket, and Comradex does not inspect its frames.
-- `http_bridge` accepts downstream WebSocket frames and sends each `response.create` through the account-aware HTTP/SSE pipeline. It supersedes an older in-flight turn when a new create arrives and converts bounded, validated SSE or JSON lifecycle events back into WebSocket text frames.
+- `raw` preserves the original handshake-pinned byte relay. One account owns the socket, and Comradex does not inspect its frames.
+- `http_bridge` is the default. It accepts downstream WebSocket frames and sends each `response.create` through the account-aware HTTP/SSE pipeline. It supersedes an older in-flight turn when a new create arrives and converts bounded, validated SSE or JSON lifecycle events back into WebSocket text frames.
 - `direct` keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend. If safe internal replay is unavailable, it preserves Codex's canonical `previous_response_not_found` retry classifier while removing account-scoped details.
 
 Direct mode uses the explicit refresh-then-alternate sequence above. Live Voice upgrades are separate from these modes and remain raw, call-bound relays.
