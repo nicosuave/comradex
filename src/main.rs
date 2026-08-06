@@ -210,7 +210,7 @@ upstream = "https://chatgpt.com/backend-api/codex"
 switch_at = 80
 max_inflight = 64
 max_upgrades = 32
-responses_websocket_mode = "raw"
+responses_websocket_mode = "http_bridge"
 installation_secret = "{}"
 affinity_key = "{}"
 

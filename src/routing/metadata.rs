@@ -19,10 +19,20 @@ pub enum AffinityKind {
 
 impl AffinityKind {
     pub fn is_hard_continuity(self) -> bool {
-        matches!(
-            self,
-            Self::TurnState | Self::Session | Self::PreviousResponse | Self::File
-        )
+        matches!(self, Self::TurnState | Self::PreviousResponse | Self::File)
+    }
+
+    /// Lower values are stronger soft routing identities. A conversation/thread
+    /// identifier carried by the request itself must win over connection-level
+    /// session and cache hints that can survive across conversations.
+    pub fn soft_routing_priority(self) -> Option<u8> {
+        match self {
+            Self::BodyThread => Some(0),
+            Self::ParentThread | Self::TurnMetadata => Some(1),
+            Self::Session => Some(2),
+            Self::PromptCache => Some(3),
+            Self::TurnState | Self::PreviousResponse | Self::File => None,
+        }
     }
 
     fn prefix(self) -> &'static str {
@@ -214,5 +224,15 @@ mod tests {
                 .any(|v| v.kind == AffinityKind::PreviousResponse)
         );
         assert!(values.iter().any(|v| v.kind == AffinityKind::File));
+        assert!(!AffinityKind::Session.is_hard_continuity());
+        assert_eq!(AffinityKind::BodyThread.soft_routing_priority(), Some(0));
+        assert!(
+            AffinityKind::BodyThread.soft_routing_priority()
+                < AffinityKind::Session.soft_routing_priority()
+        );
+        assert!(
+            AffinityKind::Session.soft_routing_priority()
+                < AffinityKind::PromptCache.soft_routing_priority()
+        );
     }
 }
