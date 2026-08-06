@@ -72,6 +72,15 @@ const UNKNOWN_CONTENT_SNIFF_BYTES: usize = 4 * 1024;
 const SSE_DECODE_SLICE_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_DIRECT_CREATES: usize = 64;
 
+fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
+    matches!(
+        kind,
+        metadata::AffinityKind::TurnState
+            | metadata::AffinityKind::PreviousResponse
+            | metadata::AffinityKind::File
+    )
+}
+
 type HttpClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
 type UpgradedWebSocket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
@@ -1129,7 +1138,8 @@ impl App {
             .iter()
             .map(|value| (value.kind, self.router.affinity.key(&value.namespaced())))
             .collect();
-        let mut bound_account: Option<String> = None;
+        let mut hard_bound_account: Option<String> = None;
+        let mut soft_bound_account: Option<String> = None;
         let mut hard_owner = false;
         let mut non_previous_hard_owner = false;
         let mut known_file_owners = 0usize;
@@ -1149,19 +1159,22 @@ impl App {
                 }
                 continue;
             };
-            if bound_account
-                .as_ref()
-                .is_some_and(|account| account != &binding.account_id)
-            {
-                anyhow::bail!("request continuity keys resolve to different accounts")
+            if is_direct_hard_continuity(*kind) {
+                if hard_bound_account
+                    .as_ref()
+                    .is_some_and(|account| account != &binding.account_id)
+                {
+                    anyhow::bail!("request continuity keys resolve to different accounts")
+                }
+                hard_owner = true;
+                non_previous_hard_owner |= *kind != metadata::AffinityKind::PreviousResponse;
+                hard_bound_account = Some(binding.account_id.clone());
+            } else if soft_bound_account.is_none() {
+                soft_bound_account = Some(binding.account_id.clone());
             }
-            hard_owner |= kind.is_hard_continuity();
-            non_previous_hard_owner |=
-                kind.is_hard_continuity() && *kind != metadata::AffinityKind::PreviousResponse;
             if *kind == metadata::AffinityKind::File {
                 known_file_owners += 1;
             }
-            bound_account = Some(binding.account_id);
         }
         if known_file_owners > 0 && known_file_owners < replay.file_ids().len() {
             anyhow::bail!("some referenced files have no known account owner")
@@ -1169,16 +1182,16 @@ impl App {
         if missing_hard_owner {
             anyhow::bail!("request carries hard continuity state with no known account owner")
         }
-        let selection = if let Some(account) = &bound_account {
+        let selection = if let Some(account) = &hard_bound_account {
             self.router
                 .select_exact(pool, account)
                 .await
                 .context("required continuity account is unavailable")?
-        } else if let Some(account) = preferred_account {
+        } else if let Some(account) = soft_bound_account.as_deref().or(preferred_account) {
             self.router
-                .select_exact(pool, account)
+                .select_preferred(&listener.pool, pool, account)
                 .await
-                .context("current direct WebSocket account is unavailable")?
+                .context("no eligible account for fresh direct WebSocket frame")?
         } else {
             self.router
                 .select(&listener.pool, pool, None, None)
@@ -1662,23 +1675,23 @@ impl App {
         headers: &hyper::HeaderMap,
         account: &str,
     ) -> Result<Option<(UpgradedWebSocket, String)>> {
+        match failure {
+            FailureKind::Quota => {
+                self.router
+                    .quota_failure(account, &hyper::HeaderMap::new())
+                    .await;
+            }
+            FailureKind::Transient => self.router.soft_failure(account).await,
+            _ => {}
+        }
         let Some(turn) = turns.get(&turn_id) else {
             return Ok(None);
         };
         let mut plan = match protocol.replay_plan(turn_id, failure, context) {
             Ok(plan) => plan,
             Err(_) => {
-                match failure {
-                    FailureKind::Quota => {
-                        self.router
-                            .quota_failure(account, &hyper::HeaderMap::new())
-                            .await;
-                    }
-                    FailureKind::Authentication { .. } => {
-                        self.router.auth_failure(account).await;
-                    }
-                    FailureKind::Transient => self.router.soft_failure(account).await,
-                    _ => {}
+                if matches!(failure, FailureKind::Authentication { .. }) {
+                    self.router.auth_failure(account).await;
                 }
                 return Ok(None);
             }
@@ -1715,16 +1728,7 @@ impl App {
                     // should recover on the same account, including a one-account deployment.
                     account.to_owned()
                 }
-                ReplayTarget::Unspecified => {
-                    if failure == FailureKind::Quota {
-                        self.router
-                            .quota_failure(account, &hyper::HeaderMap::new())
-                            .await;
-                    } else {
-                        self.router.soft_failure(account).await;
-                    }
-                    String::new()
-                }
+                ReplayTarget::Unspecified => String::new(),
             };
         if plan.target == ReplayTarget::AlternateAccount || replacement_account.is_empty() {
             if matches!(failure, FailureKind::Authentication { .. }) {
@@ -1960,7 +1964,11 @@ impl App {
                         "websocket continuity keys resolve to different accounts",
                     ));
                 }
-                hard_owner |= kind.is_hard_continuity();
+                hard_owner |= if frame_aware_direct {
+                    is_direct_hard_continuity(*kind)
+                } else {
+                    kind.is_hard_continuity()
+                };
                 bound_account = Some(binding.account_id);
             }
             if bound_account.is_none()
@@ -1992,7 +2000,9 @@ impl App {
                 ));
             };
             selection
-        } else if let Some(account) = &bound_account {
+        } else if let Some(account) = &bound_account
+            && (!frame_aware_direct || hard_owner)
+        {
             let Some(selection) = self.router.select_exact(pool, account).await else {
                 return Ok(error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2001,6 +2011,11 @@ impl App {
                 ));
             };
             selection
+        } else if let Some(account) = &bound_account {
+            self.router
+                .select_preferred(&listener.pool, pool, account)
+                .await
+                .context("no eligible account for fresh direct WebSocket")?
         } else {
             self.router
                 .select(
@@ -2142,25 +2157,30 @@ impl App {
                     .await
                 {
                     Ok(Some(_)) => continue,
-                    Ok(None) => {}
+                    Ok(None) => {
+                        self.router.auth_failure(&selection.account_id).await;
+                    }
                     Err(error) => {
-                        warn!(account = selection.account_id, %error, "websocket credential refresh failed")
+                        warn!(account = selection.account_id, %error, "websocket credential refresh failed");
+                        self.router.auth_failure(&selection.account_id).await;
                     }
                 }
+            } else if response.status() == StatusCode::UNAUTHORIZED {
+                self.router.auth_failure(&selection.account_id).await;
             }
             let retry = is_quota_status(response.status())
                 || is_selected_gateway_failure(response.status());
+            if matches!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYMENT_REQUIRED
+            ) {
+                self.router
+                    .quota_failure(&selection.account_id, response.headers())
+                    .await;
+            } else if is_selected_gateway_failure(response.status()) {
+                self.router.soft_failure(&selection.account_id).await;
+            }
             if retry && !forced_live && !hard_owner && attempt == 0 {
-                if matches!(
-                    response.status(),
-                    StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYMENT_REQUIRED
-                ) {
-                    self.router
-                        .quota_failure(&selection.account_id, response.headers())
-                        .await;
-                } else {
-                    self.router.soft_failure(&selection.account_id).await;
-                }
                 selection = self
                     .router
                     .select(
@@ -3102,6 +3122,49 @@ mod tests {
         body: Bytes,
     }
 
+    fn direct_test_app(
+        dir: &std::path::Path,
+    ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
+        let listener = ListenerConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            pool: "default".into(),
+        };
+        let config = Arc::new(Config {
+            proxy: ProxyConfig {
+                responses_websocket_mode: ResponsesWebsocketMode::Direct,
+                installation_secret: "0123456789abcdef".into(),
+                affinity_key: "0123456789abcdef0123456789abcdef".into(),
+                state_dir: Some(dir.join("state")),
+                ..ProxyConfig::default()
+            },
+            listeners: BTreeMap::from([("default".into(), listener.clone())]),
+            pools: BTreeMap::from([(
+                "default".into(),
+                PoolConfig {
+                    members: vec!["a".into(), "b".into()],
+                },
+            )]),
+            accounts: BTreeMap::from([
+                ("a".into(), AccountConfig::Inbound),
+                ("b".into(), AccountConfig::Inbound),
+            ]),
+        });
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.join("affinity.json"),
+                &config.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(Router::new(&config, affinity));
+        let stats = Arc::new(Stats::default());
+        let app = App::new(config, router.clone(), stats.clone()).unwrap();
+        (app, listener, router, stats)
+    }
+
     #[test]
     fn retries_only_intended_pre_output_statuses() {
         assert!(!retryable_http_status(
@@ -3195,6 +3258,112 @@ mod tests {
         assert!(is_safe_codex_quota_header("x-codex-plan-limit-name"));
         assert!(!is_safe_codex_quota_header("x-codex-account-id"));
         assert!(!is_safe_codex_quota_header("x-codex-turn-metadata"));
+    }
+
+    #[tokio::test]
+    async fn direct_fresh_frame_rotates_off_exhausted_socket_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, listener, router, stats) = direct_test_app(dir.path());
+        let pool = &app.config.pools["default"];
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        let mut usage = hyper::HeaderMap::new();
+        usage.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        router.observe_headers("a", &usage).await;
+        let session = router.affinity.key("session:transport");
+        assert!(router.bind(session, "a").await);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("session-id", "transport".parse().unwrap());
+
+        let replay = ReplayBody::from_bytes(
+            Bytes::from_static(
+                br#"{"type":"response.create","client_metadata":{"thread_id":"fresh"},"input":[]}"#,
+            ),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            stats,
+        )
+        .unwrap();
+        let route = app
+            .route_websocket_frame(&listener, &headers, &replay, Some("a"))
+            .await
+            .unwrap();
+
+        assert_eq!(route.account_id, "b");
+        assert!(!route.hard_owner);
+    }
+
+    #[tokio::test]
+    async fn direct_hard_owner_quota_marks_account_without_cross_account_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, listener, router, stats) = direct_test_app(dir.path());
+        let pool = &app.config.pools["default"];
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        let turn_state = router.affinity.key("turn-state:opaque");
+        assert!(router.bind(turn_state, "a").await);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-codex-turn-state", "opaque".parse().unwrap());
+        let value = serde_json::json!({"type":"response.create","input":[]});
+        let replay = ReplayBody::from_bytes(
+            Bytes::copy_from_slice(value.to_string().as_bytes()),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            stats,
+        )
+        .unwrap();
+        let route = app
+            .route_websocket_frame(&listener, &headers, &replay, Some("a"))
+            .await
+            .unwrap();
+        assert!(route.hard_owner);
+
+        let mut protocol = ProtocolState::new(ProtocolLimits::default()).unwrap();
+        let turn_id = protocol.admit_response_create(&value).unwrap();
+        let mut turns = HashMap::from([(
+            turn_id,
+            DirectTurn {
+                route,
+                request: Message::Text(value.to_string().into()),
+                value,
+            },
+        )]);
+        let replayed = app
+            .try_replay_direct_turn(
+                &mut protocol,
+                &mut turns,
+                turn_id,
+                FailureKind::Quota,
+                ReplayContext::default(),
+                &listener,
+                "/v1/responses",
+                &headers,
+                "a",
+            )
+            .await
+            .unwrap();
+
+        assert!(replayed.is_none());
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
     }
 
     #[tokio::test]
