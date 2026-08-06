@@ -11,7 +11,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
@@ -95,6 +95,38 @@ struct DirectTurn {
     route: WebSocketFrameRoute,
     request: Message,
     value: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct HttpBridgeContinuation {
+    response_id: String,
+    input: Vec<serde_json::Value>,
+    output: Vec<serde_json::Value>,
+}
+
+struct HttpBridgeCapture {
+    input: Vec<serde_json::Value>,
+    response_id: Option<String>,
+    output: Vec<serde_json::Value>,
+}
+
+impl HttpBridgeCapture {
+    fn observe(&mut self, event: &serde_json::Value) {
+        if let Some(response_id) = event
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            self.response_id = Some(response_id.to_owned());
+        }
+        if event.get("type").and_then(serde_json::Value::as_str)
+            == Some("response.output_item.done")
+            && let Some(item) = event.get("item")
+        {
+            self.output.push(item.clone());
+        }
+    }
 }
 
 struct DirectAccountLease {
@@ -450,7 +482,27 @@ impl App {
         method: Method,
         listener: &ListenerConfig,
         path: String,
+        replay: ReplayBody,
+    ) -> Result<Response<ProxyBody>> {
+        self.handle_http_replay_with_routing_anchor(
+            inbound_headers,
+            method,
+            listener,
+            path,
+            replay,
+            None,
+        )
+        .await
+    }
+
+    async fn handle_http_replay_with_routing_anchor(
+        &self,
+        inbound_headers: hyper::HeaderMap,
+        method: Method,
+        listener: &ListenerConfig,
+        path: String,
         mut replay: ReplayBody,
+        routing_previous_response_id: Option<String>,
     ) -> Result<Response<ProxyBody>> {
         if replay.file_ids_overflow() {
             return Ok(error_response(
@@ -469,7 +521,9 @@ impl App {
         let affinity_values = metadata::affinity_values(
             &inbound_headers,
             replay.thread_id(),
-            replay.previous_response_id(),
+            routing_previous_response_id
+                .as_deref()
+                .or_else(|| replay.previous_response_id()),
             replay.prompt_cache_key(),
             &file_ids,
         );
@@ -903,6 +957,7 @@ impl App {
             sender: outbound.clone(),
             generation: 0,
         };
+        let continuation = Arc::new(StdMutex::new(None::<HttpBridgeContinuation>));
         let writer_generation = active_generation.clone();
         let writer_gate = delivery_gate.clone();
         let writer_fatal = fatal_tx.clone();
@@ -1005,8 +1060,51 @@ impl App {
                     let Some(object) = frame.as_object_mut() else {
                         continue;
                     };
+                    let routing_previous_response_id = object
+                        .get("previous_response_id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned);
+                    if let Some(anchor) = routing_previous_response_id.as_deref() {
+                        let cached = continuation.lock().expect("bridge continuation").clone();
+                        let Some(cached) = cached.filter(|cached| cached.response_id == anchor)
+                        else {
+                            let error = previous_response_not_found_error();
+                            send_ws_http_error(
+                                &turn_outbound,
+                                StatusCode::BAD_REQUEST,
+                                error["error"].clone(),
+                                &hyper::HeaderMap::new(),
+                            )
+                            .await;
+                            continue;
+                        };
+                        let Some(delta) = object
+                            .get("input")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                        else {
+                            send_ws_error(
+                                &turn_outbound,
+                                "invalid_request_error",
+                                "incremental response.create input must be an array",
+                            )
+                            .await;
+                            continue;
+                        };
+                        let mut input = cached.input;
+                        input.extend(cached.output);
+                        input.extend(delta);
+                        object.insert("input".into(), serde_json::Value::Array(input));
+                        object.remove("previous_response_id");
+                    }
                     object.remove("type");
                     object.insert("stream".into(), serde_json::Value::Bool(true));
+                    let request_input = object
+                        .get("input")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
                     let body = match serde_json::to_vec(&frame) {
                         Ok(body) => bytes::Bytes::from(body),
                         Err(error) => {
@@ -1025,6 +1123,7 @@ impl App {
                     let headers = headers.clone();
                     let outbound = turn_outbound;
                     let fatal = fatal_tx.clone();
+                    let continuation = continuation.clone();
                     active_turn = self
                         .spawn_tracked_task(async move {
                             let _http_permit = match app.http_slots.clone().try_acquire_owned() {
@@ -1057,13 +1156,25 @@ impl App {
                                 }
                             };
                             match app
-                                .handle_http_replay(headers, Method::POST, &listener, path, replay)
+                                .handle_http_replay_with_routing_anchor(
+                                    headers,
+                                    Method::POST,
+                                    &listener,
+                                    path,
+                                    replay,
+                                    routing_previous_response_id,
+                                )
                                 .await
                             {
                                 Ok(response) => {
-                                    if let Err(error) =
-                                        pump_http_response_to_websocket(response, &outbound, &app)
-                                            .await
+                                    if let Err(error) = pump_http_response_to_websocket(
+                                        response,
+                                        &outbound,
+                                        &app,
+                                        request_input,
+                                        &continuation,
+                                    )
+                                    .await
                                     {
                                         if error
                                             .to_string()
@@ -2831,7 +2942,14 @@ async fn pump_http_response_to_websocket(
     response: Response<ProxyBody>,
     outbound: &BridgeSender,
     app: &Arc<App>,
+    request_input: Vec<serde_json::Value>,
+    continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
 ) -> Result<()> {
+    let mut capture = HttpBridgeCapture {
+        input: request_input,
+        response_id: None,
+        output: Vec::new(),
+    };
     let status = response.status();
     let response_headers = response.headers().clone();
     let content_type = response
@@ -2884,6 +3002,8 @@ async fn pump_http_response_to_websocket(
                 outbound,
                 app,
                 selected_account.as_deref(),
+                &mut capture,
+                continuation,
             )
             .await?
             {
@@ -2901,6 +3021,8 @@ async fn pump_http_response_to_websocket(
                 outbound,
                 app,
                 selected_account.as_deref(),
+                &mut capture,
+                continuation,
             )
             .await?
             {
@@ -2912,6 +3034,8 @@ async fn pump_http_response_to_websocket(
             outbound,
             app,
             selected_account.as_deref(),
+            &mut capture,
+            continuation,
         )
         .await?
         {
@@ -2935,7 +3059,16 @@ async fn pump_http_response_to_websocket(
         let response = value.get("response").cloned().unwrap_or(value);
         responses_json_events(response)?
     };
-    if !send_protocol_events(events, outbound, app, selected_account.as_deref()).await? {
+    if !send_protocol_events(
+        events,
+        outbound,
+        app,
+        selected_account.as_deref(),
+        &mut capture,
+        continuation,
+    )
+    .await?
+    {
         anyhow::bail!("successful Responses JSON produced no terminal event")
     }
     Ok(())
@@ -2946,12 +3079,24 @@ async fn send_protocol_events(
     outbound: &BridgeSender,
     app: &Arc<App>,
     account: Option<&str>,
+    capture: &mut HttpBridgeCapture,
+    continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
 ) -> Result<bool> {
     for event in events {
+        capture.observe(&event.value);
         if let Some(account) = account {
             bind_response_id_from_event(app, &event.payload, account).await;
         }
         let terminal = event.terminal.is_some();
+        if event.terminal == Some(sse::TerminalStatus::Completed)
+            && let Some(response_id) = capture.response_id.clone()
+        {
+            *continuation.lock().expect("bridge continuation") = Some(HttpBridgeContinuation {
+                response_id,
+                input: capture.input.clone(),
+                output: capture.output.clone(),
+            });
+        }
         if !outbound.send(Message::Text(event.payload.into())).await {
             anyhow::bail!("downstream WebSocket backpressure prevented event delivery")
         }
@@ -2968,9 +3113,20 @@ async fn send_sse_data(
     outbound: &BridgeSender,
     app: &Arc<App>,
     account: Option<&str>,
+    capture: &mut HttpBridgeCapture,
+    continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
 ) -> Result<bool> {
     for slice in data.chunks(SSE_DECODE_SLICE_BYTES) {
-        if send_protocol_events(decoder.push(slice)?, outbound, app, account).await? {
+        if send_protocol_events(
+            decoder.push(slice)?,
+            outbound,
+            app,
+            account,
+            capture,
+            continuation,
+        )
+        .await?
+        {
             return Ok(true);
         }
     }
@@ -4071,6 +4227,111 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&completed).unwrap()["type"],
             "response.completed"
+        );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_bridge_materializes_incremental_previous_response_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_bodies = bodies.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let bodies = upstream_bodies.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let bodies = bodies.clone();
+                        async move {
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let turn = {
+                                let mut bodies = bodies.lock().unwrap();
+                                bodies.push(body);
+                                bodies.len()
+                            };
+                            let response_id = format!("resp_bridge_{turn}");
+                            let output = serde_json::json!({
+                                "type":"message",
+                                "role":"assistant",
+                                "content":[{"type":"output_text","text":format!("answer {turn}")}]
+                            });
+                            let events = format!(
+                                "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+                                serde_json::json!({"type":"response.created","response":{"id":response_id,"status":"in_progress"}}),
+                                serde_json::json!({"type":"response.output_item.done","item":output}),
+                                serde_json::json!({"type":"response.completed","response":{"id":response_id,"status":"completed"}}),
+                            );
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .body(Full::new(Bytes::from(events)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::HttpBridge,
+        )
+        .await;
+        let mut websocket = connect_test_websocket(proxy_addr).await;
+        let first_input = serde_json::json!({"role":"user","content":"first"});
+        websocket
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[first_input]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            websocket.next().await.unwrap().unwrap();
+        }
+
+        let second_input = serde_json::json!({"role":"user","content":"second"});
+        websocket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"response.create",
+                    "previous_response_id":"resp_bridge_1",
+                    "input":[second_input]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            websocket.next().await.unwrap().unwrap();
+        }
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].get("previous_response_id").is_none());
+        assert_eq!(
+            bodies[1]["input"],
+            serde_json::json!([
+                {"role":"user","content":"first"},
+                {
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"answer 1"}]
+                },
+                {"role":"user","content":"second"}
+            ])
         );
         proxy_task.abort();
         upstream_task.abort();
