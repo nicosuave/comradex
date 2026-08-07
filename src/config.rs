@@ -21,6 +21,15 @@ fn default_inflight() -> usize {
 fn default_upgrades() -> usize {
     32
 }
+fn default_bridge_sessions() -> usize {
+    256
+}
+fn default_bridge_idle_seconds() -> u64 {
+    15 * 60
+}
+fn default_bridge_admission_timeout_millis() -> u64 {
+    2_000
+}
 fn default_replay_memory() -> usize {
     256 * 1024
 }
@@ -71,6 +80,12 @@ pub struct ProxyConfig {
     pub max_inflight: usize,
     #[serde(default = "default_upgrades")]
     pub max_upgrades: usize,
+    #[serde(default = "default_bridge_sessions")]
+    pub max_bridge_sessions: usize,
+    #[serde(default = "default_bridge_idle_seconds")]
+    pub bridge_idle_seconds: u64,
+    #[serde(default = "default_bridge_admission_timeout_millis")]
+    pub bridge_admission_timeout_millis: u64,
     #[serde(default)]
     pub responses_websocket_mode: ResponsesWebsocketMode,
     #[serde(default = "default_replay_memory")]
@@ -102,6 +117,9 @@ impl Default for ProxyConfig {
             switch_at: default_switch(),
             max_inflight: default_inflight(),
             max_upgrades: default_upgrades(),
+            max_bridge_sessions: default_bridge_sessions(),
+            bridge_idle_seconds: default_bridge_idle_seconds(),
+            bridge_admission_timeout_millis: default_bridge_admission_timeout_millis(),
             responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
             replay_memory_bytes: default_replay_memory(),
             max_request_bytes: default_request_limit(),
@@ -177,6 +195,15 @@ impl Config {
         if !(1..=100).contains(&self.proxy.switch_at) {
             bail!("proxy.switch_at must be 1..=100")
         }
+        if self.proxy.max_bridge_sessions == 0 {
+            bail!("proxy.max_bridge_sessions must be greater than zero")
+        }
+        if self.proxy.bridge_idle_seconds == 0 {
+            bail!("proxy.bridge_idle_seconds must be greater than zero")
+        }
+        if self.proxy.bridge_admission_timeout_millis == 0 {
+            bail!("proxy.bridge_admission_timeout_millis must be greater than zero")
+        }
         if self.accounts.len() > 512 {
             bail!("at most 512 accounts are supported")
         }
@@ -248,6 +275,12 @@ kind = "inbound"
         assert_eq!(
             ProxyConfig::default().responses_websocket_mode,
             ResponsesWebsocketMode::HttpBridge
+        );
+        assert_eq!(ProxyConfig::default().max_bridge_sessions, 256);
+        assert_eq!(ProxyConfig::default().bridge_idle_seconds, 900);
+        assert_eq!(
+            ProxyConfig::default().bridge_admission_timeout_millis,
+            2_000
         );
     }
 
