@@ -48,7 +48,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 
 use crate::{
-    auth,
+    auth::{self, Credentials},
     config::{Config, ListenerConfig, PoolConfig, ResponsesWebsocketMode},
     routing::{
         AffinityStore, Router,
@@ -97,6 +97,11 @@ struct DirectTurn {
     value: serde_json::Value,
 }
 
+struct DirectUpstream {
+    socket: UpgradedWebSocket,
+    credentials: Credentials,
+}
+
 #[derive(Debug, Clone)]
 struct HttpBridgeContinuation {
     response_id: String,
@@ -108,6 +113,13 @@ struct HttpBridgeCapture {
     input: Vec<serde_json::Value>,
     response_id: Option<String>,
     output: Vec<serde_json::Value>,
+    delivered_event: bool,
+}
+
+#[derive(Debug)]
+struct HttpBridgePumpFailure {
+    error: anyhow::Error,
+    delivered_event: bool,
 }
 
 impl HttpBridgeCapture {
@@ -236,6 +248,22 @@ pub struct App {
 
 impl App {
     pub fn new(config: Arc<Config>, router: Arc<Router>, stats: Arc<Stats>) -> Result<Arc<Self>> {
+        config.validate()?;
+        Self::build(config, router, stats)
+    }
+
+    /// Tests use loopback HTTP upstreams to exercise proxy behavior. Keep that capability outside
+    /// the production constructor so manually assembled runtime configs cannot bypass validation.
+    #[cfg(test)]
+    fn new_unvalidated(
+        config: Arc<Config>,
+        router: Arc<Router>,
+        stats: Arc<Stats>,
+    ) -> Result<Arc<Self>> {
+        Self::build(config, router, stats)
+    }
+
+    fn build(config: Arc<Config>, router: Arc<Router>, stats: Arc<Stats>) -> Result<Arc<Self>> {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -289,6 +317,57 @@ impl App {
 
     pub async fn flush_file_owners(&self) -> Result<()> {
         self.file_owners.flush().await
+    }
+
+    /// Sweep every configured managed account by stable ID. Accounts are intentionally handled
+    /// one at a time so the configured 512-account bound also bounds refresh concurrency, and an
+    /// unreadable or rejected credential cannot abort the rest of the pass.
+    pub async fn refresh_managed_accounts_at(&self, now: u64) {
+        self.stats
+            .refresh_scheduler_ticks
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .refresh_last_sweep_unix
+            .store(now, Ordering::Relaxed);
+        self.stats.refresh_inflight.fetch_add(1, Ordering::Relaxed);
+        let results = self
+            .auth
+            .proactive_refresh_managed_at(&self.config.accounts, now)
+            .await;
+        self.stats.refresh_inflight.fetch_sub(1, Ordering::Relaxed);
+        self.stats
+            .refresh_accounts_checked
+            .fetch_add(results.len() as u64, Ordering::Relaxed);
+        for (account_id, result) in results {
+            match result {
+                Ok(auth::ProactiveRefresh::Fresh) => {
+                    self.router.proactive_auth_ready(&account_id).await;
+                }
+                Ok(auth::ProactiveRefresh::Refreshed) => {
+                    self.stats.refresh_successes.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .refresh_last_success_unix
+                        .store(now, Ordering::Relaxed);
+                    self.router.proactive_auth_ready(&account_id).await;
+                    info!(account = account_id, "managed credential refreshed");
+                }
+                Err(error) => {
+                    self.stats.refresh_failures.fetch_add(1, Ordering::Relaxed);
+                    if auth::is_reauth_required(&error) {
+                        self.stats
+                            .refresh_reauth_required
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.router.reauth_required(&account_id).await;
+                        warn!(
+                            account = account_id,
+                            "managed credential requires device login"
+                        );
+                    } else {
+                        warn!(account = account_id, %error, "proactive credential refresh failed");
+                    }
+                }
+            }
+        }
     }
 
     async fn spawn_tracked<F>(&self, task: F) -> bool
@@ -1167,28 +1246,70 @@ impl App {
                                 .await
                             {
                                 Ok(response) => {
-                                    if let Err(error) = pump_http_response_to_websocket(
+                                    let close_for_inbound_auth = response.status()
+                                        == StatusCode::UNAUTHORIZED
+                                        && response
+                                            .extensions()
+                                            .get::<SelectedAccount>()
+                                            .is_some_and(|selected| {
+                                                matches!(
+                                                    app.config.accounts.get(&selected.0),
+                                                    Some(crate::config::AccountConfig::Inbound)
+                                                )
+                                            });
+                                    let pump_result = pump_http_response_to_websocket(
                                         response,
                                         &outbound,
                                         &app,
                                         request_input,
                                         &continuation,
                                     )
-                                    .await
-                                    {
-                                        if error
+                                    .await;
+                                    if close_for_inbound_auth {
+                                        let _ = outbound
+                                            .send(Message::Close(Some(
+                                                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                                                    reason: "inbound credentials rejected; reconnect required".into(),
+                                                },
+                                            )))
+                                            .await;
+                                        let _ = fatal.send(
+                                            "inbound credentials rejected; downstream reconnect required"
+                                                .into(),
+                                        );
+                                        return;
+                                    }
+                                    if let Err(failure) = pump_result {
+                                        if failure
+                                            .error
                                             .to_string()
                                             .contains("backpressure prevented event delivery")
                                         {
-                                            let _ = fatal.send(error.to_string());
+                                            let _ = fatal.send(failure.error.to_string());
                                             return;
                                         }
-                                        send_ws_error(
-                                            &outbound,
-                                            "websocket_protocol_error",
-                                            &error.to_string(),
-                                        )
-                                        .await;
+                                        if failure.delivered_event {
+                                            let _ = outbound
+                                                .send(Message::Close(Some(
+                                                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error,
+                                                        reason: "upstream stream incomplete".into(),
+                                                    },
+                                                )))
+                                                .await;
+                                            let _ = fatal.send(format!(
+                                                "upstream stream ended after visible output: {}",
+                                                failure.error
+                                            ));
+                                        } else {
+                                            send_ws_error(
+                                                &outbound,
+                                                "websocket_protocol_error",
+                                                &failure.error.to_string(),
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                                 Err(error) => {
@@ -1329,7 +1450,7 @@ impl App {
         path: &str,
         inbound_headers: &hyper::HeaderMap,
         clear_session_state: bool,
-    ) -> Result<UpgradedWebSocket> {
+    ) -> Result<DirectUpstream> {
         for attempt in 0..2 {
             let uri = self.upstream_uri(path, false)?;
             let mut upstream_req = Request::builder()
@@ -1363,12 +1484,15 @@ impl App {
                 let upgrade = hyper::upgrade::on(&mut response).await;
                 match upgrade {
                     Ok(upgraded) => {
-                        return Ok(WebSocketStream::from_raw_socket(
-                            TokioIo::new(upgraded),
-                            Role::Client,
-                            None,
-                        )
-                        .await);
+                        return Ok(DirectUpstream {
+                            socket: WebSocketStream::from_raw_socket(
+                                TokioIo::new(upgraded),
+                                Role::Client,
+                                None,
+                            )
+                            .await,
+                            credentials,
+                        });
                     }
                     Err(error) => {
                         self.router.end(account).await;
@@ -1411,12 +1535,16 @@ impl App {
     async fn run_responses_direct(
         self: &Arc<Self>,
         mut client: UpgradedWebSocket,
-        mut upstream: UpgradedWebSocket,
+        upstream: DirectUpstream,
         listener: ListenerConfig,
         path: String,
         headers: hyper::HeaderMap,
         mut account: String,
     ) -> Result<()> {
+        let DirectUpstream {
+            socket: mut upstream,
+            credentials: mut upstream_credentials,
+        } = upstream;
         let mut lease = DirectAccountLease::new(self.router.clone(), account.clone());
         let mut protocol = ProtocolState::new(ProtocolLimits::default())
             .map_err(|error| anyhow::anyhow!("invalid direct protocol limits: {error:?}"))?;
@@ -1509,7 +1637,8 @@ impl App {
                                 .await;
                                 account = route.account_id.clone();
                                 lease.replace(account.clone()).await;
-                                upstream = replacement;
+                                upstream = replacement.socket;
+                                upstream_credentials = replacement.credentials;
                             }
                             let value = parsed.expect("response.create was checked");
                             let turn_id = match protocol.admit_response_create(&value) {
@@ -1551,6 +1680,7 @@ impl App {
                                         &mut turns,
                                         &mut client,
                                         &mut upstream,
+                                        &mut upstream_credentials,
                                         &listener,
                                         &path,
                                         &headers,
@@ -1608,6 +1738,7 @@ impl App {
                                         &path,
                                         &headers,
                                         &account,
+                                        &upstream_credentials,
                                     )
                                     .await?
                                 {
@@ -1618,7 +1749,8 @@ impl App {
                                     .await;
                                     account = replacement_account;
                                     lease.replace(account.clone()).await;
-                                    upstream = replacement;
+                                    upstream = replacement.socket;
+                                    upstream_credentials = replacement.credentials;
                                     continue;
                                 }
                             } else if failure.kind != FailureKind::None {
@@ -1725,6 +1857,7 @@ impl App {
                                     &mut turns,
                                     &mut client,
                                     &mut upstream,
+                                    &mut upstream_credentials,
                                     &listener,
                                     &path,
                                     &headers,
@@ -1749,6 +1882,7 @@ impl App {
                                     &mut turns,
                                     &mut client,
                                     &mut upstream,
+                                    &mut upstream_credentials,
                                     &listener,
                                     &path,
                                     &headers,
@@ -1785,7 +1919,8 @@ impl App {
         path: &str,
         headers: &hyper::HeaderMap,
         account: &str,
-    ) -> Result<Option<(UpgradedWebSocket, String)>> {
+        failed_credentials: &Credentials,
+    ) -> Result<Option<(DirectUpstream, String)>> {
         match failure {
             FailureKind::Quota => {
                 self.router
@@ -1810,13 +1945,9 @@ impl App {
         let mut replacement_account =
             match plan.target {
                 ReplayTarget::SameAccountAfterRefresh => {
-                    let credentials = self
-                        .auth
-                        .resolve(&self.config.accounts[account], headers)
-                        .await?;
                     match self
                         .auth
-                        .force_refresh(&self.config.accounts[account], &credentials)
+                        .force_refresh(&self.config.accounts[account], failed_credentials)
                         .await
                     {
                         Ok(Some(_)) => account.to_owned(),
@@ -1876,8 +2007,16 @@ impl App {
                         anyhow::anyhow!("consume failed direct auth reconnect: {error:?}")
                     })?;
                     return Box::pin(self.try_replay_direct_turn(
-                        protocol, turns, turn_id, failure, context, listener, path, headers,
+                        protocol,
+                        turns,
+                        turn_id,
+                        failure,
+                        context,
+                        listener,
+                        path,
+                        headers,
                         account,
+                        failed_credentials,
                     ))
                     .await;
                 }
@@ -1905,7 +2044,7 @@ impl App {
         if committed != plan {
             anyhow::bail!("direct replay plan changed before commit")
         }
-        if let Err(error) = replacement.send(replay_message.clone()).await {
+        if let Err(error) = replacement.socket.send(replay_message.clone()).await {
             warn!(%error, account = replacement_account, "safe direct replay send failed");
             return Ok(None);
         }
@@ -1933,6 +2072,7 @@ impl App {
         turns: &mut HashMap<TurnId, DirectTurn>,
         client: &mut UpgradedWebSocket,
         upstream: &mut UpgradedWebSocket,
+        upstream_credentials: &mut Credentials,
         listener: &ListenerConfig,
         path: &str,
         headers: &hyper::HeaderMap,
@@ -1953,13 +2093,15 @@ impl App {
                     path,
                     headers,
                     account,
+                    upstream_credentials,
                 )
                 .await?
             {
                 let _ = tokio::time::timeout(Duration::from_secs(2), upstream.close(None)).await;
                 *account = replacement_account;
                 lease.replace(account.clone()).await;
-                *upstream = replacement;
+                *upstream = replacement.socket;
+                *upstream_credentials = replacement.credentials;
                 return Ok(false);
             }
         }
@@ -2019,7 +2161,8 @@ impl App {
             Ok(replacement) => {
                 let _ = tokio::time::timeout(Duration::from_secs(2), upstream.close(None)).await;
                 lease.replace(account.clone()).await;
-                *upstream = replacement;
+                *upstream = replacement.socket;
+                *upstream_credentials = replacement.credentials;
                 Ok(false)
             }
             Err(error) => {
@@ -2228,7 +2371,10 @@ impl App {
                                     if let Err(error) = app
                                         .run_responses_direct(
                                             client,
-                                            upstream,
+                                            DirectUpstream {
+                                                socket: upstream,
+                                                credentials: credentials.clone(),
+                                            },
                                             listener,
                                             path,
                                             headers,
@@ -2538,18 +2684,8 @@ fn map_http_response_leased(
     let (mut parts, body) = response.into_parts();
     headers::strip_hop_by_hop(&mut parts.headers);
     parts.extensions.insert(SelectedAccount(account.clone()));
-    let observer = observe_response_ids.then(|| {
-        if parts
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
-        {
-            HttpResponseObserver::Json(Vec::new())
-        } else {
-            HttpResponseObserver::Sse(SseDecoder::default())
-        }
-    });
+    let observer = observe_response_ids
+        .then(|| response_observer_for_content_type(parts.headers.get(CONTENT_TYPE)));
     Response::from_parts(
         parts,
         BodyExt::boxed(LeasedIncoming {
@@ -2576,7 +2712,85 @@ struct LeasedIncoming {
 
 enum HttpResponseObserver {
     Sse(SseDecoder),
-    Json(Vec<u8>),
+    Json(Option<Vec<u8>>),
+    /// Wire bytes, not Content-Type, select the observer. At most the small
+    /// sniff prefix is retained before committing to streaming SSE or bounded
+    /// JSON observation, so a mislabeled SSE never incurs full-body buffering.
+    Undecided(Vec<u8>),
+}
+
+fn response_observer_for_content_type(
+    _content_type: Option<&hyper::header::HeaderValue>,
+) -> HttpResponseObserver {
+    HttpResponseObserver::Undecided(Vec::new())
+}
+
+impl HttpResponseObserver {
+    fn observe(&mut self, data: &[u8]) -> Vec<String> {
+        match self {
+            Self::Sse(decoder) => observe_sse_response_ids(decoder, data),
+            Self::Json(json) => {
+                if let Some(bytes) = json {
+                    if bytes.len().saturating_add(data.len()) <= RESPONSES_JSON_RESPONSE_LIMIT {
+                        bytes.extend_from_slice(data);
+                    } else {
+                        *json = None;
+                    }
+                }
+                Vec::new()
+            }
+            Self::Undecided(buffered) => {
+                let mut probe = buffered.clone();
+                let remaining = UNKNOWN_CONTENT_SNIFF_BYTES.saturating_sub(probe.len());
+                probe.extend_from_slice(&data[..data.len().min(remaining)]);
+                let kind = sniffed_body_kind(&probe).or_else(|| {
+                    (probe.len() >= UNKNOWN_CONTENT_SNIFF_BYTES).then_some(SniffedBodyKind::Json)
+                });
+                let Some(kind) = kind else {
+                    *buffered = probe;
+                    return Vec::new();
+                };
+                let previous = std::mem::take(buffered);
+                *self = match kind {
+                    SniffedBodyKind::Json => Self::Json(Some(Vec::new())),
+                    SniffedBodyKind::Sse => Self::Sse(SseDecoder::default()),
+                };
+                let mut ids = self.observe(&previous);
+                ids.extend(self.observe(data));
+                ids
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        match self {
+            Self::Sse(mut decoder) => response_ids_from_sse_finish(&mut decoder),
+            Self::Json(Some(bytes)) => response_ids_from_json(&bytes),
+            Self::Json(None) => Vec::new(),
+            Self::Undecided(bytes) => response_ids_from_json(&bytes),
+        }
+    }
+}
+
+fn observe_sse_response_ids(decoder: &mut SseDecoder, data: &[u8]) -> Vec<String> {
+    let mut response_id = None;
+    for slice in data.chunks(SSE_DECODE_SLICE_BYTES) {
+        if let Ok(events) = decoder.push(slice)
+            && response_id.is_none()
+        {
+            response_id = events.into_iter().find_map(response_id_from_protocol_event);
+        }
+    }
+    response_id.into_iter().collect()
+}
+
+fn response_ids_from_sse_finish(decoder: &mut SseDecoder) -> Vec<String> {
+    decoder
+        .finish()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(response_id_from_protocol_event)
+        .collect()
 }
 
 impl Body for LeasedIncoming {
@@ -2641,43 +2855,17 @@ impl Body for LeasedIncoming {
 
 impl LeasedIncoming {
     fn observe_response_data(&mut self, data: &[u8]) -> Vec<String> {
-        match self.observer.as_mut() {
-            Some(HttpResponseObserver::Sse(decoder)) => {
-                let mut response_id = None;
-                for slice in data.chunks(SSE_DECODE_SLICE_BYTES) {
-                    if let Ok(events) = decoder.push(slice)
-                        && response_id.is_none()
-                    {
-                        response_id = events.into_iter().find_map(response_id_from_protocol_event);
-                    }
-                }
-                response_id.into_iter().collect()
-            }
-            Some(HttpResponseObserver::Json(bytes))
-                if bytes.len().saturating_add(data.len()) <= RESPONSES_JSON_RESPONSE_LIMIT =>
-            {
-                bytes.extend_from_slice(data);
-                Vec::new()
-            }
-            Some(HttpResponseObserver::Json(_)) => {
-                self.observer = None;
-                Vec::new()
-            }
-            None => Vec::new(),
-        }
+        self.observer
+            .as_mut()
+            .map(|observer| observer.observe(data))
+            .unwrap_or_default()
     }
 
     fn finish_response_observer(&mut self) -> Vec<String> {
-        match self.observer.take() {
-            Some(HttpResponseObserver::Sse(mut decoder)) => decoder
-                .finish()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(response_id_from_protocol_event)
-                .collect(),
-            Some(HttpResponseObserver::Json(bytes)) => response_ids_from_json(&bytes),
-            None => Vec::new(),
-        }
+        self.observer
+            .take()
+            .map(HttpResponseObserver::finish)
+            .unwrap_or_default()
     }
 
     fn response_binding(
@@ -2944,12 +3132,14 @@ async fn pump_http_response_to_websocket(
     app: &Arc<App>,
     request_input: Vec<serde_json::Value>,
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
-) -> Result<()> {
+) -> std::result::Result<(), HttpBridgePumpFailure> {
     let mut capture = HttpBridgeCapture {
         input: request_input,
         response_id: None,
         output: Vec::new(),
+        delivered_event: false,
     };
+    let result: Result<()> = async {
     let status = response.status();
     let response_headers = response.headers().clone();
     let content_type = response
@@ -2985,15 +3175,23 @@ async fn pump_http_response_to_websocket(
         send_ws_http_error(outbound, status, error, &response_headers).await;
         return Ok(());
     }
-    let explicit_sse = content_type.contains("text/event-stream");
-    let explicit_json = content_type.contains("application/json");
-    let (sniffed_sse, initial_chunks) = if !explicit_sse && !explicit_json {
-        let (kind, chunks) = sniff_unknown_responses_body(&mut body).await?;
-        (kind == SniffedBodyKind::Sse, chunks)
-    } else {
-        (false, Vec::new())
-    };
-    if explicit_sse || sniffed_sse {
+    let header_kind = content_type
+        .contains("text/event-stream")
+        .then_some(SniffedBodyKind::Sse)
+        .or_else(|| {
+            content_type
+                .contains("application/json")
+                .then_some(SniffedBodyKind::Json)
+        })
+        .unwrap_or(SniffedBodyKind::Json);
+    // Select the protocol from a bounded wire prefix even when Content-Type is
+    // explicit. Intermediaries have been observed to preserve stale response
+    // headers; trusting those headers can turn a valid terminal response into
+    // a retryable protocol failure. The header is only the fallback when the
+    // prefix remains undecidable.
+    let (body_kind, initial_chunks) =
+        sniff_unknown_responses_body(&mut body, header_kind).await?;
+    if body_kind == SniffedBodyKind::Sse {
         let mut decoder = SseDecoder::default();
         for data in initial_chunks {
             if send_sse_data(
@@ -3048,7 +3246,7 @@ async fn pump_http_response_to_websocket(
             .await?;
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
-        Err(json_error) if explicit_json => {
+        Err(json_error) if header_kind == SniffedBodyKind::Json => {
             return Err(json_error.into());
         }
         Err(_) => anyhow::bail!("successful Responses body was not valid JSON"),
@@ -3072,6 +3270,12 @@ async fn pump_http_response_to_websocket(
         anyhow::bail!("successful Responses JSON produced no terminal event")
     }
     Ok(())
+    }
+    .await;
+    result.map_err(|error| HttpBridgePumpFailure {
+        error,
+        delivered_event: capture.delivered_event,
+    })
 }
 
 async fn send_protocol_events(
@@ -3100,6 +3304,7 @@ async fn send_protocol_events(
         if !outbound.send(Message::Text(event.payload.into())).await {
             anyhow::bail!("downstream WebSocket backpressure prevented event delivery")
         }
+        capture.delivered_event = true;
         if terminal {
             return Ok(true);
         }
@@ -3182,8 +3387,23 @@ enum SniffedBodyKind {
     Sse,
 }
 
+fn sniffed_body_kind(prefix: &[u8]) -> Option<SniffedBodyKind> {
+    let trimmed = prefix
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map(|offset| &prefix[offset..])?;
+    if matches!(trimmed.first(), Some(b'{') | Some(b'[')) {
+        return Some(SniffedBodyKind::Json);
+    }
+    [b"data:".as_slice(), b"event:", b"id:", b"retry:", b":"]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+        .then_some(SniffedBodyKind::Sse)
+}
+
 async fn sniff_unknown_responses_body(
     body: &mut ProxyBody,
+    fallback: SniffedBodyKind,
 ) -> Result<(SniffedBodyKind, Vec<bytes::Bytes>)> {
     let mut prefix = bytes::BytesMut::new();
     let mut chunks = Vec::new();
@@ -3198,23 +3418,11 @@ async fn sniff_unknown_responses_body(
         let remaining = UNKNOWN_CONTENT_SNIFF_BYTES - prefix.len();
         prefix.extend_from_slice(&data[..data.len().min(remaining)]);
         chunks.push(data);
-        let trimmed = prefix
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .map(|offset| &prefix[offset..]);
-        if let Some(trimmed) = trimmed {
-            if matches!(trimmed.first(), Some(b'{') | Some(b'[')) {
-                return Ok((SniffedBodyKind::Json, chunks));
-            }
-            if [b"data:".as_slice(), b"event:", b"id:", b"retry:", b":"]
-                .iter()
-                .any(|marker| trimmed.starts_with(marker))
-            {
-                return Ok((SniffedBodyKind::Sse, chunks));
-            }
+        if let Some(kind) = sniffed_body_kind(&prefix) {
+            return Ok((kind, chunks));
         }
     }
-    Ok((SniffedBodyKind::Json, chunks))
+    Ok((fallback, chunks))
 }
 
 fn is_safe_codex_quota_header(name: &str) -> bool {
@@ -3223,9 +3431,14 @@ fn is_safe_codex_quota_header(name: &str) -> bool {
             || (["-primary-", "-secondary-", "-tertiary-"]
                 .iter()
                 .any(|part| name.contains(part))
-                && ["-used-percent", "-window-minutes", "-reset-at"]
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix))))
+                && [
+                    "-used-percent",
+                    "-window-minutes",
+                    "-reset-at",
+                    "-reset-after-seconds",
+                ]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))))
 }
 
 async fn collect_proxy_body(body: &mut ProxyBody, limit: usize) -> Result<bytes::Bytes> {
@@ -3278,6 +3491,128 @@ mod tests {
         body: Bytes,
     }
 
+    #[test]
+    fn response_observer_binds_json_without_content_type() {
+        let mut observer = response_observer_for_content_type(None);
+        assert!(matches!(observer, HttpResponseObserver::Undecided(_)));
+        assert!(
+            observer
+                .observe(br#"{"id":"resp_missing_type","object":"response"}"#)
+                .is_empty()
+        );
+        assert_eq!(observer.finish(), ["resp_missing_type"]);
+    }
+
+    #[test]
+    fn response_observer_binds_json_with_generic_content_type() {
+        let content_type = hyper::header::HeaderValue::from_static("application/octet-stream");
+        let mut observer = response_observer_for_content_type(Some(&content_type));
+        assert!(matches!(observer, HttpResponseObserver::Undecided(_)));
+        assert!(
+            observer
+                .observe(br#"{"response":{"id":"resp_generic_type"}}"#)
+                .is_empty()
+        );
+        assert_eq!(observer.finish(), ["resp_generic_type"]);
+    }
+
+    #[test]
+    fn response_observer_keeps_explicit_sse_streaming() {
+        let content_type = hyper::header::HeaderValue::from_static("text/event-stream");
+        let mut observer = response_observer_for_content_type(Some(&content_type));
+        assert!(matches!(observer, HttpResponseObserver::Undecided(_)));
+        let event = br#"data: {"type":"response.created","response":{"id":"resp_stream"}}
+
+"#;
+        let ids = observer.observe(event);
+        assert_eq!(ids, ["resp_stream"]);
+        assert!(matches!(observer, HttpResponseObserver::Sse(_)));
+        assert!(observer.finish().is_empty());
+
+        // A mislabeled stream takes the dual path, but still discovers the ID
+        // from the current frame instead of waiting for EOF/JSON parsing.
+        let generic = hyper::header::HeaderValue::from_static("application/octet-stream");
+        let mut observer = response_observer_for_content_type(Some(&generic));
+        let ids = observer.observe(event);
+        assert_eq!(ids, ["resp_stream"]);
+        assert!(observer.finish().is_empty());
+
+        // Content-Type cannot override a JSON wire body.
+        let mislabeled = hyper::header::HeaderValue::from_static("text/event-stream");
+        let mut observer = response_observer_for_content_type(Some(&mislabeled));
+        assert!(
+            observer
+                .observe(b"  {\"id\":\"resp_mislabeled_json\",\"object\":\"response\"}")
+                .is_empty()
+        );
+        assert_eq!(observer.finish(), ["resp_mislabeled_json"]);
+    }
+
+    #[test]
+    fn response_observer_ignores_malformed_and_non_response_bodies() {
+        let mut malformed = response_observer_for_content_type(None);
+        assert!(malformed.observe(br#"{"id":"resp_broken""#).is_empty());
+        assert!(malformed.finish().is_empty());
+
+        let generic = hyper::header::HeaderValue::from_static("text/plain");
+        let mut unrelated = response_observer_for_content_type(Some(&generic));
+        assert!(unrelated.observe(br#"{"ok":true,"items":[]}"#).is_empty());
+        assert!(unrelated.finish().is_empty());
+    }
+
+    #[test]
+    fn public_constructor_rejects_noncanonical_credential_destinations() {
+        for upstream in [
+            "https://example.invalid/backend-api/codex",
+            "http://127.0.0.1:12345/backend-api/codex",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let managed_home = dir.path().join("managed");
+            std::fs::create_dir_all(&managed_home).unwrap();
+            let listener = ListenerConfig {
+                address: "127.0.0.1:0".parse().unwrap(),
+                pool: "default".into(),
+            };
+            let config = Arc::new(Config {
+                proxy: ProxyConfig {
+                    upstream: upstream.into(),
+                    installation_secret: "0123456789abcdef".into(),
+                    affinity_key: "0123456789abcdef0123456789abcdef".into(),
+                    state_dir: Some(dir.path().join("state")),
+                    ..ProxyConfig::default()
+                },
+                listeners: BTreeMap::from([("default".into(), listener)]),
+                pools: BTreeMap::from([(
+                    "default".into(),
+                    PoolConfig {
+                        members: vec!["managed".into()],
+                    },
+                )]),
+                accounts: BTreeMap::from([(
+                    "managed".into(),
+                    AccountConfig::CodexHome { path: managed_home },
+                )]),
+            });
+            let affinity = Arc::new(
+                AffinityStore::load(
+                    dir.path().join("affinity.json"),
+                    &config.proxy.affinity_key,
+                    100,
+                    100_000,
+                    Duration::from_secs(60),
+                )
+                .unwrap(),
+            );
+            let router = Arc::new(Router::new(&config, affinity));
+
+            let error = match App::new(config, router, Arc::new(Stats::default())) {
+                Ok(_) => panic!("public constructor accepted credential destination {upstream}"),
+                Err(error) => error,
+            };
+            assert!(format!("{error:#}").contains("proxy.upstream must be exactly"));
+        }
+    }
+
     fn direct_test_app(
         dir: &std::path::Path,
     ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
@@ -3317,7 +3652,7 @@ mod tests {
         );
         let router = Arc::new(Router::new(&config, affinity));
         let stats = Arc::new(Stats::default());
-        let app = App::new(config, router.clone(), stats.clone()).unwrap();
+        let app = App::new_unvalidated(config, router.clone(), stats.clone()).unwrap();
         (app, listener, router, stats)
     }
 
@@ -3507,6 +3842,10 @@ mod tests {
                 "/v1/responses",
                 &headers,
                 "a",
+                &Credentials {
+                    authorization: "Bearer token-a".into(),
+                    account_id: None,
+                },
             )
             .await
             .unwrap();
@@ -3627,7 +3966,7 @@ mod tests {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new(config, router, Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router, Arc::new(Stats::default())).unwrap();
         let proxy_task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
 
         let client: TestClient<HttpConnector, Full<Bytes>> =
@@ -3873,7 +4212,7 @@ mod tests {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new(config, router, Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router, Arc::new(Stats::default())).unwrap();
         let proxy_task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
         let client: TestClient<HttpConnector, Full<Bytes>> =
             TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
@@ -3965,7 +4304,7 @@ mod tests {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new(config, router.clone(), Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default())).unwrap();
         let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
         (proxy_addr, task, router)
     }
@@ -4031,9 +4370,64 @@ mod tests {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new(config, router.clone(), Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default())).unwrap();
         let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
         (proxy_addr, task, router)
+    }
+
+    async fn start_managed_caller_proxy(
+        dir: &std::path::Path,
+        upstream: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Result<()>>) {
+        let account = dir.join("managed");
+        fs::create_dir_all(&account).unwrap();
+        fs::write(
+            account.join("auth.json"),
+            r#"{"tokens":{"access_token":"managed-token"}}"#,
+        )
+        .unwrap();
+
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_tcp.local_addr().unwrap();
+        let listener = ListenerConfig {
+            address: proxy_addr,
+            pool: "default".into(),
+        };
+        let config = Arc::new(Config {
+            proxy: ProxyConfig {
+                upstream,
+                responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
+                installation_secret: "0123456789abcdef".into(),
+                affinity_key: "0123456789abcdef0123456789abcdef".into(),
+                state_dir: Some(dir.join("state")),
+                ..ProxyConfig::default()
+            },
+            listeners: BTreeMap::from([("default".into(), listener.clone())]),
+            pools: BTreeMap::from([(
+                "default".into(),
+                PoolConfig {
+                    members: vec!["managed".into()],
+                },
+            )]),
+            accounts: BTreeMap::from([(
+                "managed".into(),
+                AccountConfig::CodexHome { path: account },
+            )]),
+        });
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.join("affinity.json"),
+                &config.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(Router::new(&config, affinity));
+        let app = App::new_unvalidated(config, router, Arc::new(Stats::default())).unwrap();
+        let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
+        (proxy_addr, task)
     }
 
     async fn connect_test_websocket_with_headers(
@@ -4057,13 +4451,20 @@ mod tests {
     }
 
     async fn connect_test_websocket(address: std::net::SocketAddr) -> WebSocketStream<TcpStream> {
+        connect_test_websocket_with_token(address, "caller-token").await
+    }
+
+    async fn connect_test_websocket_with_token(
+        address: std::net::SocketAddr,
+        token: &str,
+    ) -> WebSocketStream<TcpStream> {
         let stream = TcpStream::connect(address).await.unwrap();
         let mut request = format!("ws://{address}/0123456789abcdef/v1/responses")
             .into_client_request()
             .unwrap();
         request
             .headers_mut()
-            .insert(AUTHORIZATION, "Bearer caller-token".parse().unwrap());
+            .insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         let (websocket, _) = tokio_tungstenite::client_async(request, stream)
             .await
             .unwrap();
@@ -4228,6 +4629,395 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&completed).unwrap()["type"],
             "response.completed"
         );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    async fn assert_http_bridge_uses_wire_body_over_content_type(
+        content_type: &'static str,
+        body: Bytes,
+        expected_types: &[&str],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let service = service_fn(move |_req: Request<Incoming>| {
+                let body = body.clone();
+                async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, content_type)
+                            .body(Full::new(body))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::HttpBridge,
+        )
+        .await;
+        let mut websocket = connect_test_websocket(proxy_addr).await;
+        websocket
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut actual = Vec::new();
+        for _ in expected_types {
+            let message = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let event: serde_json::Value = serde_json::from_str(&message).unwrap();
+            actual.push(event["type"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(actual, expected_types);
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_bridge_accepts_json_mislabeled_as_sse() {
+        assert_http_bridge_uses_wire_body_over_content_type(
+            "text/event-stream",
+            Bytes::from_static(br#"{"id":"resp_json","status":"completed","output":[]}"#),
+            &["response.created", "response.completed"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn http_bridge_accepts_sse_mislabeled_as_json() {
+        assert_http_bridge_uses_wire_body_over_content_type(
+            "application/json",
+            Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_sse\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_sse\",\"status\":\"completed\"}}\n\n",
+            ),
+            &["response.created", "response.completed"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn http_bridge_inbound_401_closes_and_reconnect_uses_new_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_seen = seen.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let seen = upstream_seen.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            let authorization =
+                                req.headers()[AUTHORIZATION].to_str().unwrap().to_owned();
+                            seen.lock().unwrap().push(authorization.clone());
+                            let response = if authorization == "Bearer fresh-token" {
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .body(Full::new(Bytes::from_static(
+                                        b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fresh\",\"status\":\"completed\"}}\n\n",
+                                    )))
+                                    .unwrap()
+                            } else {
+                                Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"error":{"type":"authentication_error","code":"invalid_token","message":"expired credential"}}"#,
+                                    )))
+                                    .unwrap()
+                            };
+                            Ok::<_, Infallible>(response)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::HttpBridge,
+        )
+        .await;
+
+        let mut stale = connect_test_websocket_with_token(proxy_addr, "stale-token").await;
+        stale
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_str(
+            stale
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["status"], 401);
+        assert_eq!(error["error"]["code"], "invalid_token");
+        let close = stale.next().await.unwrap().unwrap();
+        let Message::Close(Some(close)) = close else {
+            panic!("expected WebSocket close after inbound 401, got {close:?}");
+        };
+        assert_eq!(
+            close.code,
+            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+        );
+        assert_eq!(
+            close.reason,
+            "inbound credentials rejected; reconnect required"
+        );
+
+        let mut fresh = connect_test_websocket_with_token(proxy_addr, "fresh-token").await;
+        fresh
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let completed: serde_json::Value = serde_json::from_str(
+            fresh
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(completed["type"], "response.completed");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["Bearer stale-token", "Bearer fresh-token"]
+        );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_bridge_managed_401_keeps_downstream_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Full::new(Bytes::from_static(
+                                    br#"{"error":{"type":"authentication_error","code":"invalid_token","message":"managed credential rejected"}}"#,
+                                )))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_managed_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        )
+        .await;
+        let mut websocket = connect_test_websocket(proxy_addr).await;
+        websocket
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_str(
+            websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(error["status"], 401);
+
+        let ping = Bytes::from_static(b"still-open");
+        websocket.send(Message::Ping(ping.clone())).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), websocket.next())
+                .await
+                .expect("managed bridge should remain open")
+                .unwrap()
+                .unwrap(),
+            Message::Pong(ping)
+        );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_bridge_marks_partial_sse_eof_non_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "text/event-stream")
+                                .body(Full::new(Bytes::from_static(
+                                    b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\",\"status\":\"in_progress\"}}\n\n",
+                                )))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::HttpBridge,
+        )
+        .await;
+        let mut websocket = connect_test_websocket(proxy_addr).await;
+        websocket
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let created: serde_json::Value = serde_json::from_str(
+            websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let close = websocket.next().await.unwrap().unwrap();
+        assert_eq!(created["type"], "response.created");
+        let Message::Close(Some(frame)) = close else {
+            panic!("expected 1011 close after visible partial stream, got {close:?}")
+        };
+        assert_eq!(
+            frame.code,
+            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error
+        );
+        assert_eq!(frame.reason, "upstream stream incomplete");
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_bridge_keeps_pre_output_sse_failure_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let service = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "text/event-stream")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::HttpBridge,
+        )
+        .await;
+        let mut websocket = connect_test_websocket(proxy_addr).await;
+        websocket
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let error: serde_json::Value = serde_json::from_str(
+            websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["code"], "websocket_protocol_error");
+        assert_eq!(error["error"]["retryable"], true);
         proxy_task.abort();
         upstream_task.abort();
     }

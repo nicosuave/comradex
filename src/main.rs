@@ -3,13 +3,14 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
 use comradex::{
+    auth_lock::HomeAuthLock,
     codex_process::{self, ProcessControl, SystemProcesses},
     config::Config,
     install,
@@ -280,6 +281,20 @@ async fn serve(path: &Path) -> Result<()> {
             }
         }
     });
+    let refresh_app = app.clone();
+    let refresh_background = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            comradex::auth::PROACTIVE_REFRESH_INTERVAL_SECONDS,
+        ));
+        loop {
+            interval.tick().await;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            refresh_app.refresh_managed_accounts_at(now).await;
+        }
+    });
     let listener_error = tokio::select! {
         signal = shutdown_signal() => {
             signal?;
@@ -297,6 +312,8 @@ async fn serve(path: &Path) -> Result<()> {
     info!("shutting down");
     background.abort();
     let _ = background.await;
+    refresh_background.abort();
+    let _ = refresh_background.await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     app.shutdown_connections().await;
@@ -437,6 +454,20 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
                 println!(
                     "  {} buffered on disk",
                     human_bytes(stats.active_spool_bytes)
+                );
+            }
+            println!(
+                "  refresh scheduler: {} sweep(s), {} account check(s), {} refreshed, {} failure(s) ({} need login)",
+                stats.refresh_scheduler_ticks,
+                stats.refresh_accounts_checked,
+                stats.refresh_successes,
+                stats.refresh_failures,
+                stats.refresh_reauth_required,
+            );
+            if stats.refresh_last_sweep_unix > 0 {
+                println!(
+                    "  last refresh sweep unix {}, last successful refresh unix {}",
+                    stats.refresh_last_sweep_unix, stats.refresh_last_success_unix
                 );
             }
         }
@@ -636,17 +667,26 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
     let comradex::config::AccountConfig::CodexHome { path } = account else {
         bail!("this is the Codex App's own login and cannot be logged in here")
     };
+    service::while_daemon_stopped(|| {
+        login_managed_home_with(path, |path| {
+            let status = Command::new("codex")
+                .arg("login")
+                .arg("--device-auth")
+                .env("CODEX_HOME", path)
+                .status()
+                .context("launch codex device login")?;
+            if !status.success() {
+                bail!("codex login exited with {status}")
+            }
+            Ok(())
+        })
+    })
+}
+
+fn login_managed_home_with(path: &Path, run_login: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     fs::create_dir_all(path)?;
-    let status = Command::new("codex")
-        .arg("login")
-        .arg("--device-auth")
-        .env("CODEX_HOME", path)
-        .status()
-        .context("launch codex device login")?;
-    if !status.success() {
-        bail!("codex login exited with {status}")
-    }
-    Ok(())
+    let _guard = HomeAuthLock::acquire(path)?;
+    run_login(path)
 }
 
 fn state_dir(config: &Config) -> PathBuf {
@@ -657,6 +697,32 @@ fn state_dir(config: &Config) -> PathBuf {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn managed_login_holds_auth_lock_for_entire_child_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+
+        login_managed_home_with(&home, |child_home| {
+            assert!(HomeAuthLock::try_acquire(child_home)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_managed_login_releases_auth_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+
+        let error = login_managed_home_with(&home, |_| bail!("simulated child failure"))
+            .expect_err("child failure should propagate");
+
+        assert!(error.to_string().contains("simulated child failure"));
+        assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+    }
 
     #[test]
     fn config_path_defaults_to_user_config_directory() {

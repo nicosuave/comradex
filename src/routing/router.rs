@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, NaiveDateTime, Utc};
 use tokio::sync::Mutex;
 use tracing::error;
 
@@ -28,6 +29,7 @@ struct AccountRuntime {
     inflight: u64,
     last_assigned: u64,
     needs_login: bool,
+    needs_login_retry_at: Option<Instant>,
     quota_until: Option<Instant>,
     avoid_until: Option<Instant>,
 }
@@ -99,8 +101,13 @@ impl Router {
         };
         let mut accounts = self.accounts.lock().await;
         for runtime in accounts.values_mut() {
-            if runtime.needs_login && runtime.avoid_until.is_some_and(|until| until <= now) {
+            if runtime.needs_login
+                && runtime
+                    .needs_login_retry_at
+                    .is_some_and(|until| until <= now)
+            {
                 runtime.needs_login = false;
+                runtime.needs_login_retry_at = None;
             }
         }
         if let Some(binding) = binding {
@@ -235,12 +242,37 @@ impl Router {
     }
     pub async fn auth_failure(&self, account: &str) {
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
+            if a.needs_login && a.needs_login_retry_at.is_none() {
+                return;
+            }
             a.needs_login = true;
-            a.avoid_until = Some(Instant::now() + Duration::from_secs(60));
+            let retry_at = Instant::now() + Duration::from_secs(60);
+            a.needs_login_retry_at = Some(retry_at);
+            a.avoid_until = Some(retry_at);
         }
         self.affinity.invalidate_account(account).await;
         if let Err(error) = self.affinity.flush().await {
             error!(%error, account, "failed to persist account affinity invalidation");
+        }
+    }
+
+    /// Keep an account out of routing until its managed credential file is repaired. Unlike a
+    /// request-time 401, a refresh-token rejection is not expected to heal after a short delay.
+    pub async fn reauth_required(&self, account: &str) {
+        if let Some(a) = self.accounts.lock().await.get_mut(account) {
+            a.needs_login = true;
+            a.needs_login_retry_at = None;
+        }
+    }
+
+    /// Clear only the durable reauthentication state owned by the proactive refresh scheduler.
+    /// Temporary request-time auth backoff remains owned by `auth_failure`.
+    pub async fn proactive_auth_ready(&self, account: &str) {
+        if let Some(a) = self.accounts.lock().await.get_mut(account)
+            && a.needs_login
+            && a.needs_login_retry_at.is_none()
+        {
+            a.needs_login = false;
         }
     }
     pub async fn observe_headers(&self, account: &str, headers: &hyper::HeaderMap) {
@@ -266,26 +298,77 @@ impl Router {
 }
 
 fn quota_delay(headers: &hyper::HeaderMap) -> Duration {
-    let seconds = [
-        "retry-after",
-        "x-codex-primary-reset-after-seconds",
-        "x-codex-secondary-reset-after-seconds",
-        "x-ratelimit-reset-after-seconds",
-    ]
-    .iter()
-    .filter_map(|name| {
-        headers
-            .get(*name)?
-            .to_str()
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-    })
-    .max()
-    .unwrap_or(60)
-    .clamp(1, 24 * 60 * 60);
+    quota_delay_at(headers, Utc::now())
+}
+
+fn quota_delay_at(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> Duration {
+    let seconds = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str();
+            let value = value.to_str().ok()?.trim();
+            if name == "retry-after" {
+                return value.parse::<u64>().ok().or_else(|| {
+                    parse_http_date(value).map(|reset_at| seconds_until(reset_at, now))
+                });
+            }
+            if !is_quota_reset_header(name) {
+                return None;
+            }
+            if name.ends_with("-reset-after-seconds") {
+                value.parse::<u64>().ok()
+            } else {
+                parse_reset_at(value).map(|reset_at| seconds_until(reset_at, now))
+            }
+        })
+        .max()
+        .unwrap_or(60)
+        .clamp(1, 24 * 60 * 60);
     Duration::from_secs(seconds)
+}
+
+fn is_quota_reset_header(name: &str) -> bool {
+    let supported_prefix = name.starts_with("x-codex-") || name.starts_with("x-ratelimit-");
+    let supported_window = ["-primary-", "-secondary-", "-tertiary-"]
+        .iter()
+        .any(|window| name.contains(window));
+    supported_prefix
+        && (name == "x-codex-reset-after-seconds"
+            || name == "x-ratelimit-reset-after-seconds"
+            || (supported_window
+                && (name.ends_with("-reset-after-seconds") || name.ends_with("-reset-at"))))
+}
+
+fn parse_reset_at(value: &str) -> Option<DateTime<Utc>> {
+    value
+        .parse::<i64>()
+        .ok()
+        .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+        })
+}
+
+fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT")
+                .ok()
+                .map(|timestamp| timestamp.and_utc())
+        })
+}
+
+fn seconds_until(reset_at: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
+    reset_at
+        .signed_duration_since(now)
+        .num_milliseconds()
+        .max(0)
+        .saturating_add(999)
+        .div_euclid(1_000) as u64
 }
 
 #[cfg(test)]
@@ -430,6 +513,119 @@ mod tests {
                 .unwrap()
                 .account_id,
             second.account_id
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_reauth_is_durable_without_invalidating_affinity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity.clone());
+        let pool = &cfg.pools["default"];
+        let key = affinity.key("owned-thread");
+        assert!(router.bind(key.clone(), "a").await);
+
+        router.reauth_required("a").await;
+        assert!(router.select_exact(pool, "a").await.is_none());
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+
+        router.proactive_auth_ready("a").await;
+        assert!(router.select_exact(pool, "a").await.is_some());
+        assert_eq!(affinity.get(&key).await.unwrap().account_id, "a");
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn quota_delay_accepts_tertiary_only_evidence() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-tertiary-reset-after-seconds",
+            HeaderValue::from_static("321"),
+        );
+
+        assert_eq!(
+            quota_delay_at(&headers, fixed_now()),
+            Duration::from_secs(321)
+        );
+    }
+
+    #[test]
+    fn quota_delay_accepts_epoch_and_iso_absolute_resets() {
+        let now = fixed_now();
+        let mut epoch_headers = HeaderMap::new();
+        epoch_headers.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_str(&(now.timestamp() + 450).to_string()).unwrap(),
+        );
+        assert_eq!(
+            quota_delay_at(&epoch_headers, now),
+            Duration::from_secs(450)
+        );
+
+        let mut iso_headers = HeaderMap::new();
+        iso_headers.insert(
+            "x-ratelimit-secondary-reset-at",
+            HeaderValue::from_static("2026-08-11T12:07:31Z"),
+        );
+        assert_eq!(quota_delay_at(&iso_headers, now), Duration::from_secs(451));
+    }
+
+    #[test]
+    fn quota_delay_accepts_http_date_retry_after() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_static("Tue, 11 Aug 2026 12:02:03 GMT"),
+        );
+
+        assert_eq!(
+            quota_delay_at(&headers, fixed_now()),
+            Duration::from_secs(123)
+        );
+    }
+
+    #[test]
+    fn quota_delay_uses_longest_valid_window_and_ignores_malformed_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("20"));
+        headers.insert(
+            "x-codex-primary-reset-after-seconds",
+            HeaderValue::from_static("malformed"),
+        );
+        headers.insert(
+            "x-codex-secondary-reset-at",
+            HeaderValue::from_static("2026-08-11T12:00:45Z"),
+        );
+        headers.insert(
+            "x-ratelimit-tertiary-reset-after-seconds",
+            HeaderValue::from_static("90"),
+        );
+
+        assert_eq!(
+            quota_delay_at(&headers, fixed_now()),
+            Duration::from_secs(90)
         );
     }
 }

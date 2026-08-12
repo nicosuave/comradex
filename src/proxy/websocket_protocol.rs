@@ -1063,6 +1063,7 @@ fn tool_outputs_are_self_contained(items: &[Value], max_calls: usize) -> Result<
         ("function_call", HashSet::new()),
         ("custom_tool_call", HashSet::new()),
         ("apply_patch_call", HashSet::new()),
+        ("tool_search_call", HashSet::new()),
     ]);
     let mut consumed: HashSet<(&str, &str)> = HashSet::new();
     let mut tracked = 0usize;
@@ -1092,9 +1093,17 @@ fn tool_outputs_are_self_contained(items: &[Value], max_calls: usize) -> Result<
             "function_call_output" => Some("function_call"),
             "custom_tool_call_output" => Some("custom_tool_call"),
             "apply_patch_call_output" => Some("apply_patch_call"),
+            "tool_search_output" => Some("tool_search_call"),
             _ => None,
         };
         let Some(call_type) = call_type else {
+            // New tool call/output variants must be reviewed explicitly before a
+            // request containing them can be replayed without its response anchor.
+            // Silently ignoring an unfamiliar pair could move account-owned
+            // history to a different account without all of its dependencies.
+            if item_type.ends_with("_call") || item_type.ends_with("_output") {
+                return Ok(false);
+            }
             continue;
         };
         let Some(call_id) = call_id else {
@@ -1713,6 +1722,79 @@ mod tests {
             analysis.full_resend,
             FullResendSafety::Refused(FullResendRefusal::UnmatchedToolOutput)
         );
+    }
+
+    #[test]
+    fn matched_tool_search_output_is_a_self_contained_full_resend() {
+        let frame = json!({
+            "type":"response.create",
+            "previous_response_id":"resp_old",
+            "input":[
+                {"type":"tool_search_call","call_id":"search_1","arguments":{"query":"spawn agent"}},
+                {"type":"tool_search_output","call_id":"search_1","tools":[]},
+                {"role":"user","content":"continue"}
+            ]
+        });
+        let analysis = analyze_response_create(&frame, ProtocolLimits::default()).unwrap();
+        assert_eq!(analysis.full_resend, FullResendSafety::Eligible);
+    }
+
+    #[test]
+    fn tool_search_output_without_its_call_is_not_a_self_contained_full_resend() {
+        let frame = json!({
+            "type":"response.create",
+            "previous_response_id":"resp_old",
+            "input":[
+                {"role":"user","content":"old"},
+                {"type":"tool_search_output","call_id":"missing","tools":[]}
+            ]
+        });
+        let analysis = analyze_response_create(&frame, ProtocolLimits::default()).unwrap();
+        assert_eq!(
+            analysis.full_resend,
+            FullResendSafety::Refused(FullResendRefusal::UnmatchedToolOutput)
+        );
+    }
+
+    #[test]
+    fn duplicate_tool_search_output_is_not_a_self_contained_full_resend() {
+        let frame = json!({
+            "type":"response.create",
+            "previous_response_id":"resp_old",
+            "input":[
+                {"type":"tool_search_call","call_id":"search_1","arguments":{"query":"spawn agent"}},
+                {"type":"tool_search_output","call_id":"search_1","tools":[]},
+                {"type":"tool_search_output","call_id":"search_1","tools":[]}
+            ]
+        });
+        let analysis = analyze_response_create(&frame, ProtocolLimits::default()).unwrap();
+        assert_eq!(
+            analysis.full_resend,
+            FullResendSafety::Refused(FullResendRefusal::UnmatchedToolOutput)
+        );
+    }
+
+    #[test]
+    fn unknown_call_or_output_like_items_fail_closed_for_full_resend() {
+        for item in [
+            json!({"type":"future_tool_call","call_id":"future_1"}),
+            json!({"type":"future_tool_call_output","call_id":"future_1","output":"unsafe"}),
+            json!({"type":"future_tool_output","call_id":"future_1","output":"unsafe"}),
+        ] {
+            let frame = json!({
+                "type":"response.create",
+                "previous_response_id":"resp_old",
+                "input":[
+                    {"role":"user","content":"old"},
+                    item
+                ]
+            });
+            let analysis = analyze_response_create(&frame, ProtocolLimits::default()).unwrap();
+            assert_eq!(
+                analysis.full_resend,
+                FullResendSafety::Refused(FullResendRefusal::UnmatchedToolOutput)
+            );
+        }
     }
 
     #[test]

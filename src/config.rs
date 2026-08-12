@@ -2,15 +2,17 @@ use std::{
     collections::BTreeMap,
     fs,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub const CANONICAL_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
+
 fn default_upstream() -> String {
-    "https://chatgpt.com/backend-api/codex".into()
+    CANONICAL_UPSTREAM.into()
 }
 fn default_switch() -> u8 {
     80
@@ -135,6 +137,56 @@ pub enum AccountConfig {
     CodexHome { path: PathBuf },
 }
 
+/// Return the stable identity used for a managed CODEX_HOME. This removes
+/// lexical aliases and resolves every existing ancestor, so homes that do not
+/// exist yet still inherit symlink resolution from their parent directories.
+pub fn normalize_codex_home(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("codex_home path must be absolute")
+    }
+    let mut lexical = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => lexical.push(prefix.as_os_str()),
+            Component::RootDir => lexical.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !lexical.pop() {
+                    bail!("codex_home path escapes its filesystem root")
+                }
+            }
+            Component::Normal(part) => lexical.push(part),
+        }
+    }
+
+    let mut ancestor = lexical.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .context("codex_home path has no existing ancestor")?;
+    }
+    let canonical = fs::canonicalize(ancestor)
+        .with_context(|| format!("resolve codex_home ancestor {}", ancestor.display()))?;
+    let suffix = lexical
+        .strip_prefix(ancestor)
+        .expect("ancestor was obtained from the same path");
+    Ok(canonical.join(suffix))
+}
+
+/// Most macOS installations use a case-insensitive filesystem. A nonexistent
+/// suffix cannot be canonicalized yet, so conservatively fold it for collision
+/// checks. Linux keeps its native case-sensitive path semantics.
+fn managed_home_comparison_identity(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.to_owned()
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let config_path =
@@ -161,6 +213,7 @@ impl Config {
                 if !path.is_absolute() {
                     *path = config_dir.join(&*path);
                 }
+                *path = normalize_codex_home(path)?;
             }
         }
         value.validate()?;
@@ -168,6 +221,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.proxy.upstream != CANONICAL_UPSTREAM {
+            bail!(
+                "proxy.upstream must be exactly {CANONICAL_UPSTREAM}; custom upstreams cannot safely receive account credentials"
+            )
+        }
         if self.proxy.installation_secret.len() < 16 {
             bail!("proxy.installation_secret must be at least 16 characters")
         }
@@ -180,6 +238,7 @@ impl Config {
         if self.accounts.len() > 512 {
             bail!("at most 512 accounts are supported")
         }
+        let mut managed_homes: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
         for (name, account) in &self.accounts {
             if name.len() > 256 {
                 bail!("account name exceeds the 256-byte limit")
@@ -191,6 +250,27 @@ impl Config {
                 if !path.is_absolute() {
                     bail!("account {name} codex_home path must be absolute after loading")
                 }
+                let identity = normalize_codex_home(path)
+                    .with_context(|| format!("normalize account {name} codex_home"))?;
+                let comparison_identity = managed_home_comparison_identity(&identity);
+                for (other_name, other, other_comparison) in &managed_homes {
+                    if comparison_identity == *other_comparison {
+                        bail!(
+                            "accounts {other_name} and {name} use the same codex_home {}",
+                            identity.display()
+                        )
+                    }
+                    if comparison_identity.starts_with(other_comparison)
+                        || other_comparison.starts_with(&comparison_identity)
+                    {
+                        bail!(
+                            "accounts {other_name} and {name} have overlapping codex_home paths ({} and {})",
+                            other.display(),
+                            identity.display()
+                        )
+                    }
+                }
+                managed_homes.push((name, identity, comparison_identity));
             }
         }
         if self.listeners.is_empty() {
@@ -317,5 +397,122 @@ kind = "inbound"
 
         let error = Config::load(&path).unwrap_err();
         assert!(error.to_string().contains("must not be empty"));
+    }
+
+    fn two_managed_accounts_text(first: &Path, second: &Path) -> String {
+        config_text(None)
+            .replace(
+                "members = [\"caller\"]",
+                "members = [\"first\", \"second\"]",
+            )
+            .replace(
+                "[accounts.caller]\nkind = \"inbound\"",
+                &format!(
+                    "[accounts.first]\nkind = \"codex_home\"\npath = {:?}\n\n[accounts.second]\nkind = \"codex_home\"\npath = {:?}",
+                    first, second
+                ),
+            )
+    }
+
+    #[test]
+    fn lexical_account_home_alias_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let first = dir.path().join("accounts/one");
+        let second = dir.path().join("accounts/other/../one");
+        fs::write(&path, two_managed_accounts_text(&first, &second)).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("same codex_home"));
+        assert!(error.to_string().contains("first"));
+        assert!(error.to_string().contains("second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_account_home_alias_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        fs::create_dir_all(real_parent.join("account")).unwrap();
+        let alias_parent = dir.path().join("alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let path = dir.path().join("comradex.toml");
+        fs::write(
+            &path,
+            two_managed_accounts_text(&real_parent.join("account"), &alias_parent.join("account")),
+        )
+        .unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("same codex_home"));
+    }
+
+    #[test]
+    fn nested_account_homes_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let first = dir.path().join("accounts/one");
+        let second = first.join("nested");
+        fs::write(&path, two_managed_accounts_text(&first, &second)).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("overlapping codex_home"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nonexistent_case_folded_account_home_alias_is_rejected_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let first = dir.path().join("accounts/Profile");
+        let second = dir.path().join("accounts/profile");
+        fs::write(&path, two_managed_accounts_text(&first, &second)).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("same codex_home"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonexistent_case_distinct_account_homes_remain_valid_on_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let first = dir.path().join("accounts/Profile");
+        let second = dir.path().join("accounts/profile");
+        fs::write(&path, two_managed_accounts_text(&first, &second)).unwrap();
+
+        Config::load(&path).unwrap();
+    }
+
+    #[test]
+    fn arbitrary_upstream_host_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let text = config_text(None).replace(
+            "[proxy]\n",
+            "[proxy]\nupstream = \"https://example.com/backend-api/codex\"\n",
+        );
+        fs::write(&path, text).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains(CANONICAL_UPSTREAM));
+        assert!(error.to_string().contains("account credentials"));
+    }
+
+    #[test]
+    fn cleartext_canonical_upstream_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let text = config_text(None).replace(
+            "[proxy]\n",
+            "[proxy]\nupstream = \"http://chatgpt.com/backend-api/codex\"\n",
+        );
+        fs::write(&path, text).unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains(CANONICAL_UPSTREAM));
+        assert!(error.to_string().contains("account credentials"));
     }
 }

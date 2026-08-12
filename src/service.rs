@@ -228,6 +228,80 @@ pub fn installed() -> Result<bool> {
     Ok(plist_path()?.exists())
 }
 
+/// Run account maintenance while an installed LaunchAgent is unloaded. The
+/// previous loaded state is restored even when the maintenance operation
+/// fails, preventing the daemon from racing an external credential writer.
+pub fn while_daemon_stopped<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        action()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = plist_path()?;
+        if !plist_path.exists() {
+            return action();
+        }
+        let domain = launchctl_domain();
+        if !is_loaded(&domain)? {
+            return action();
+        }
+
+        // Resolve everything needed to restore readiness before stopping service.
+        let plist = fs::read_to_string(&plist_path)
+            .with_context(|| format!("read {}", plist_path.display()))?;
+        let config_path = plist_program_config(&plist).with_context(|| {
+            format!("no --config argument recorded in {}", plist_path.display())
+        })?;
+        let config = crate::config::Config::load(&config_path)?;
+        let listener_addresses: Vec<_> = config
+            .listeners
+            .values()
+            .map(|listener| listener.address)
+            .collect();
+        let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
+
+        maintenance_transaction(
+            true,
+            || bootout(&domain),
+            || {
+                bootstrap(&domain, &plist_path)?;
+                wait_until_ready(
+                    &domain,
+                    &listener_addresses,
+                    service_nonce.as_deref(),
+                    READY_TIMEOUT,
+                )
+            },
+            action,
+        )
+    }
+}
+
+fn maintenance_transaction<T>(
+    was_loaded: bool,
+    stop: impl FnOnce() -> Result<()>,
+    start: impl FnOnce() -> Result<()>,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !was_loaded {
+        return action();
+    }
+    stop()?;
+    let action_result = action();
+    let restore_result = start();
+    match (action_result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(action_error), Ok(())) => Err(action_error),
+        (Ok(_), Err(restore_error)) => {
+            Err(restore_error.context("account maintenance succeeded but service restart failed"))
+        }
+        (Err(action_error), Err(restore_error)) => bail!(
+            "account maintenance failed: {action_error:#}; service restart also failed: {restore_error:#}"
+        ),
+    }
+}
+
 /// Restart the installed LaunchAgent so the daemon reloads its configuration.
 /// The config path and readiness nonce come from the installed plist rather
 /// than the CLI, and the configuration is validated before the daemon is
@@ -630,6 +704,51 @@ mod tests {
         assert_eq!(stops.get(), 2);
         assert_eq!(new_starts.get(), 1);
         assert_eq!(previous_starts.get(), 1);
+    }
+
+    #[test]
+    fn failed_account_maintenance_restores_loaded_service() {
+        let stopped = Cell::new(false);
+        let started = Cell::new(false);
+        let result: Result<()> = maintenance_transaction(
+            true,
+            || {
+                stopped.set(true);
+                Ok(())
+            },
+            || {
+                started.set(true);
+                Ok(())
+            },
+            || bail!("simulated login failure"),
+        );
+
+        assert!(result.unwrap_err().to_string().contains("login failure"));
+        assert!(stopped.get());
+        assert!(started.get());
+    }
+
+    #[test]
+    fn account_maintenance_does_not_touch_an_unloaded_service() {
+        let stopped = Cell::new(false);
+        let started = Cell::new(false);
+        let value = maintenance_transaction(
+            false,
+            || {
+                stopped.set(true);
+                Ok(())
+            },
+            || {
+                started.set(true);
+                Ok(())
+            },
+            || Ok(42),
+        )
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert!(!stopped.get());
+        assert!(!started.get());
     }
 
     #[test]

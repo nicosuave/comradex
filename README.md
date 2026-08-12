@@ -115,7 +115,9 @@ comradex account login personal_2
 
 This executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`.
 
-For each request, the daemon reads the account's `auth.json`, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. Refreshes are single-flight per isolated account and atomically rotate `auth.json`. The Codex App's own credentials remain unmanaged.
+For each request, the daemon reads the account's `auth.json`, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. A bounded background sweep checks managed accounts once per minute and refreshes only tokens within five minutes of expiry, so rarely selected accounts do not depend on request-time refresh. Refreshes are single-flight per normalized, non-overlapping account home and atomically rotate `auth.json`; permanent refresh rejection marks only that account as requiring device login. The Codex App's own credentials remain unmanaged.
+
+On macOS, `comradex account login` temporarily unloads an installed, running Comradex LaunchAgent while the official Codex client writes the selected account home, then restores the service and waits for its listeners. This prevents login and daemon refresh from racing over rotating credentials.
 
 ## Connecting Codex
 
@@ -133,7 +135,7 @@ openai_base_url = "http://127.0.0.1:10100/<installation_secret>/v1"
 
 The address belongs to the selected listener; `--listener` chooses the listener and therefore the account pool that serves the traffic. `<installation_secret>` is the random per-installation token written to `comradex.toml` by `init`.
 
-Codex treats the value as an ordinary base URL, so every request arrives with the secret as a path prefix. Comradex rejects requests without `/<installation_secret>/v1`, strips the prefix from accepted requests, selects an account from the listener's pool, substitutes that account's credentials, and forwards the path, query, and body unchanged to `proxy.upstream` (`https://chatgpt.com/backend-api/codex` by default). The listener binds to loopback, but the secret also prevents other local software from discovering an open relay to your accounts.
+Codex treats the value as an ordinary base URL, so every request arrives with the secret as a path prefix. Comradex rejects requests without `/<installation_secret>/v1`, strips the prefix from accepted requests, selects an account from the listener's pool, substitutes that account's credentials, and forwards the path, query, and body unchanged to `proxy.upstream`. To keep bearer tokens and ChatGPT account metadata pinned to their intended destination, loaded configurations require this upstream to be exactly `https://chatgpt.com/backend-api/codex`; custom hosts, cleartext HTTP, and URL variants are rejected. The listener binds to loopback, but the secret also prevents other local software from discovering an open relay to your accounts.
 
 Reinstalling updates the Comradex URL without losing the original pre-Comradex value. That value is kept in `state/install.json`; `comradex uninstall` restores it, but refuses if somebody changed the Codex configuration after installation.
 
