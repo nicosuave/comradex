@@ -12,7 +12,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -182,6 +182,21 @@ impl Drop for OpenUpgradeGuard {
     }
 }
 
+struct InflightGuard<'a>(&'a AtomicUsize);
+
+impl<'a> InflightGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct BridgeSender {
     sender: mpsc::Sender<(u64, Message)>,
@@ -329,12 +344,11 @@ impl App {
         self.stats
             .refresh_last_sweep_unix
             .store(now, Ordering::Relaxed);
-        self.stats.refresh_inflight.fetch_add(1, Ordering::Relaxed);
+        let _inflight = InflightGuard::new(&self.stats.refresh_inflight);
         let results = self
             .auth
             .proactive_refresh_managed_at(&self.config.accounts, now)
             .await;
-        self.stats.refresh_inflight.fetch_sub(1, Ordering::Relaxed);
         self.stats
             .refresh_accounts_checked
             .fetch_add(results.len() as u64, Ordering::Relaxed);
@@ -3489,6 +3503,22 @@ mod tests {
         path: String,
         authorization: String,
         body: Bytes,
+    }
+
+    #[tokio::test]
+    async fn inflight_guard_clears_counter_when_task_is_aborted() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let task_counter = Arc::clone(&counter);
+        let task = tokio::spawn(async move {
+            let _inflight = InflightGuard::new(&task_counter);
+            std::future::pending::<()>().await;
+        });
+        while counter.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     #[test]

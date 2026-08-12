@@ -266,12 +266,9 @@ pub fn while_daemon_stopped<T>(action: impl FnOnce() -> Result<T>) -> Result<T> 
             || bootout(&domain),
             || {
                 bootstrap(&domain, &plist_path)?;
-                wait_until_ready(
-                    &domain,
-                    &listener_addresses,
-                    service_nonce.as_deref(),
-                    READY_TIMEOUT,
-                )
+                let (readiness_listeners, readiness_nonce) =
+                    readiness_probe(&listener_addresses, service_nonce.as_deref());
+                wait_until_ready(&domain, readiness_listeners, readiness_nonce, READY_TIMEOUT)
             },
             action,
         )
@@ -338,9 +335,18 @@ pub fn restart() -> Result<()> {
     } else {
         bootstrap(&domain, &plist_path)?;
     }
-    match &service_nonce {
-        Some(nonce) => wait_until_ready(&domain, &listener_addresses, Some(nonce), READY_TIMEOUT),
-        None => wait_until_ready(&domain, &[], None, READY_TIMEOUT),
+    let (readiness_listeners, readiness_nonce) =
+        readiness_probe(&listener_addresses, service_nonce.as_deref());
+    wait_until_ready(&domain, readiness_listeners, readiness_nonce, READY_TIMEOUT)
+}
+
+fn readiness_probe<'a>(
+    listeners: &'a [SocketAddr],
+    service_nonce: Option<&'a str>,
+) -> (&'a [SocketAddr], Option<&'a str>) {
+    match service_nonce {
+        Some(nonce) => (listeners, Some(nonce)),
+        None => (&[], None),
     }
 }
 
@@ -749,6 +755,20 @@ mod tests {
         assert_eq!(value, 42);
         assert!(!stopped.get());
         assert!(!started.get());
+    }
+
+    #[test]
+    fn legacy_plists_fall_back_to_process_readiness() {
+        let listeners = ["127.0.0.1:8080".parse().unwrap()];
+
+        let (readiness_listeners, readiness_nonce) = readiness_probe(&listeners, None);
+
+        assert!(readiness_listeners.is_empty());
+        assert_eq!(readiness_nonce, None);
+
+        let (readiness_listeners, readiness_nonce) = readiness_probe(&listeners, Some("nonce123"));
+        assert_eq!(readiness_listeners, listeners);
+        assert_eq!(readiness_nonce, Some("nonce123"));
     }
 
     #[test]
