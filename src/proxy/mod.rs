@@ -71,6 +71,7 @@ const BRIDGE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const UNKNOWN_CONTENT_SNIFF_BYTES: usize = 4 * 1024;
 const SSE_DECODE_SLICE_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_DIRECT_CREATES: usize = 64;
+const HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS: usize = 4_096;
 
 fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
     matches!(
@@ -107,6 +108,53 @@ struct HttpBridgeContinuation {
     response_id: String,
     input: Vec<serde_json::Value>,
     output: Vec<serde_json::Value>,
+}
+
+fn materialize_http_bridge_continuation(
+    cached: HttpBridgeContinuation,
+    incoming: Vec<serde_json::Value>,
+) -> std::result::Result<Vec<serde_json::Value>, &'static str> {
+    let mut prefix = cached.input;
+    prefix.extend(cached.output);
+    if prefix.len() > HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS
+        || incoming.len() > HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS
+    {
+        return Err("materialized response.create input exceeds the bridge safety limit");
+    }
+
+    let materialized = if incoming.starts_with(&prefix) {
+        // Some clients resend their complete local history while retaining the anchor.
+        // In that case the cached prefix is already present and must not be duplicated.
+        incoming
+    } else {
+        let shared_prefix = prefix
+            .iter()
+            .zip(&incoming)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let boundary_overlap = (1..=prefix.len().min(incoming.len()))
+            .any(|len| prefix[prefix.len() - len..] == incoming[..len]);
+        if shared_prefix != 0 || boundary_overlap {
+            // A partial match can equally represent a truncated resend or a genuinely new,
+            // identical item. Guessing either way risks duplicating or dropping conversation
+            // history, so require the caller to send an unambiguous full resend or delta.
+            return Err("incremental response.create input partially overlaps cached history");
+        }
+        let item_count = prefix
+            .len()
+            .checked_add(incoming.len())
+            .ok_or("materialized response.create input exceeds the bridge safety limit")?;
+        if item_count > HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS {
+            return Err("materialized response.create input exceeds the bridge safety limit");
+        }
+        prefix.extend(incoming);
+        prefix
+    };
+
+    if materialized.len() > HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS {
+        return Err("materialized response.create input exceeds the bridge safety limit");
+    }
+    Ok(materialized)
 }
 
 struct HttpBridgeCapture {
@@ -1329,9 +1377,14 @@ impl App {
                             .await;
                             continue;
                         };
-                        let mut input = cached.input;
-                        input.extend(cached.output);
-                        input.extend(delta);
+                        let input = match materialize_http_bridge_continuation(cached, delta) {
+                            Ok(input) => input,
+                            Err(message) => {
+                                send_ws_error(&turn_outbound, "invalid_request_error", message)
+                                    .await;
+                                continue;
+                            }
+                        };
                         object.insert("input".into(), serde_json::Value::Array(input));
                         object.remove("previous_response_id");
                     }
@@ -5458,8 +5511,39 @@ mod tests {
             websocket.next().await.unwrap().unwrap();
         }
 
+        let third_input = serde_json::json!({"role":"user","content":"third"});
+        websocket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type":"response.create",
+                    "previous_response_id":"resp_bridge_2",
+                    "input":[
+                        {"role":"user","content":"first"},
+                        {
+                            "type":"message",
+                            "role":"assistant",
+                            "content":[{"type":"output_text","text":"answer 1"}]
+                        },
+                        {"role":"user","content":"second"},
+                        {
+                            "type":"message",
+                            "role":"assistant",
+                            "content":[{"type":"output_text","text":"answer 2"}]
+                        },
+                        third_input
+                    ]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            websocket.next().await.unwrap().unwrap();
+        }
+
         let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies.len(), 3);
         assert!(bodies[1].get("previous_response_id").is_none());
         assert_eq!(
             bodies[1]["input"],
@@ -5473,8 +5557,140 @@ mod tests {
                 {"role":"user","content":"second"}
             ])
         );
+        assert!(bodies[2].get("previous_response_id").is_none());
+        assert_eq!(bodies[2]["input"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            bodies[2]["input"][4],
+            serde_json::json!({"role":"user","content":"third"})
+        );
         proxy_task.abort();
         upstream_task.abort();
+    }
+
+    #[test]
+    fn http_bridge_continuation_rejects_partial_history_overlap() {
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: vec![serde_json::json!({"role":"user","content":"first"})],
+            output: vec![serde_json::json!({"role":"assistant","content":"answer"})],
+        };
+        let error = materialize_http_bridge_continuation(
+            cached,
+            vec![
+                serde_json::json!({"role":"user","content":"first"}),
+                serde_json::json!({"role":"user","content":"second"}),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("partially overlaps"));
+    }
+
+    #[test]
+    fn http_bridge_continuation_materializes_pure_delta() {
+        let first = serde_json::json!({"role":"user","content":"first"});
+        let answer = serde_json::json!({"role":"assistant","content":"answer"});
+        let second = serde_json::json!({"role":"user","content":"second"});
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: vec![first.clone()],
+            output: vec![answer.clone()],
+        };
+        assert_eq!(
+            materialize_http_bridge_continuation(cached, vec![second.clone()]).unwrap(),
+            vec![first, answer, second]
+        );
+    }
+
+    #[test]
+    fn http_bridge_continuation_accepts_exact_cached_prefix() {
+        let first = serde_json::json!({"role":"user","content":"first"});
+        let answer = serde_json::json!({"role":"assistant","content":"answer"});
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: vec![first.clone()],
+            output: vec![answer.clone()],
+        };
+        assert_eq!(
+            materialize_http_bridge_continuation(cached, vec![first.clone(), answer.clone()])
+                .unwrap(),
+            vec![first, answer]
+        );
+    }
+
+    #[test]
+    fn http_bridge_continuation_rejects_boundary_overlap() {
+        let first = serde_json::json!({"role":"user","content":"first"});
+        let answer = serde_json::json!({"role":"assistant","content":"answer"});
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: vec![first],
+            output: vec![answer.clone()],
+        };
+        let error = materialize_http_bridge_continuation(
+            cached,
+            vec![
+                answer,
+                serde_json::json!({"role":"user","content":"second"}),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("partially overlaps"));
+    }
+
+    #[test]
+    fn http_bridge_continuation_empty_cache_preserves_input() {
+        let incoming = vec![serde_json::json!({"role":"user","content":"first"})];
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        assert_eq!(
+            materialize_http_bridge_continuation(cached, incoming.clone()).unwrap(),
+            incoming
+        );
+    }
+
+    #[test]
+    fn http_bridge_continuation_defers_byte_limit_to_configured_request_limit() {
+        let large = "x".repeat(RESPONSES_JSON_RESPONSE_LIMIT + 1);
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let input = materialize_http_bridge_continuation(
+            cached,
+            vec![serde_json::json!({"role":"user","content":large})],
+        )
+        .expect("materialization must not impose an unrelated response-size limit");
+        let body = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"input":input})).expect("request JSON"),
+        );
+        let configured_limit = body.len();
+        ReplayBody::from_bytes(
+            body,
+            configured_limit,
+            configured_limit,
+            Arc::new(Stats::default()),
+        )
+        .expect("the configured request limit accepts the materialized body");
+    }
+
+    #[test]
+    fn http_bridge_continuation_bounds_full_history_resends() {
+        let cached = HttpBridgeContinuation {
+            response_id: "resp_anchor".into(),
+            input: vec![serde_json::json!({"role":"user","content":"first"})],
+            output: Vec::new(),
+        };
+        let mut incoming = vec![serde_json::json!({"role":"user","content":"first"})];
+        incoming.resize(
+            HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS + 1,
+            serde_json::Value::Null,
+        );
+        let error = materialize_http_bridge_continuation(cached, incoming).unwrap_err();
+        assert!(error.contains("safety limit"));
     }
 
     #[tokio::test]
