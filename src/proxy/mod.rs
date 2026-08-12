@@ -110,6 +110,40 @@ struct HttpBridgeContinuation {
     output: Vec<serde_json::Value>,
 }
 
+fn has_suffix_prefix_overlap<T: PartialEq>(prefix: &[T], incoming: &[T]) -> bool {
+    if prefix.is_empty() || incoming.is_empty() {
+        return false;
+    }
+
+    // KMP keeps the overlap check linear even when histories contain long runs of
+    // identical, deeply nested values.
+    let mut failure = vec![0; incoming.len()];
+    for index in 1..incoming.len() {
+        let mut matched = failure[index - 1];
+        while matched > 0 && incoming[index] != incoming[matched] {
+            matched = failure[matched - 1];
+        }
+        if incoming[index] == incoming[matched] {
+            matched += 1;
+        }
+        failure[index] = matched;
+    }
+
+    let mut matched = 0;
+    for item in prefix {
+        if matched == incoming.len() {
+            matched = failure[matched - 1];
+        }
+        while matched > 0 && item != &incoming[matched] {
+            matched = failure[matched - 1];
+        }
+        if item == &incoming[matched] {
+            matched += 1;
+        }
+    }
+    matched > 0
+}
+
 fn materialize_http_bridge_continuation(
     cached: HttpBridgeContinuation,
     incoming: Vec<serde_json::Value>,
@@ -132,8 +166,7 @@ fn materialize_http_bridge_continuation(
             .zip(&incoming)
             .take_while(|(left, right)| left == right)
             .count();
-        let boundary_overlap = (1..=prefix.len().min(incoming.len()))
-            .any(|len| prefix[prefix.len() - len..] == incoming[..len]);
+        let boundary_overlap = has_suffix_prefix_overlap(&prefix, &incoming);
         if shared_prefix != 0 || boundary_overlap {
             // A partial match can equally represent a truncated resend or a genuinely new,
             // identical item. Guessing either way risks duplicating or dropping conversation
@@ -5635,6 +5668,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("partially overlaps"));
+    }
+
+    #[test]
+    fn boundary_overlap_matching_is_linear_for_repeated_histories() {
+        #[derive(Clone)]
+        struct CountedValue {
+            value: u8,
+            comparisons: Arc<AtomicUsize>,
+        }
+
+        impl PartialEq for CountedValue {
+            fn eq(&self, other: &Self) -> bool {
+                self.comparisons.fetch_add(1, Ordering::Relaxed);
+                self.value == other.value
+            }
+        }
+
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let counted = |value| CountedValue {
+            value,
+            comparisons: Arc::clone(&comparisons),
+        };
+        let mut prefix = vec![counted(1); HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS - 1];
+        prefix.push(counted(2));
+        let incoming = vec![counted(1); HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS];
+
+        assert!(!has_suffix_prefix_overlap(&prefix, &incoming));
+        assert!(
+            comparisons.load(Ordering::Relaxed) < HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS * 6,
+            "overlap matching performed too many comparisons"
+        );
     }
 
     #[test]
