@@ -1,10 +1,11 @@
 use std::{
-    collections::HashMap,
-    fs,
+    collections::{BTreeMap, HashMap},
+    error::Error as StdError,
+    fmt, fs,
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -21,11 +22,24 @@ use hyper_util::{
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::config::{AccountConfig, Config};
+use crate::{
+    auth_lock::HomeAuthLock,
+    config::{AccountConfig, Config, normalize_codex_home},
+};
 
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const REFRESH_WINDOW_SECONDS: u64 = 5 * 60;
+/// Managed credentials are refreshed once their JWT expires within five minutes. This is a
+/// deliberately small safety window for completing an in-flight request, not an assumption about
+/// an undocumented OAuth idle lifetime.
+pub const REFRESH_WINDOW_SECONDS: u64 = 5 * 60;
+/// A one-minute sweep keeps the five-minute safety window responsive while bounding idle work to
+/// one sequential pass over the configured (at most 512) managed accounts per minute.
+pub const PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 60;
+/// Maximum wall-clock time spent checking one managed account during a proactive sweep. This
+/// bounds both lock contention and OAuth I/O so one stalled account cannot block later accounts
+/// or keep the next scheduled sweep waiting indefinitely.
+pub const PROACTIVE_REFRESH_ACCOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REFRESH_RESPONSE_BYTES: usize = 1024 * 1024;
 
 type AuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
@@ -39,6 +53,48 @@ pub struct Credentials {
 pub struct Resolver {
     client: AuthClient,
     locks: HashMap<PathBuf, Arc<Mutex<()>>>,
+    refresh_url: hyper::Uri,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProactiveRefresh {
+    Fresh,
+    Refreshed,
+}
+
+#[derive(Debug)]
+struct ReauthRequired {
+    code: String,
+}
+
+impl fmt::Display for ReauthRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "OAuth refresh requires a new device login ({})",
+            self.code
+        )
+    }
+}
+
+impl StdError for ReauthRequired {}
+
+pub fn is_reauth_required(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReauthRequired>().is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFailureRecovery {
+    ReuseCurrent,
+    RefreshCurrent,
+}
+
+fn auth_failure_recovery(current: &Credentials, failed: &Credentials) -> AuthFailureRecovery {
+    if current.authorization == failed.authorization {
+        AuthFailureRecovery::RefreshCurrent
+    } else {
+        AuthFailureRecovery::ReuseCurrent
+    }
 }
 
 impl Resolver {
@@ -53,13 +109,17 @@ impl Resolver {
             .accounts
             .values()
             .filter_map(|account| match account {
-                AccountConfig::CodexHome { path } => Some((path.clone(), Arc::new(Mutex::new(())))),
+                AccountConfig::CodexHome { path } => Some((
+                    normalize_codex_home(path).expect("Config::validate normalized account home"),
+                    Arc::new(Mutex::new(())),
+                )),
                 AccountConfig::Inbound => None,
             })
             .collect();
         Self {
             client: Client::builder(TokioExecutor::new()).build(https),
             locks,
+            refresh_url: REFRESH_URL.parse().expect("static refresh URL is valid"),
         }
     }
 
@@ -73,11 +133,12 @@ impl Resolver {
             AccountConfig::CodexHome { path } => {
                 let document = read_auth(&path.join("auth.json"))?;
                 if access_token_needs_refresh(&document.value) {
-                    let lock = self.lock(path);
+                    let lock = self.lock(path)?;
                     let _guard = lock.lock().await;
+                    let _home_guard = HomeAuthLock::acquire_async(path).await?;
                     let current = read_auth(&path.join("auth.json"))?;
                     if access_token_needs_refresh(&current.value) {
-                        return self.refresh(path, current).await;
+                        return self.refresh(path, current, unix_now()).await;
                     }
                     return Ok(current.credentials);
                 }
@@ -94,23 +155,100 @@ impl Resolver {
         let AccountConfig::CodexHome { path } = account else {
             return Ok(None);
         };
-        let lock = self.lock(path);
+        let lock = self.lock(path)?;
         let _guard = lock.lock().await;
+        let _home_guard = HomeAuthLock::acquire_async(path).await?;
         let current = read_auth(&path.join("auth.json"))?;
-        if current.credentials.authorization != previous.authorization {
+        if auth_failure_recovery(&current.credentials, previous)
+            == AuthFailureRecovery::ReuseCurrent
+        {
             return Ok(Some(current.credentials));
         }
-        self.refresh(path, current).await.map(Some)
+        self.refresh(path, current, unix_now()).await.map(Some)
     }
 
-    fn lock(&self, path: &Path) -> Arc<Mutex<()>> {
+    /// Refresh a managed account only when its access-token JWT is within the documented safety
+    /// window. The auth file is always re-read while holding the same normalized-home lock used by
+    /// request-time resolution and forced auth recovery.
+    pub async fn proactive_refresh_at(
+        &self,
+        account: &AccountConfig,
+        now: u64,
+    ) -> Result<Option<ProactiveRefresh>> {
+        let AccountConfig::CodexHome { path } = account else {
+            return Ok(None);
+        };
+        let lock = self.lock(path)?;
+        let _guard = lock.lock().await;
+        let _home_guard = HomeAuthLock::acquire_async(path).await?;
+        let current = read_auth(&path.join("auth.json"))?;
+        if !access_token_needs_refresh_at(&current.value, now) {
+            return Ok(Some(ProactiveRefresh::Fresh));
+        }
+        self.refresh(path, current, now)
+            .await
+            .map(|_| Some(ProactiveRefresh::Refreshed))
+    }
+
+    /// Run a bounded pass over managed accounts. Every result is retained independently so one
+    /// account's filesystem, network, or OAuth failure cannot stop later configured IDs.
+    pub async fn proactive_refresh_managed_at(
+        &self,
+        accounts: &BTreeMap<String, AccountConfig>,
+        now: u64,
+    ) -> Vec<(String, Result<ProactiveRefresh>)> {
+        self.proactive_refresh_managed_at_with_timeout(
+            accounts,
+            now,
+            PROACTIVE_REFRESH_ACCOUNT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn proactive_refresh_managed_at_with_timeout(
+        &self,
+        accounts: &BTreeMap<String, AccountConfig>,
+        now: u64,
+        per_account_timeout: Duration,
+    ) -> Vec<(String, Result<ProactiveRefresh>)> {
+        let mut results = Vec::new();
+        for (account_id, account) in accounts {
+            if !matches!(account, AccountConfig::CodexHome { .. }) {
+                continue;
+            }
+            let result = match tokio::time::timeout(
+                per_account_timeout,
+                self.proactive_refresh_at(account, now),
+            )
+            .await
+            {
+                Ok(result) => result.and_then(|outcome| {
+                    outcome.context("managed account returned no refresh state")
+                }),
+                Err(_) => Err(anyhow::anyhow!(
+                    "managed account refresh timed out after {} ms",
+                    per_account_timeout.as_millis()
+                )),
+            };
+            results.push((account_id.clone(), result));
+        }
+        results
+    }
+
+    fn lock(&self, path: &Path) -> Result<Arc<Mutex<()>>> {
+        let identity = normalize_codex_home(path)?;
         self.locks
-            .get(path)
+            .get(&identity)
             .cloned()
-            .unwrap_or_else(|| Arc::new(Mutex::new(())))
+            .with_context(|| format!("no resolver lock for codex_home {}", identity.display()))
     }
 
-    async fn refresh(&self, home: &Path, mut document: AuthDocument) -> Result<Credentials> {
+    async fn refresh(
+        &self,
+        home: &Path,
+        mut document: AuthDocument,
+        now: u64,
+    ) -> Result<Credentials> {
         let refresh_token = lookup(&document.value, &["tokens", "refresh_token"])
             .filter(|value| !value.is_empty())
             .context("Codex auth has no refresh token")?
@@ -120,7 +258,7 @@ impl Resolver {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
         }))?);
-        let request = Request::post(REFRESH_URL)
+        let request = Request::post(self.refresh_url.clone())
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(body))?;
         let response = self.client.request(request).await?;
@@ -149,7 +287,10 @@ impl Resolver {
                     "refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated"
                 )
             {
-                bail!("OAuth refresh requires a new device login ({code})")
+                return Err(ReauthRequired {
+                    code: code.to_owned(),
+                }
+                .into());
             }
             bail!("OAuth refresh failed with HTTP {status} ({code})")
         }
@@ -171,7 +312,10 @@ impl Resolver {
         {
             tokens.insert("account_id".to_owned(), Value::String(account_id));
         }
-        document.value["last_refresh"] = Value::String(Utc::now().to_rfc3339());
+        let refreshed_at = chrono::DateTime::<Utc>::from_timestamp(now as i64, 0)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+        document.value["last_refresh"] = Value::String(refreshed_at);
         atomic_write_auth(
             &home.join("auth.json"),
             &serde_json::to_vec_pretty(&document.value)?,
@@ -242,12 +386,16 @@ fn credentials_from_value(value: &Value) -> Result<Credentials> {
 }
 
 fn access_token_needs_refresh(value: &Value) -> bool {
+    access_token_needs_refresh_at(value, unix_now())
+}
+
+fn access_token_needs_refresh_at(value: &Value, now: u64) -> bool {
     let token = lookup(value, &["tokens", "access_token"])
         .or_else(|| lookup(value, &["tokens", "accessToken"]));
     let Some(expiration) = token.and_then(jwt_expiration) else {
         return false;
     };
-    expiration <= unix_now().saturating_add(REFRESH_WINDOW_SECONDS)
+    expiration <= now.saturating_add(REFRESH_WINDOW_SECONDS)
 }
 
 fn jwt_expiration(token: &str) -> Option<u64> {
@@ -316,6 +464,95 @@ fn lookup<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 mod tests {
     use super::*;
 
+    fn jwt(expiration: u64, marker: &str) -> String {
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&json!({ "exp": expiration, "marker": marker })).unwrap());
+        format!("e30.{payload}.sig")
+    }
+
+    fn write_managed_auth(home: &Path, access_token: &str) {
+        fs::create_dir_all(home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec(&json!({
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": "test-refresh-token"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn test_resolver(homes: &[&Path], refresh_url: hyper::Uri) -> Resolver {
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let locks = homes
+            .iter()
+            .map(|home| {
+                (
+                    normalize_codex_home(home).unwrap(),
+                    Arc::new(Mutex::new(())),
+                )
+            })
+            .collect();
+        Resolver {
+            client: Client::builder(TokioExecutor::new()).build(https),
+            locks,
+            refresh_url,
+        }
+    }
+
+    async fn serve_refresh_response(status: &str, body: Value) -> hyper::Uri {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = serde_json::to_vec(&body).unwrap();
+        let status = status.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        format!("http://{address}/oauth/token").parse().unwrap()
+    }
+
+    async fn serve_paused_refresh_response() -> hyper::Uri {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        format!("http://{address}/oauth/token").parse().unwrap()
+    }
+
+    fn credentials(token: &str) -> Credentials {
+        Credentials {
+            authorization: format!("Bearer {token}"),
+            account_id: None,
+        }
+    }
+
+    fn simulated_recovery_refresh_count(current: &Credentials, failed: &Credentials) -> usize {
+        usize::from(auth_failure_recovery(current, failed) == AuthFailureRecovery::RefreshCurrent)
+    }
+
     #[test]
     fn derives_account_and_expiry_from_jwt_claims() {
         let payload = URL_SAFE_NO_PAD.encode(
@@ -324,5 +561,262 @@ mod tests {
         let jwt = format!("e30.{payload}.sig");
         assert_eq!(jwt_expiration(&jwt), Some(4_102_444_800));
         assert_eq!(jwt_account_id(&jwt).as_deref(), Some("acct"));
+    }
+
+    #[test]
+    fn proactive_threshold_is_exactly_five_minutes() {
+        let now = 1_000_000;
+        let outside = json!({ "tokens": { "access_token": jwt(now + 301, "outside") } });
+        let boundary = json!({ "tokens": { "access_token": jwt(now + 300, "boundary") } });
+        assert!(!access_token_needs_refresh_at(&outside, now));
+        assert!(access_token_needs_refresh_at(&boundary, now));
+    }
+
+    #[tokio::test]
+    async fn managed_sweep_refreshes_stale_accounts_and_continues_after_failure() {
+        let now = 1_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let stale_home = directory.path().join("stale");
+        let missing_home = directory.path().join("missing");
+        let fresh_home = directory.path().join("fresh");
+        write_managed_auth(&stale_home, &jwt(now + 60, "stale"));
+        fs::create_dir_all(&missing_home).unwrap();
+        write_managed_auth(&fresh_home, &jwt(now + 3_600, "fresh"));
+        let refreshed_token = jwt(now + 7_200, "refreshed");
+        let refresh_url = serve_refresh_response(
+            "200 OK",
+            json!({
+                "access_token": refreshed_token,
+                "refresh_token": "replacement-refresh-token"
+            }),
+        )
+        .await;
+        let resolver = test_resolver(&[&stale_home, &missing_home, &fresh_home], refresh_url);
+        let stale = AccountConfig::CodexHome {
+            path: stale_home.clone(),
+        };
+        let missing = AccountConfig::CodexHome { path: missing_home };
+        let fresh = AccountConfig::CodexHome { path: fresh_home };
+        let inbound = AccountConfig::Inbound;
+
+        let accounts = BTreeMap::from([
+            ("1-stale".to_owned(), stale),
+            ("2-missing".to_owned(), missing),
+            ("3-inbound".to_owned(), inbound),
+            ("4-fresh".to_owned(), fresh),
+        ]);
+        let results = resolver.proactive_refresh_managed_at(&accounts, now).await;
+
+        assert_eq!(results.len(), 3, "inbound accounts must never be touched");
+        assert_eq!(results[0].0, "1-stale");
+        assert!(matches!(results[0].1, Ok(ProactiveRefresh::Refreshed)));
+        assert_eq!(results[1].0, "2-missing");
+        assert!(results[1].1.is_err());
+        assert_eq!(results[2].0, "4-fresh");
+        assert!(matches!(results[2].1, Ok(ProactiveRefresh::Fresh)));
+        let written: Value =
+            serde_json::from_slice(&fs::read(stale_home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            lookup(&written, &["tokens", "refresh_token"]),
+            Some("replacement-refresh-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_sweep_times_out_stalled_refresh_and_checks_later_account() {
+        let now = 1_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let stalled_home = directory.path().join("stalled");
+        let fresh_home = directory.path().join("fresh");
+        write_managed_auth(&stalled_home, &jwt(now + 60, "stalled"));
+        write_managed_auth(&fresh_home, &jwt(now + 3_600, "fresh"));
+        let refresh_url = serve_paused_refresh_response().await;
+        let resolver = test_resolver(&[&stalled_home, &fresh_home], refresh_url);
+        let accounts = BTreeMap::from([
+            (
+                "1-stalled".to_owned(),
+                AccountConfig::CodexHome {
+                    path: stalled_home.clone(),
+                },
+            ),
+            (
+                "2-fresh".to_owned(),
+                AccountConfig::CodexHome { path: fresh_home },
+            ),
+        ]);
+
+        let results = resolver
+            .proactive_refresh_managed_at_with_timeout(&accounts, now, Duration::from_millis(50))
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_err()).count(),
+            1
+        );
+        assert_eq!(results[0].0, "1-stalled");
+        assert!(format!("{:#}", results[0].1.as_ref().unwrap_err()).contains("timed out"));
+        assert_eq!(results[1].0, "2-fresh");
+        assert!(matches!(results[1].1, Ok(ProactiveRefresh::Fresh)));
+        let lock = resolver.lock(&stalled_home).unwrap();
+        assert!(
+            lock.try_lock().is_ok(),
+            "timeout cancellation must release the managed-home lock"
+        );
+        assert!(
+            HomeAuthLock::try_acquire(&stalled_home).unwrap().is_some(),
+            "timeout cancellation must release the cross-process auth lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_rejection_is_typed_as_reauth_required() {
+        let now = 1_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        write_managed_auth(&home, &jwt(now + 60, "stale"));
+        let refresh_url = serve_refresh_response(
+            "401 Unauthorized",
+            json!({ "error": { "code": "refresh_token_expired" } }),
+        )
+        .await;
+        let resolver = test_resolver(&[&home], refresh_url);
+        let account = AccountConfig::CodexHome { path: home };
+
+        let error = resolver
+            .proactive_refresh_at(&account, now)
+            .await
+            .unwrap_err();
+
+        assert!(is_reauth_required(&error));
+        assert!(!format!("{error:#}").contains("test-refresh-token"));
+    }
+
+    #[tokio::test]
+    async fn proactive_refresh_waits_for_cross_process_home_lock() {
+        let now = 1_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        write_managed_auth(&home, &jwt(now + 3_600, "fresh"));
+        let resolver = Arc::new(test_resolver(
+            &[&home],
+            "http://127.0.0.1:9/oauth/token".parse().unwrap(),
+        ));
+        let account = AccountConfig::CodexHome { path: home.clone() };
+        let login_guard = HomeAuthLock::acquire(&home).unwrap();
+        let refresh = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.proactive_refresh_at(&account, now).await })
+        };
+        let mut refresh = Box::pin(refresh);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut refresh)
+                .await
+                .is_err(),
+            "refresh must not read or write auth.json while login owns the home"
+        );
+        drop(login_guard);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), &mut refresh)
+            .await
+            .expect("refresh should resume after login releases the lock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Some(ProactiveRefresh::Fresh));
+    }
+
+    #[test]
+    fn near_expiry_resolve_refresh_is_reused_after_old_socket_auth_failure() {
+        let credential_used_by_failed_socket = credentials("near-expiry");
+        let credential_refreshed_during_later_resolve = credentials("already-refreshed");
+
+        assert_eq!(
+            auth_failure_recovery(
+                &credential_refreshed_during_later_resolve,
+                &credential_used_by_failed_socket,
+            ),
+            AuthFailureRecovery::ReuseCurrent
+        );
+        assert_eq!(
+            simulated_recovery_refresh_count(
+                &credential_refreshed_during_later_resolve,
+                &credential_used_by_failed_socket,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_credential_replacement_is_reused_without_refresh() {
+        let credential_used_by_failed_socket = credentials("old");
+        let concurrently_replaced_credential = credentials("new");
+
+        assert_eq!(
+            auth_failure_recovery(
+                &concurrently_replaced_credential,
+                &credential_used_by_failed_socket,
+            ),
+            AuthFailureRecovery::ReuseCurrent
+        );
+        assert_eq!(
+            simulated_recovery_refresh_count(
+                &concurrently_replaced_credential,
+                &credential_used_by_failed_socket,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn unchanged_failed_credential_gets_exactly_one_forced_refresh() {
+        let credential_used_by_failed_socket = credentials("unchanged");
+        let current_credential = credential_used_by_failed_socket.clone();
+
+        assert_eq!(
+            auth_failure_recovery(&current_credential, &credential_used_by_failed_socket),
+            AuthFailureRecovery::RefreshCurrent
+        );
+        assert_eq!(
+            simulated_recovery_refresh_count(
+                &current_credential,
+                &credential_used_by_failed_socket,
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn force_refresh_executes_one_real_exchange_for_the_failed_credential() {
+        let now = unix_now();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        let failed_token = jwt(now + 3_600, "failed-socket");
+        write_managed_auth(&home, &failed_token);
+        let replacement = jwt(now + 7_200, "replacement");
+        let refresh_url = serve_refresh_response(
+            "200 OK",
+            json!({
+                "access_token": replacement,
+                "refresh_token": "replacement-refresh-token"
+            }),
+        )
+        .await;
+        let resolver = test_resolver(&[&home], refresh_url);
+        let account = AccountConfig::CodexHome { path: home.clone() };
+
+        let refreshed = resolver
+            .force_refresh(&account, &credentials(&failed_token))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(refreshed.authorization, format!("Bearer {failed_token}"));
+        let written: Value =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            lookup(&written, &["tokens", "refresh_token"]),
+            Some("replacement-refresh-token")
+        );
     }
 }
