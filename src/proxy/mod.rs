@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -38,7 +38,7 @@ use hyper_util::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot},
     task::{AbortHandle, JoinSet},
 };
 use tokio_tungstenite::{
@@ -197,6 +197,65 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+struct BridgeSessionActivity {
+    active_turns: AtomicUsize,
+    last_activity: StdMutex<Instant>,
+}
+
+impl BridgeSessionActivity {
+    fn new() -> Self {
+        Self {
+            active_turns: AtomicUsize::new(0),
+            last_activity: StdMutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        *self.last_activity.lock().expect("bridge activity") = Instant::now();
+    }
+
+    fn last_activity(&self) -> Instant {
+        *self.last_activity.lock().expect("bridge activity")
+    }
+
+    fn is_idle(&self) -> bool {
+        self.active_turns.load(Ordering::Acquire) == 0
+    }
+}
+
+struct BridgeSessionEntry {
+    activity: Arc<BridgeSessionActivity>,
+    evict: Option<oneshot::Sender<()>>,
+    closing: bool,
+}
+
+struct BridgeSessionAdmission {
+    id: u64,
+    activity: Arc<BridgeSessionActivity>,
+    evicted: oneshot::Receiver<()>,
+}
+
+struct BridgeTurnGuard {
+    activity: Arc<BridgeSessionActivity>,
+    changed: Arc<Notify>,
+}
+
+impl BridgeTurnGuard {
+    fn new(activity: Arc<BridgeSessionActivity>, changed: Arc<Notify>) -> Self {
+        activity.active_turns.fetch_add(1, Ordering::AcqRel);
+        activity.touch();
+        Self { activity, changed }
+    }
+}
+
+impl Drop for BridgeTurnGuard {
+    fn drop(&mut self) {
+        self.activity.active_turns.fetch_sub(1, Ordering::AcqRel);
+        self.activity.touch();
+        self.changed.notify_waiters();
+    }
+}
+
 #[derive(Clone)]
 struct BridgeSender {
     sender: mpsc::Sender<(u64, Message)>,
@@ -253,6 +312,9 @@ pub struct App {
     stats: Arc<Stats>,
     http_slots: Arc<Semaphore>,
     upgrade_slots: Arc<Semaphore>,
+    bridge_sessions: AsyncMutex<HashMap<u64, BridgeSessionEntry>>,
+    bridge_sessions_changed: Arc<Notify>,
+    next_bridge_session_id: AtomicU64,
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     file_owners: Arc<AffinityStore>,
@@ -303,6 +365,9 @@ impl App {
         Ok(Arc::new(Self {
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),
+            bridge_sessions: AsyncMutex::new(HashMap::new()),
+            bridge_sessions_changed: Arc::new(Notify::new()),
+            next_bridge_session_id: AtomicU64::new(1),
             live_calls: LiveCallStore::load(
                 &format!(
                     "{}:{}",
@@ -959,17 +1024,70 @@ impl App {
         Ok(Response::from_parts(parts, bytes_body(bytes)))
     }
 
+    async fn admit_bridge_session(&self) -> Option<BridgeSessionAdmission> {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(self.config.proxy.bridge_admission_timeout_millis);
+        loop {
+            let changed = self.bridge_sessions_changed.notified();
+            let mut sessions = self.bridge_sessions.lock().await;
+            if sessions.len() < self.config.proxy.max_bridge_sessions {
+                let id = self.next_bridge_session_id.fetch_add(1, Ordering::Relaxed);
+                let activity = Arc::new(BridgeSessionActivity::new());
+                let (evict, evicted) = oneshot::channel();
+                sessions.insert(
+                    id,
+                    BridgeSessionEntry {
+                        activity: activity.clone(),
+                        evict: Some(evict),
+                        closing: false,
+                    },
+                );
+                return Some(BridgeSessionAdmission {
+                    id,
+                    activity,
+                    evicted,
+                });
+            }
+
+            let lru_idle = sessions
+                .iter()
+                .filter(|(_, entry)| !entry.closing && entry.activity.is_idle())
+                .min_by_key(|(_, entry)| entry.activity.last_activity())
+                .map(|(id, _)| *id);
+            if let Some(id) = lru_idle {
+                let entry = sessions.get_mut(&id).expect("selected bridge session");
+                entry.closing = true;
+                if entry
+                    .evict
+                    .take()
+                    .is_some_and(|evict| evict.send(()).is_err())
+                {
+                    sessions.remove(&id);
+                    drop(sessions);
+                    self.bridge_sessions_changed.notify_waiters();
+                    continue;
+                }
+            }
+            drop(sessions);
+
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    async fn finish_bridge_session(&self, id: u64) {
+        if self.bridge_sessions.lock().await.remove(&id).is_some() {
+            self.bridge_sessions_changed.notify_waiters();
+        }
+    }
+
     async fn handle_responses_http_bridge(
         self: &Arc<Self>,
         mut req: Request<Incoming>,
         listener: &ListenerConfig,
         path: String,
     ) -> Result<Response<ProxyBody>> {
-        let permit = self
-            .upgrade_slots
-            .clone()
-            .try_acquire_owned()
-            .context("WebSocket limit reached")?;
         let key = req
             .headers()
             .get(SEC_WEBSOCKET_KEY)
@@ -987,17 +1105,23 @@ impl App {
                 "Sec-WebSocket-Version must be 13",
             ));
         }
+        let Some(admission) = self.admit_bridge_session().await else {
+            return Ok(bridge_capacity_response());
+        };
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key);
         let headers = req.headers().clone();
         let client_upgrade = hyper::upgrade::on(&mut req);
         let app = self.clone();
+        let cleanup_app = self.clone();
         let listener = listener.clone();
+        let session_id = admission.id;
+        let activity = admission.activity;
+        let evicted = admission.evicted;
         self.stats.open_upgrades.fetch_add(1, Ordering::Relaxed);
         let upgrade_guard = OpenUpgradeGuard(self.stats.clone());
         let spawned = self
             .spawn_tracked(async move {
                 let _upgrade_guard = upgrade_guard;
-                let _permit = permit;
                 match client_upgrade.await {
                     Ok(client) => {
                         let websocket = WebSocketStream::from_raw_socket(
@@ -1007,7 +1131,9 @@ impl App {
                         )
                         .await;
                         if let Err(error) = app
-                            .run_responses_http_bridge(websocket, listener, path, headers)
+                            .run_responses_http_bridge(
+                                websocket, listener, path, headers, activity, evicted,
+                            )
                             .await
                         {
                             warn!(%error, "Responses HTTP bridge ended");
@@ -1015,9 +1141,11 @@ impl App {
                     }
                     Err(error) => warn!(%error, "Responses HTTP bridge upgrade failed"),
                 }
+                cleanup_app.finish_bridge_session(session_id).await;
             })
             .await;
         if !spawned {
+            self.finish_bridge_session(session_id).await;
             anyhow::bail!("proxy is shutting down")
         }
         Ok(Response::builder()
@@ -1034,6 +1162,8 @@ impl App {
         listener: ListenerConfig,
         path: String,
         mut headers: hyper::HeaderMap,
+        activity: Arc<BridgeSessionActivity>,
+        mut evicted: oneshot::Receiver<()>,
     ) -> Result<()> {
         headers::strip_hop_by_hop(&mut headers);
         headers.remove(SEC_WEBSOCKET_KEY);
@@ -1077,7 +1207,14 @@ impl App {
         let mut active_turn: Option<TrackedTask> = None;
         let mut read_error: Option<String> = None;
         loop {
+            let idle_timeout = wait_for_bridge_idle_timeout(
+                activity.clone(),
+                self.bridge_sessions_changed.clone(),
+                Duration::from_secs(self.config.proxy.bridge_idle_seconds),
+            );
             let message = tokio::select! {
+                _ = &mut evicted => break,
+                _ = idle_timeout => break,
                 fatal = fatal_rx.recv() => {
                     read_error = Some(fatal.unwrap_or_else(|| "downstream WebSocket writer stopped".into()));
                     break;
@@ -1087,6 +1224,7 @@ impl App {
                     message
                 }
             };
+            activity.touch();
             let message = match message {
                 Ok(message) => message,
                 Err(error) => {
@@ -1128,6 +1266,12 @@ impl App {
                         .await;
                         continue;
                     }
+                    // Protect the session from idle/LRU eviction for the entire create path,
+                    // including cancellation and request validation before the turn task starts.
+                    let mut turn_guard = Some(BridgeTurnGuard::new(
+                        activity.clone(),
+                        self.bridge_sessions_changed.clone(),
+                    ));
                     // Cancel upstream work immediately. The gate is acquired only afterward,
                     // so a blocked downstream send cannot keep consuming account usage.
                     let generation = active_generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1217,8 +1361,10 @@ impl App {
                     let outbound = turn_outbound;
                     let fatal = fatal_tx.clone();
                     let continuation = continuation.clone();
+                    let turn_guard = turn_guard.take().expect("response.create turn guard");
                     active_turn = self
                         .spawn_tracked_task(async move {
+                            let _turn_guard = turn_guard;
                             let _http_permit = match app.http_slots.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
@@ -2952,6 +3098,42 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Pro
         .expect("static response")
 }
 
+fn bridge_capacity_response() -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_TYPE, "application/json")
+        .header("retry-after", "1")
+        .body(json_body(serde_json::json!({
+            "error": {
+                "type": "at_capacity",
+                "message": "Responses WebSocket bridge is at capacity; retry shortly"
+            }
+        })))
+        .expect("static bridge capacity response")
+}
+
+async fn wait_for_bridge_idle_timeout(
+    activity: Arc<BridgeSessionActivity>,
+    changed: Arc<Notify>,
+    idle_for: Duration,
+) {
+    loop {
+        let elapsed = activity.last_activity().elapsed();
+        if activity.is_idle() && elapsed >= idle_for {
+            return;
+        }
+        let wait = if activity.is_idle() {
+            idle_for.saturating_sub(elapsed)
+        } else {
+            Duration::from_secs(1)
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait.max(Duration::from_millis(1))) => {}
+            _ = changed.notified() => {}
+        }
+    }
+}
+
 fn internal_error(error: anyhow::Error) -> Response<ProxyBody> {
     error!(error = %error, "request failed");
     error_response(StatusCode::BAD_GATEWAY, "proxy_error", &error.to_string())
@@ -3684,6 +3866,144 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let app = App::new_unvalidated(config, router.clone(), stats.clone()).unwrap();
         (app, listener, router, stats)
+    }
+
+    fn bridge_admission_test_app(
+        dir: &std::path::Path,
+        max_bridge_sessions: usize,
+        bridge_admission_timeout_millis: u64,
+    ) -> Arc<App> {
+        let listener = ListenerConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            pool: "default".into(),
+        };
+        let config = Arc::new(Config {
+            proxy: ProxyConfig {
+                max_bridge_sessions,
+                bridge_admission_timeout_millis,
+                installation_secret: "0123456789abcdef".into(),
+                affinity_key: "0123456789abcdef0123456789abcdef".into(),
+                state_dir: Some(dir.join("state")),
+                ..ProxyConfig::default()
+            },
+            listeners: BTreeMap::from([("default".into(), listener)]),
+            pools: BTreeMap::from([(
+                "default".into(),
+                PoolConfig {
+                    members: vec!["caller".into()],
+                },
+            )]),
+            accounts: BTreeMap::from([("caller".into(), AccountConfig::Inbound)]),
+        });
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.join("affinity.json"),
+                &config.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(Router::new(&config, affinity));
+        App::new(config, router, Arc::new(Stats::default())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bridge_capacity_evicts_lru_idle_session_without_using_upgrade_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let upstream_upgrade_slots = app.upgrade_slots.available_permits();
+        let first = app.admit_bridge_session().await.unwrap();
+        assert_eq!(
+            app.upgrade_slots.available_permits(),
+            upstream_upgrade_slots
+        );
+
+        let replacement_app = app.clone();
+        let replacement =
+            tokio::spawn(async move { replacement_app.admit_bridge_session().await.unwrap() });
+        first.evicted.await.unwrap();
+        app.finish_bridge_session(first.id).await;
+        let second = replacement.await.unwrap();
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(app.bridge_sessions.lock().await.len(), 1);
+        app.finish_bridge_session(second.id).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_capacity_never_evicts_active_turn_and_returns_retryable_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 20);
+        let first = app.admit_bridge_session().await.unwrap();
+        let turn =
+            BridgeTurnGuard::new(first.activity.clone(), app.bridge_sessions_changed.clone());
+
+        assert!(app.admit_bridge_session().await.is_none());
+        let response = bridge_capacity_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+
+        drop(turn);
+        app.finish_bridge_session(first.id).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_lru_eviction_closes_idle_socket_before_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 1_000);
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let listener = ListenerConfig {
+            address,
+            pool: "default".into(),
+        };
+        let proxy = tokio::spawn(app.clone().serve_tcp("default".into(), listener, tcp));
+
+        let mut first = connect_test_websocket(address).await;
+        let second = tokio::time::timeout(Duration::from_secs(2), connect_test_websocket(address))
+            .await
+            .expect("replacement bridge admission timed out");
+        let first_end = tokio::time::timeout(Duration::from_secs(1), first.next())
+            .await
+            .expect("evicted bridge did not close");
+        assert!(matches!(first_end, None | Some(Ok(Message::Close(_)))));
+        assert_eq!(app.bridge_sessions.lock().await.len(), 1);
+
+        drop(second);
+        proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn bridge_idle_timeout_waits_for_active_turn_to_finish() {
+        let activity = Arc::new(BridgeSessionActivity::new());
+        let changed = Arc::new(Notify::new());
+        let turn = BridgeTurnGuard::new(activity.clone(), changed.clone());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                wait_for_bridge_idle_timeout(
+                    activity.clone(),
+                    changed.clone(),
+                    Duration::from_millis(5),
+                ),
+            )
+            .await
+            .is_err()
+        );
+
+        drop(turn);
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            wait_for_bridge_idle_timeout(
+                activity,
+                Arc::new(Notify::new()),
+                Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("idle timeout did not resume after the active turn ended");
     }
 
     #[test]
