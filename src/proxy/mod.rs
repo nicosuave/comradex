@@ -71,6 +71,8 @@ const BRIDGE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const UNKNOWN_CONTENT_SNIFF_BYTES: usize = 4 * 1024;
 const SSE_DECODE_SLICE_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_DIRECT_CREATES: usize = 64;
+pub(super) const RESPONSES_MISSING_CREATED_TIMEOUT: Duration = Duration::from_secs(240);
+pub(super) const RESPONSES_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS: usize = 4_096;
 
 fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
@@ -195,16 +197,43 @@ struct HttpBridgeCapture {
     response_id: Option<String>,
     output: Vec<serde_json::Value>,
     delivered_event: bool,
+    response_created: bool,
 }
 
 #[derive(Debug)]
 struct HttpBridgePumpFailure {
     error: anyhow::Error,
     delivered_event: bool,
+    liveness: Option<HttpBridgeLivenessFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpBridgeLivenessFailure {
+    MissingResponseCreated,
+    UpstreamIdle,
+}
+
+impl HttpBridgeLivenessFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::MissingResponseCreated => "missing_response_created_timeout",
+            Self::UpstreamIdle => "upstream_idle_timeout",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::MissingResponseCreated => "upstream did not create the response before timeout",
+            Self::UpstreamIdle => "upstream response stream became idle before completion",
+        }
+    }
 }
 
 impl HttpBridgeCapture {
     fn observe(&mut self, event: &serde_json::Value) {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("response.created") {
+            self.response_created = true;
+        }
         if let Some(response_id) = event
             .get("response")
             .and_then(|response| response.get("id"))
@@ -243,6 +272,13 @@ impl TrackedTask {
             self.abort.abort();
             let _ = (&mut self.done).await;
         }
+    }
+}
+
+async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -1451,6 +1487,8 @@ impl App {
                     active_turn = self
                         .spawn_tracked_task(async move {
                             let _turn_guard = turn_guard;
+                            let dispatch_deadline =
+                                tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT;
                             let _http_permit = match app.http_slots.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
@@ -1480,18 +1518,20 @@ impl App {
                                     return;
                                 }
                             };
-                            match app
-                                .handle_http_replay_with_routing_anchor(
+                            match tokio::time::timeout_at(
+                                dispatch_deadline,
+                                app.handle_http_replay_with_routing_anchor(
                                     headers,
                                     Method::POST,
                                     &listener,
                                     path,
                                     replay,
                                     routing_previous_response_id,
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                             {
-                                Ok(response) => {
+                                Ok(Ok(response)) => {
                                     let close_for_inbound_auth = response.status()
                                         == StatusCode::UNAUTHORIZED
                                         && response
@@ -1509,6 +1549,8 @@ impl App {
                                         &app,
                                         request_input,
                                         &continuation,
+                                        dispatch_deadline,
+                                        RESPONSES_UPSTREAM_IDLE_TIMEOUT,
                                     )
                                     .await;
                                     if close_for_inbound_auth {
@@ -1527,6 +1569,14 @@ impl App {
                                         return;
                                     }
                                     if let Err(failure) = pump_result {
+                                        if let Some(liveness) = failure.liveness {
+                                            send_ws_nonretryable_liveness_error(
+                                                &outbound,
+                                                liveness,
+                                            )
+                                            .await;
+                                            return;
+                                        }
                                         if failure
                                             .error
                                             .to_string()
@@ -1558,9 +1608,16 @@ impl App {
                                         }
                                     }
                                 }
-                                Err(error) => {
+                                Ok(Err(error)) => {
                                     send_ws_error(&outbound, "proxy_error", &error.to_string())
                                         .await;
+                                }
+                                Err(_) => {
+                                    send_ws_nonretryable_liveness_error(
+                                        &outbound,
+                                        HttpBridgeLivenessFailure::MissingResponseCreated,
+                                    )
+                                    .await;
                                 }
                             }
                         })
@@ -1796,6 +1853,8 @@ impl App {
             .map_err(|error| anyhow::anyhow!("invalid direct protocol limits: {error:?}"))?;
         let mut turns = HashMap::<TurnId, DirectTurn>::new();
         let mut awaiting_response_created: Option<TurnId> = None;
+        let mut missing_created_deadline: Option<tokio::time::Instant> = None;
+        let mut upstream_idle_deadline: Option<tokio::time::Instant> = None;
         let mut queued_creates = VecDeque::<Message>::new();
         loop {
             let queued_message = if awaiting_response_created.is_none() {
@@ -1805,6 +1864,48 @@ impl App {
             };
             tokio::select! {
                 biased;
+                _ = wait_for_optional_deadline(missing_created_deadline) => {
+                    let close_downstream = self
+                        .recover_or_settle_direct_end(
+                            &mut protocol,
+                            &mut turns,
+                            &mut client,
+                            &mut upstream,
+                            &mut upstream_credentials,
+                            &listener,
+                            &path,
+                            &headers,
+                            &mut account,
+                            &mut lease,
+                            UpstreamEnd::MissingResponseCreatedTimeout,
+                        )
+                        .await?;
+                    awaiting_response_created = None;
+                    missing_created_deadline = None;
+                    upstream_idle_deadline = None;
+                    if close_downstream { break; }
+                }
+                _ = wait_for_optional_deadline(upstream_idle_deadline) => {
+                    let close_downstream = self
+                        .recover_or_settle_direct_end(
+                            &mut protocol,
+                            &mut turns,
+                            &mut client,
+                            &mut upstream,
+                            &mut upstream_credentials,
+                            &listener,
+                            &path,
+                            &headers,
+                            &mut account,
+                            &mut lease,
+                            UpstreamEnd::UpstreamIdleTimeout,
+                        )
+                        .await?;
+                    awaiting_response_created = None;
+                    missing_created_deadline = None;
+                    upstream_idle_deadline = None;
+                    if close_downstream { break; }
+                }
                 client_message = async {
                     match queued_message {
                         Some(message) => Some(Ok(message)),
@@ -1901,6 +2002,9 @@ impl App {
                             };
                             upstream.send(client_message.clone()).await?;
                             awaiting_response_created = Some(turn_id);
+                            missing_created_deadline = Some(
+                                tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT,
+                            );
                             turns.insert(turn_id, DirectTurn {
                                 route,
                                 request: client_message,
@@ -1916,6 +2020,11 @@ impl App {
                 upstream_message = upstream.next() => {
                     match upstream_message {
                         Some(Ok(message)) => {
+                            if upstream_idle_deadline.is_some() {
+                                upstream_idle_deadline = Some(
+                                    tokio::time::Instant::now() + RESPONSES_UPSTREAM_IDLE_TIMEOUT,
+                                );
+                            }
                             if let Message::Close(frame) = &message {
                                 let end = UpstreamEnd::Close {
                                     code: frame.as_ref().map_or(1005, |frame| u16::from(frame.code)),
@@ -1939,7 +2048,17 @@ impl App {
                                     .is_some_and(|turn_id| protocol.turn(turn_id).is_none())
                                 {
                                     awaiting_response_created = None;
+                                    missing_created_deadline = None;
+                                } else if awaiting_response_created.is_some() {
+                                    // A recoverable pre-acceptance close may replace the upstream
+                                    // and replay the one safe turn. Its acknowledgement gets a new
+                                    // full deadline on the replacement generation.
+                                    missing_created_deadline = Some(
+                                        tokio::time::Instant::now()
+                                            + RESPONSES_MISSING_CREATED_TIMEOUT,
+                                    );
                                 }
+                                upstream_idle_deadline = None;
                                 if close_downstream {
                                     break;
                                 }
@@ -1997,6 +2116,11 @@ impl App {
                                     lease.replace(account.clone()).await;
                                     upstream = replacement.socket;
                                     upstream_credentials = replacement.credentials;
+                                    missing_created_deadline = Some(
+                                        tokio::time::Instant::now()
+                                            + RESPONSES_MISSING_CREATED_TIMEOUT,
+                                    );
+                                    upstream_idle_deadline = None;
                                     continue;
                                 }
                             } else if failure.kind != FailureKind::None {
@@ -2024,6 +2148,7 @@ impl App {
                                 for turn_id in association.turn_ids {
                                     if awaiting_response_created == Some(turn_id) {
                                         awaiting_response_created = None;
+                                        missing_created_deadline = None;
                                     }
                                     let response_id = protocol
                                         .turn(turn_id)
@@ -2038,6 +2163,9 @@ impl App {
                                         .await?;
                                     let _ = protocol.settle(turn_id, Settlement::Failed);
                                     turns.remove(&turn_id);
+                                }
+                                if protocol.pending_len() == 0 {
+                                    upstream_idle_deadline = None;
                                 }
                                 continue;
                             }
@@ -2056,6 +2184,11 @@ impl App {
                                 for turn_id in &association.turn_ids {
                                     if awaiting_response_created == Some(*turn_id) {
                                         awaiting_response_created = None;
+                                        missing_created_deadline = None;
+                                        upstream_idle_deadline = Some(
+                                            tokio::time::Instant::now()
+                                                + RESPONSES_UPSTREAM_IDLE_TIMEOUT,
+                                        );
                                     }
                                     if let Some(turn) = turns.get(turn_id) {
                                         for key in &turn.route.soft_keys {
@@ -2088,11 +2221,15 @@ impl App {
                                 for turn_id in association.turn_ids {
                                     if awaiting_response_created == Some(turn_id) {
                                         awaiting_response_created = None;
+                                        missing_created_deadline = None;
                                     }
                                     protocol
                                         .settle(turn_id, settlement)
                                         .map_err(|error| anyhow::anyhow!("settle direct turn: {error:?}"))?;
                                     turns.remove(&turn_id);
+                                }
+                                if protocol.pending_len() == 0 {
+                                    upstream_idle_deadline = None;
                                 }
                             }
                         }
@@ -2116,7 +2253,14 @@ impl App {
                                 .is_some_and(|turn_id| protocol.turn(turn_id).is_none())
                             {
                                 awaiting_response_created = None;
+                                missing_created_deadline = None;
+                            } else if awaiting_response_created.is_some() {
+                                missing_created_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + RESPONSES_MISSING_CREATED_TIMEOUT,
+                                );
                             }
+                            upstream_idle_deadline = None;
                             if close_downstream {
                                 return Err(error.into());
                             }
@@ -2141,7 +2285,14 @@ impl App {
                                 .is_some_and(|turn_id| protocol.turn(turn_id).is_none())
                             {
                                 awaiting_response_created = None;
+                                missing_created_deadline = None;
+                            } else if awaiting_response_created.is_some() {
+                                missing_created_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + RESPONSES_MISSING_CREATED_TIMEOUT,
+                                );
                             }
+                            upstream_idle_deadline = None;
                             if close_downstream {
                                 break;
                             }
@@ -2326,7 +2477,14 @@ impl App {
         lease: &mut DirectAccountLease,
         end: UpstreamEnd,
     ) -> Result<bool> {
-        if protocol.pending_len() == 1 && !matches!(end, UpstreamEnd::Close { code: 1000 }) {
+        let watchdog = matches!(
+            end,
+            UpstreamEnd::MissingResponseCreatedTimeout | UpstreamEnd::UpstreamIdleTimeout
+        );
+        if protocol.pending_len() == 1
+            && !watchdog
+            && !matches!(end, UpstreamEnd::Close { code: 1000 })
+        {
             let turn_id = protocol.pending().next().expect("one pending").id();
             if let Some((replacement, replacement_account)) = self
                 .try_replay_direct_turn(
@@ -2372,12 +2530,26 @@ impl App {
                     let _ = protocol.settle(action.turn_id, Settlement::RejectedInput);
                 }
                 TurnEndDisposition::StreamIncomplete => {
+                    let (code, message) = match end {
+                        UpstreamEnd::MissingResponseCreatedTimeout => (
+                            "missing_response_created_timeout",
+                            "upstream did not acknowledge response.create before the safety deadline",
+                        ),
+                        UpstreamEnd::UpstreamIdleTimeout => (
+                            "upstream_idle_timeout",
+                            "upstream response made no progress before the safety deadline",
+                        ),
+                        _ => (
+                            "stream_incomplete",
+                            "upstream stream ended before a terminal event",
+                        ),
+                    };
                     let payload = serde_json::json!({
                         "type":"response.failed",
                         "response":{
                             "id":response_id,
                             "status":"failed",
-                            "error":{"type":"server_error","code":"stream_incomplete","message":"upstream stream ended before a terminal event"}
+                            "error":{"type":"server_error","code":code,"message":message,"retryable":false}
                         }
                     });
                     client
@@ -2431,11 +2603,10 @@ impl App {
         path: String,
         live_call_id: Option<String>,
     ) -> Result<Response<ProxyBody>> {
-        let permit = self
-            .upgrade_slots
-            .clone()
-            .try_acquire_owned()
-            .context("WebSocket limit reached")?;
+        let permit = match self.upgrade_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Ok(upgrade_capacity_response()),
+        };
         let inbound_headers = req.headers().clone();
         let pool = self.pool(listener)?;
         let forced_live = live_call_id.is_some();
@@ -3198,6 +3369,20 @@ fn bridge_capacity_response() -> Response<ProxyBody> {
         .expect("static bridge capacity response")
 }
 
+fn upgrade_capacity_response() -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(CONTENT_TYPE, "application/json")
+        .header("retry-after", "5")
+        .body(json_body(serde_json::json!({
+            "error": {
+                "type": "at_capacity",
+                "message": "WebSocket capacity reached; retry later"
+            }
+        })))
+        .expect("static upgrade capacity response")
+}
+
 async fn wait_for_bridge_idle_timeout(
     activity: Arc<BridgeSessionActivity>,
     changed: Arc<Notify>,
@@ -3277,6 +3462,26 @@ async fn send_ws_error(outbound: &BridgeSender, kind: &str, message: &str) {
     })
     .to_string();
     let _ = outbound.send(Message::Text(payload.into())).await;
+}
+
+async fn send_ws_nonretryable_liveness_error(
+    outbound: &BridgeSender,
+    failure: HttpBridgeLivenessFailure,
+) {
+    let payload = serde_json::json!({
+        "type": "error",
+        "status": StatusCode::GATEWAY_TIMEOUT.as_u16(),
+        "error": {
+            "type": "upstream_timeout",
+            "code": failure.code(),
+            "message": failure.message(),
+            "retryable": false
+        },
+        "headers": {},
+    });
+    let _ = outbound
+        .send(Message::Text(payload.to_string().into()))
+        .await;
 }
 
 async fn send_direct_error(
@@ -3414,13 +3619,17 @@ async fn pump_http_response_to_websocket(
     app: &Arc<App>,
     request_input: Vec<serde_json::Value>,
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
+    response_created_deadline: tokio::time::Instant,
+    upstream_idle_timeout: Duration,
 ) -> std::result::Result<(), HttpBridgePumpFailure> {
     let mut capture = HttpBridgeCapture {
         input: request_input,
         response_id: None,
         output: Vec::new(),
         delivered_event: false,
+        response_created: false,
     };
+    let mut liveness = None;
     let result: Result<()> = async {
     let status = response.status();
     let response_headers = response.headers().clone();
@@ -3436,7 +3645,18 @@ async fn pump_http_response_to_websocket(
         .get::<SelectedAccount>()
         .map(|selected| selected.0.clone());
     if !status.is_success() {
-        let bytes = collect_proxy_body(&mut body, FILE_CREATE_RESPONSE_LIMIT).await?;
+        let bytes = match tokio::time::timeout_at(
+            response_created_deadline,
+            collect_proxy_body(&mut body, FILE_CREATE_RESPONSE_LIMIT),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                liveness = Some(HttpBridgeLivenessFailure::MissingResponseCreated);
+                anyhow::bail!("missing response.created watchdog expired")
+            }
+        };
         let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
         let error = parsed
             .as_ref()
@@ -3471,8 +3691,18 @@ async fn pump_http_response_to_websocket(
     // headers; trusting those headers can turn a valid terminal response into
     // a retryable protocol failure. The header is only the fallback when the
     // prefix remains undecidable.
-    let (body_kind, initial_chunks) =
-        sniff_unknown_responses_body(&mut body, header_kind).await?;
+    let (body_kind, initial_chunks) = match tokio::time::timeout_at(
+        response_created_deadline,
+        sniff_unknown_responses_body(&mut body, header_kind),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            liveness = Some(HttpBridgeLivenessFailure::MissingResponseCreated);
+            anyhow::bail!("missing response.created watchdog expired")
+        }
+    };
     if body_kind == SniffedBodyKind::Sse {
         let mut decoder = SseDecoder::default();
         for data in initial_chunks {
@@ -3490,7 +3720,24 @@ async fn pump_http_response_to_websocket(
                 return Ok(());
             }
         }
-        while let Some(frame) = body.frame().await {
+        loop {
+            let next_frame = if capture.response_created {
+                tokio::time::timeout(upstream_idle_timeout, body.frame()).await
+            } else {
+                tokio::time::timeout_at(response_created_deadline, body.frame()).await
+            };
+            let frame = match next_frame {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(_) => {
+                    liveness = Some(if capture.response_created {
+                        HttpBridgeLivenessFailure::UpstreamIdle
+                    } else {
+                        HttpBridgeLivenessFailure::MissingResponseCreated
+                    });
+                    anyhow::bail!("Responses upstream liveness watchdog expired")
+                }
+            };
             let frame = frame?;
             let Ok(data) = frame.into_data() else {
                 continue;
@@ -3523,9 +3770,22 @@ async fn pump_http_response_to_websocket(
         }
         anyhow::bail!("upstream SSE ended without a terminal event")
     }
-    let bytes =
-        collect_proxy_body_with_initial(&mut body, initial_chunks, RESPONSES_JSON_RESPONSE_LIMIT)
-            .await?;
+    let bytes = match tokio::time::timeout_at(
+        response_created_deadline,
+        collect_proxy_body_with_initial(
+            &mut body,
+            initial_chunks,
+            RESPONSES_JSON_RESPONSE_LIMIT,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            liveness = Some(HttpBridgeLivenessFailure::MissingResponseCreated);
+            anyhow::bail!("missing response.created watchdog expired")
+        }
+    };
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(json_error) if header_kind == SniffedBodyKind::Json => {
@@ -3557,6 +3817,7 @@ async fn pump_http_response_to_websocket(
     result.map_err(|error| HttpBridgePumpFailure {
         error,
         delivered_event: capture.delivered_event,
+        liveness,
     })
 }
 
@@ -3911,6 +4172,16 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn websocket_capacity_is_typed_service_unavailable() {
+        let response = upgrade_capacity_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "5");
+        let body = response.into_body().collect().await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body.to_bytes()).unwrap();
+        assert_eq!(payload["error"]["type"], "at_capacity");
+    }
+
     fn direct_test_app(
         dir: &std::path::Path,
     ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
@@ -3995,6 +4266,56 @@ mod tests {
         App::new(config, router, Arc::new(Stats::default())).unwrap()
     }
 
+    fn pending_sse_response(
+        initial: &'static [u8],
+    ) -> (
+        Response<ProxyBody>,
+        mpsc::Sender<std::io::Result<Frame<Bytes>>>,
+    ) {
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .try_send(Ok(Frame::data(Bytes::from_static(initial))))
+            .unwrap();
+        let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        });
+        let body = BodyExt::boxed(http_body_util::StreamBody::new(stream));
+        (
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .unwrap(),
+            sender,
+        )
+    }
+
+    async fn pump_with_test_watchdogs(
+        app: &Arc<App>,
+        response: Response<ProxyBody>,
+        created_after: Duration,
+        idle_for: Duration,
+    ) -> (HttpBridgePumpFailure, mpsc::Receiver<(u64, Message)>) {
+        let (sender, receiver) = mpsc::channel(8);
+        let outbound = BridgeSender {
+            sender,
+            generation: 1,
+        };
+        let continuation = Arc::new(StdMutex::new(None));
+        let failure = pump_http_response_to_websocket(
+            response,
+            &outbound,
+            app,
+            Vec::new(),
+            &continuation,
+            tokio::time::Instant::now() + created_after,
+            idle_for,
+        )
+        .await
+        .unwrap_err();
+        (failure, receiver)
+    }
+
     #[tokio::test]
     async fn bridge_capacity_evicts_lru_idle_session_without_using_upgrade_slots() {
         let dir = tempfile::tempdir().unwrap();
@@ -4016,6 +4337,175 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_eq!(app.bridge_sessions.lock().await.len(), 1);
         app.finish_bridge_session(second.id).await;
+    }
+
+    #[tokio::test]
+    async fn http_bridge_comments_do_not_disarm_missing_created_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let (response, _body_sender) = pending_sse_response(b": keepalive\n\n");
+
+        let (failure, receiver) = pump_with_test_watchdogs(
+            &app,
+            response,
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            failure.liveness,
+            Some(HttpBridgeLivenessFailure::MissingResponseCreated)
+        );
+        assert!(!failure.delivered_event);
+        assert!(receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_bridge_prelude_does_not_disarm_missing_created_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let (response, _body_sender) =
+            pending_sse_response(b"data: {\"type\":\"response.queued\",\"sequence_number\":0}\n\n");
+
+        let (failure, mut receiver) = pump_with_test_watchdogs(
+            &app,
+            response,
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            failure.liveness,
+            Some(HttpBridgeLivenessFailure::MissingResponseCreated)
+        );
+        assert!(failure.delivered_event);
+        let (_, message) = receiver.recv().await.unwrap();
+        assert!(message.into_text().unwrap().contains("response.queued"));
+    }
+
+    #[tokio::test]
+    async fn http_bridge_response_metadata_is_visible_but_does_not_disarm_created_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let (response, _body_sender) = pending_sse_response(
+            b"data: {\"type\":\"response.metadata\",\"sequence_number\":7,\"response\":{\"metadata\":{\"trace\":\"opaque\"}}}\n\n",
+        );
+
+        let (failure, mut receiver) = pump_with_test_watchdogs(
+            &app,
+            response,
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            failure.liveness,
+            Some(HttpBridgeLivenessFailure::MissingResponseCreated)
+        );
+        assert!(failure.delivered_event);
+        let (_, message) = receiver.recv().await.unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(message.into_text().unwrap().as_ref()).unwrap();
+        assert_eq!(payload["type"], "response.metadata");
+        assert_eq!(payload["sequence_number"], 7);
+        assert_eq!(payload["response"]["metadata"]["trace"], "opaque");
+    }
+
+    #[tokio::test]
+    async fn http_bridge_created_switches_to_per_frame_idle_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let (response, _body_sender) = pending_sse_response(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_watchdog\"}}\n\n",
+        );
+
+        let (failure, mut receiver) = pump_with_test_watchdogs(
+            &app,
+            response,
+            Duration::from_secs(1),
+            Duration::from_millis(30),
+        )
+        .await;
+
+        assert_eq!(
+            failure.liveness,
+            Some(HttpBridgeLivenessFailure::UpstreamIdle)
+        );
+        assert!(failure.delivered_event);
+        let (_, message) = receiver.recv().await.unwrap();
+        assert!(message.into_text().unwrap().contains("response.created"));
+    }
+
+    #[tokio::test]
+    async fn http_bridge_partial_json_cannot_bypass_missing_created_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let (mut response, _body_sender) = pending_sse_response(b"{\"response\":");
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        let (failure, receiver) = pump_with_test_watchdogs(
+            &app,
+            response,
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            failure.liveness,
+            Some(HttpBridgeLivenessFailure::MissingResponseCreated)
+        );
+        assert!(!failure.delivered_event);
+        assert!(receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_bridge_error_body_cannot_bypass_missing_created_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let (mut response, _body_sender) = pending_sse_response(b"{\"error\":");
+        *response.status_mut() = StatusCode::BAD_GATEWAY;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        let (failure, receiver) = pump_with_test_watchdogs(
+            &app,
+            response,
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            failure.liveness,
+            Some(HttpBridgeLivenessFailure::MissingResponseCreated)
+        );
+        assert!(!failure.delivered_event);
+        assert!(receiver.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_bridge_liveness_error_is_typed_and_nonretryable() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let outbound = BridgeSender {
+            sender,
+            generation: 7,
+        };
+        send_ws_nonretryable_liveness_error(&outbound, HttpBridgeLivenessFailure::UpstreamIdle)
+            .await;
+        let (generation, message) = receiver.recv().await.unwrap();
+        assert_eq!(generation, 7);
+        let payload: serde_json::Value =
+            serde_json::from_str(message.into_text().unwrap().as_ref()).unwrap();
+        assert_eq!(payload["status"], 504);
+        assert_eq!(payload["error"]["code"], "upstream_idle_timeout");
+        assert_eq!(payload["error"]["retryable"], false);
     }
 
     #[tokio::test]
@@ -4974,6 +5464,109 @@ mod tests {
             }
         });
         (address, task)
+    }
+
+    async fn spawn_metadata_websocket_upstream()
+    -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |mut req: Request<Incoming>| async move {
+                let key = req.headers()[SEC_WEBSOCKET_KEY].as_bytes();
+                let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key);
+                let upgrade = hyper::upgrade::on(&mut req);
+                tokio::spawn(async move {
+                    let upgraded = upgrade.await.unwrap();
+                    let mut websocket = WebSocketStream::from_raw_socket(
+                        TokioIo::new(upgraded),
+                        Role::Server,
+                        None,
+                    )
+                    .await;
+                    assert!(matches!(websocket.next().await, Some(Ok(Message::Text(_)))));
+                    for payload in [
+                        serde_json::json!({
+                            "type":"response.metadata",
+                            "sequence_number":7,
+                            "response":{"metadata":{"trace":"opaque"}}
+                        }),
+                        serde_json::json!({
+                            "type":"response.created",
+                            "sequence_number":8,
+                            "response":{"id":"resp_metadata","status":"in_progress"}
+                        }),
+                        serde_json::json!({
+                            "type":"response.completed",
+                            "sequence_number":9,
+                            "response":{"id":"resp_metadata","status":"completed"}
+                        }),
+                    ] {
+                        websocket
+                            .send(Message::Text(payload.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                });
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(StatusCode::SWITCHING_PROTOCOLS)
+                        .header(CONNECTION, "Upgrade")
+                        .header(UPGRADE, "websocket")
+                        .header(SEC_WEBSOCKET_ACCEPT, accept)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                )
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn direct_mode_passes_response_metadata_before_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let (upstream_addr, upstream_task) = spawn_metadata_websocket_upstream().await;
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::Direct,
+        )
+        .await;
+        let mut websocket = connect_test_websocket(proxy_addr).await;
+        websocket
+            .send(Message::Text(
+                serde_json::json!({"type":"response.create","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        for (expected_type, expected_sequence) in [
+            ("response.metadata", 7),
+            ("response.created", 8),
+            ("response.completed", 9),
+        ] {
+            let payload: serde_json::Value = serde_json::from_str(
+                websocket
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
+                    .as_ref(),
+            )
+            .unwrap();
+            assert_eq!(payload["type"], expected_type);
+            assert_eq!(payload["sequence_number"], expected_sequence);
+        }
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     #[tokio::test]

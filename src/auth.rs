@@ -41,6 +41,9 @@ pub const PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 60;
 /// or keep the next scheduled sweep waiting indefinitely.
 pub const PROACTIVE_REFRESH_ACCOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REFRESH_RESPONSE_BYTES: usize = 1024 * 1024;
+const DEFAULT_OAUTH_EXPIRES_IN_SECONDS: u64 = 60 * 60;
+const MAX_OAUTH_EXPIRES_IN_SECONDS: u64 = 24 * 60 * 60;
+const ACCESS_TOKEN_EXPIRES_AT_KEY: &str = "comradex_access_token_expires_at";
 
 type AuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -295,12 +298,26 @@ impl Resolver {
             bail!("OAuth refresh failed with HTTP {status} ({code})")
         }
         let refreshed: Value = serde_json::from_slice(&bytes).context("parse OAuth refresh")?;
+        let access_token = refreshed
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .context("OAuth refresh response has no access token")?;
+        let expires_at = now.saturating_add(validated_expires_in(&refreshed));
         let tokens = document
             .value
             .get_mut("tokens")
             .and_then(Value::as_object_mut)
             .context("Codex auth tokens are not an object")?;
-        for key in ["id_token", "access_token", "refresh_token"] {
+        tokens.insert(
+            "access_token".to_owned(),
+            Value::String(access_token.to_owned()),
+        );
+        tokens.insert(
+            ACCESS_TOKEN_EXPIRES_AT_KEY.to_owned(),
+            Value::Number(expires_at.into()),
+        );
+        for key in ["id_token", "refresh_token"] {
             if let Some(value) = refreshed.get(key).and_then(Value::as_str) {
                 tokens.insert(key.to_owned(), Value::String(value.to_owned()));
             }
@@ -392,10 +409,36 @@ fn access_token_needs_refresh(value: &Value) -> bool {
 fn access_token_needs_refresh_at(value: &Value, now: u64) -> bool {
     let token = lookup(value, &["tokens", "access_token"])
         .or_else(|| lookup(value, &["tokens", "accessToken"]));
-    let Some(expiration) = token.and_then(jwt_expiration) else {
+    let Some(token) = token else {
+        // Top-level API keys and legacy non-managed credential shapes are not refresh candidates.
         return false;
     };
+    let jwt_expiration = jwt_expiration(token);
+    let fallback_value = value
+        .get("tokens")
+        .and_then(|tokens| tokens.get(ACCESS_TOKEN_EXPIRES_AT_KEY));
+    let fallback_expiration = fallback_value
+        .and_then(Value::as_u64)
+        .filter(|expiration| *expiration <= now.saturating_add(MAX_OAUTH_EXPIRES_IN_SECONDS));
+    let expiration = match (jwt_expiration, fallback_expiration) {
+        (Some(jwt), Some(fallback)) => jwt.min(fallback),
+        (Some(jwt), None) => jwt,
+        (None, Some(fallback)) => fallback,
+        // A persisted but malformed fallback came from a Comradex refresh and must fail closed.
+        (None, None) if fallback_value.is_some() => return true,
+        // Preserve compatibility with existing opaque managed credentials. Every successful
+        // Comradex refresh writes the bounded fallback, so only legacy/external tokens reach here.
+        (None, None) => return false,
+    };
     expiration <= now.saturating_add(REFRESH_WINDOW_SECONDS)
+}
+
+fn validated_expires_in(response: &Value) -> u64 {
+    response
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .filter(|seconds| (1..=MAX_OAUTH_EXPIRES_IN_SECONDS).contains(seconds))
+        .unwrap_or(DEFAULT_OAUTH_EXPIRES_IN_SECONDS)
 }
 
 fn jwt_expiration(token: &str) -> Option<u64> {
@@ -570,6 +613,99 @@ mod tests {
         let boundary = json!({ "tokens": { "access_token": jwt(now + 300, "boundary") } });
         assert!(!access_token_needs_refresh_at(&outside, now));
         assert!(access_token_needs_refresh_at(&boundary, now));
+    }
+
+    #[test]
+    fn missing_or_untrusted_managed_expiry_is_never_indefinitely_fresh() {
+        let now = 1_000_000;
+        for value in [
+            json!({
+                "tokens": {
+                    "access_token": "opaque-token",
+                    ACCESS_TOKEN_EXPIRES_AT_KEY: "not-a-timestamp"
+                }
+            }),
+            json!({
+                "tokens": {
+                    "access_token": "opaque-token",
+                    ACCESS_TOKEN_EXPIRES_AT_KEY: u64::MAX
+                }
+            }),
+        ] {
+            assert!(access_token_needs_refresh_at(&value, now));
+        }
+
+        let legacy_opaque = json!({ "tokens": { "access_token": "opaque-token" } });
+        assert!(!access_token_needs_refresh_at(&legacy_opaque, now));
+
+        let far_future_jwt = json!({
+            "tokens": {
+                "access_token": jwt(u64::MAX, "far-future"),
+                "refresh_token": "test-refresh-token"
+            }
+        });
+        assert!(!access_token_needs_refresh_at(&far_future_jwt, now));
+
+        let bounded = json!({
+            "tokens": {
+                "access_token": "opaque-token",
+                ACCESS_TOKEN_EXPIRES_AT_KEY: now + 3_600
+            }
+        });
+        assert!(!access_token_needs_refresh_at(&bounded, now));
+        assert!(access_token_needs_refresh_at(&bounded, now + 3_300));
+    }
+
+    #[test]
+    fn oauth_expires_in_is_strictly_bounded() {
+        assert_eq!(validated_expires_in(&json!({ "expires_in": 7_200 })), 7_200);
+        for response in [
+            json!({}),
+            json!({ "expires_in": "3600" }),
+            json!({ "expires_in": -1 }),
+            json!({ "expires_in": 0 }),
+            json!({ "expires_in": MAX_OAUTH_EXPIRES_IN_SECONDS + 1 }),
+        ] {
+            assert_eq!(
+                validated_expires_in(&response),
+                DEFAULT_OAUTH_EXPIRES_IN_SECONDS
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refreshed_opaque_access_token_gets_bounded_fallback_expiry() {
+        let now = 1_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        write_managed_auth(&home, &jwt(now + 60, "stale"));
+        let refresh_url = serve_refresh_response(
+            "200 OK",
+            json!({
+                "access_token": "opaque-replacement",
+                "refresh_token": "replacement-refresh-token",
+                "expires_in": u64::MAX
+            }),
+        )
+        .await;
+        let resolver = test_resolver(&[&home], refresh_url);
+        let account = AccountConfig::CodexHome { path: home.clone() };
+
+        assert_eq!(
+            resolver.proactive_refresh_at(&account, now).await.unwrap(),
+            Some(ProactiveRefresh::Refreshed)
+        );
+        let written: Value =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(
+            written["tokens"][ACCESS_TOKEN_EXPIRES_AT_KEY],
+            now + DEFAULT_OAUTH_EXPIRES_IN_SECONDS
+        );
+        assert!(!access_token_needs_refresh_at(&written, now));
+        assert!(access_token_needs_refresh_at(
+            &written,
+            now + DEFAULT_OAUTH_EXPIRES_IN_SECONDS - REFRESH_WINDOW_SECONDS
+        ));
     }
 
     #[tokio::test]
