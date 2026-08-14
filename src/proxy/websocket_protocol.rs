@@ -327,6 +327,8 @@ pub enum UpstreamEnd {
     Close { code: u16 },
     Eof,
     TransportError { process_wide: bool },
+    MissingResponseCreatedTimeout,
+    UpstreamIdleTimeout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,6 +707,10 @@ impl ProtocolState {
 
     pub fn classify_upstream_end(&self, end: UpstreamEnd) -> UpstreamEndPlan {
         let process_wide = matches!(end, UpstreamEnd::TransportError { process_wide: true });
+        let watchdog = matches!(
+            end,
+            UpstreamEnd::MissingResponseCreatedTimeout | UpstreamEnd::UpstreamIdleTimeout
+        );
         let clean = matches!(end, UpstreamEnd::Close { code: 1000 });
         let turns: Vec<_> = self
             .pending
@@ -741,7 +747,7 @@ impl ProtocolState {
         UpstreamEndPlan {
             turns,
             downstream,
-            penalize_account: has_incomplete && !process_wide,
+            penalize_account: has_incomplete && !process_wide && !watchdog,
             process_wide,
         }
     }
@@ -1332,6 +1338,39 @@ mod tests {
     }
 
     #[test]
+    fn response_metadata_is_visible_and_sequenced_without_marking_created() {
+        let mut state = state();
+        let turn = state
+            .admit_response_create(&create(json!("hello")))
+            .unwrap();
+        let metadata = json!({
+            "type":"response.metadata",
+            "sequence_number":7,
+            "response":{"metadata":{"trace":"opaque"}}
+        });
+
+        let association = state.observe_upstream_event(&metadata, None).unwrap();
+        assert_eq!(association.turn_ids, [turn]);
+        assert_eq!(association.event_type.as_deref(), Some("response.metadata"));
+        let pending = state.turn(turn).unwrap();
+        assert!(!pending.response_created());
+        assert_eq!(pending.response_event_count(), 1);
+        assert!(!pending.downstream_visible());
+
+        state.mark_downstream_delivered(turn, &metadata).unwrap();
+        let pending = state.turn(turn).unwrap();
+        assert!(pending.downstream_visible());
+        assert_eq!(
+            pending.last_visible_sequence(),
+            Some(SequenceNumber::Signed(7))
+        );
+        assert!(matches!(
+            state.replay_decision(turn, FailureKind::Transient, ReplayContext::default()),
+            ReplayDecision::Refused(ReplayRefusal::FiniteSequenceVisible)
+        ));
+    }
+
+    #[test]
     fn replay_requires_a_single_previsible_unsettled_turn() {
         let mut state = state();
         let turn = state
@@ -1619,6 +1658,29 @@ mod tests {
         let plan = state.classify_upstream_end(UpstreamEnd::TransportError { process_wide: true });
         assert!(plan.process_wide);
         assert!(!plan.penalize_account);
+    }
+
+    #[test]
+    fn watchdog_timeouts_are_account_neutral_and_never_imply_clean_rejection() {
+        for end in [
+            UpstreamEnd::MissingResponseCreatedTimeout,
+            UpstreamEnd::UpstreamIdleTimeout,
+        ] {
+            let mut state = state();
+            let turn = state
+                .admit_response_create(&create(json!("hello")))
+                .unwrap();
+            let plan = state.classify_upstream_end(end);
+            assert_eq!(
+                plan.turns,
+                [TurnEndAction {
+                    turn_id: turn,
+                    disposition: TurnEndDisposition::StreamIncomplete,
+                }]
+            );
+            assert!(!plan.penalize_account);
+            assert_eq!(plan.downstream, DownstreamEndAction::KeepOpen);
+        }
     }
 
     #[test]
