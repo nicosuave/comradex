@@ -223,6 +223,18 @@ docker run --rm -it -v comradex-review-auth:/root/.codex comradex-review login -
 
 Running against the real Codex backend requires account authentication and should mount the configuration, state, and account directories explicitly. Isolated account homes must be writable if the daemon is expected to rotate OAuth credentials; run the container with the host account directories' numeric UID/GID rather than weakening their `0600` permissions.
 
+## Releasing
+
+GitHub Actions builds and publishes the Linux artifacts after a version tag is pushed. macOS artifacts are built locally so the Developer ID certificate and Apple notarization credentials remain in the maintainer's Keychain rather than GitHub secrets.
+
+After the tagged Linux release workflow succeeds, publish both signed and notarized macOS architectures and update the Homebrew tap with:
+
+```sh
+scripts/release_macos_local.sh 0.9.3
+```
+
+The script requires the tag to point at `HEAD`, refuses uncommitted Rust source changes, uses the first local Developer ID Application identity, and uses the `sidequery-notarization` Keychain profile by default. Override those with `CODESIGN_IDENTITY` or `NOTARY_PROFILE` when necessary. It replaces the matching macOS GitHub release assets, waits for the Homebrew update workflow, and retries that update once if GitHub's asset CDN has not settled.
+
 ## Status and statistics
 
 ```sh
