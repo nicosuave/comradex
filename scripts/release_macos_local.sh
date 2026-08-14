@@ -22,7 +22,7 @@ if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "$tag^{commit}")" ]]; then
   echo "HEAD must be the commit tagged $tag" >&2
   exit 1
 fi
-if ! git diff --quiet -- Cargo.toml Cargo.lock src; then
+if ! git diff --quiet HEAD -- Cargo.toml Cargo.lock src; then
   echo "Refusing to release with uncommitted source changes" >&2
   exit 1
 fi
@@ -78,8 +78,16 @@ gh release upload "$tag" \
   --clobber
 
 update_homebrew() {
-  local previous_run new_run
-  previous_run="$(gh run list -R nicosuave/homebrew-tap --limit 1 --json databaseId --jq '.[0].databaseId')"
+  local workflow="update-formula.yml"
+  local previous_runs new_run candidate candidate_log
+  previous_runs="$(
+    gh run list -R nicosuave/homebrew-tap \
+      --workflow "$workflow" \
+      --event repository_dispatch \
+      --limit 100 \
+      --json databaseId \
+      --jq '.[].databaseId'
+  )"
   gh api --method POST repos/nicosuave/homebrew-tap/dispatches \
     -f event_type=update-formula \
     -F "client_payload[formula]=comradex" \
@@ -87,12 +95,34 @@ update_homebrew() {
     -F "client_payload[repo]=nicosuave/comradex"
 
   new_run=""
-  for _ in {1..15}; do
-    new_run="$(gh run list -R nicosuave/homebrew-tap --limit 1 --json databaseId --jq '.[0].databaseId')"
-    [[ -n "$new_run" && "$new_run" != "$previous_run" ]] && break
+  for _ in {1..60}; do
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] || continue
+      if grep -Fqx "$candidate" <<<"$previous_runs"; then
+        continue
+      fi
+      # repository_dispatch does not return a run ID. Filter to the exact
+      # workflow/event, then correlate concurrent dispatches using the payload
+      # echoed by this workflow before deciding which run to trust.
+      candidate_log="$(
+        gh run view "$candidate" -R nicosuave/homebrew-tap --log 2>/dev/null || true
+      )"
+      if grep -Fq "Updating comradex to $version" <<<"$candidate_log"; then
+        new_run="$candidate"
+        break
+      fi
+    done < <(
+      gh run list -R nicosuave/homebrew-tap \
+        --workflow "$workflow" \
+        --event repository_dispatch \
+        --limit 20 \
+        --json databaseId \
+        --jq '.[].databaseId'
+    )
+    [[ -n "$new_run" ]] && break
     sleep 2
   done
-  if [[ -z "$new_run" || "$new_run" == "$previous_run" ]]; then
+  if [[ -z "$new_run" ]]; then
     echo "Timed out waiting for the Homebrew update workflow" >&2
     return 1
   fi
