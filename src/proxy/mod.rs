@@ -800,13 +800,26 @@ impl App {
 
     async fn handle_http_replay_with_routing_anchor(
         &self,
-        inbound_headers: hyper::HeaderMap,
+        mut inbound_headers: hyper::HeaderMap,
         method: Method,
         listener: &ListenerConfig,
-        path: String,
+        mut path: String,
         mut replay: ReplayBody,
         routing_previous_response_id: Option<String>,
     ) -> Result<Response<ProxyBody>> {
+        let legacy_compact = method == Method::POST && is_legacy_compact_path(&path);
+        if legacy_compact {
+            let bytes = replay.into_bytes().await?;
+            let bytes = rewrite_legacy_compact_request(&bytes)?;
+            replay = ReplayBody::from_bytes(
+                bytes,
+                self.config.proxy.max_request_bytes,
+                self.config.proxy.max_spool_bytes,
+                self.stats.clone(),
+            )?;
+            path = responses_path_for_legacy_compact(&path);
+            mark_compaction_request(&mut inbound_headers)?;
+        }
         if replay.file_ids_overflow() {
             return Ok(error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1046,6 +1059,9 @@ impl App {
                             selected = alternate;
                             continue;
                         }
+                    }
+                    if status.is_success() && legacy_compact {
+                        return map_legacy_compact_response(response).await;
                     }
                     request_lease.disarm();
                     return Ok(map_http_response_leased(
@@ -3102,6 +3118,169 @@ fn is_native_responses(path: &str) -> bool {
     )
 }
 
+fn is_legacy_compact_path(path: &str) -> bool {
+    path.split('?').next() == Some("/responses/compact")
+}
+
+fn responses_path_for_legacy_compact(path: &str) -> String {
+    path.strip_prefix("/responses/compact")
+        .map(|suffix| format!("/responses{suffix}"))
+        .unwrap_or_else(|| path.to_owned())
+}
+
+fn rewrite_legacy_compact_request(bytes: &[u8]) -> Result<bytes::Bytes> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).context("parse legacy compact request")?;
+    let object = value
+        .as_object_mut()
+        .context("legacy compact request must be a JSON object")?;
+    object.insert("stream".into(), serde_json::Value::Bool(true));
+    object.insert("store".into(), serde_json::Value::Bool(false));
+    object.remove("text");
+    object.remove("tools");
+    object.remove("tool_choice");
+    let input = object
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("legacy compact request input must be an array")?;
+    if !input.last().is_some_and(|item| {
+        item.get("type").and_then(serde_json::Value::as_str) == Some("compaction_trigger")
+    }) {
+        input.push(serde_json::json!({"type":"compaction_trigger"}));
+    }
+    Ok(bytes::Bytes::from(serde_json::to_vec(&value)?))
+}
+
+fn mark_compaction_request(headers: &mut hyper::HeaderMap) -> Result<()> {
+    let mut metadata = headers
+        .get("x-codex-turn-metadata")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(value).ok()
+        })
+        .unwrap_or_default();
+    metadata.insert(
+        "request_kind".into(),
+        serde_json::Value::String("compaction".into()),
+    );
+    headers.insert(
+        "x-codex-turn-metadata",
+        serde_json::to_string(&metadata)?.parse()?,
+    );
+    headers.remove(CONTENT_LENGTH);
+    Ok(())
+}
+
+async fn map_legacy_compact_response(response: Response<Incoming>) -> Result<Response<ProxyBody>> {
+    let (mut parts, mut body) = response.into_parts();
+    let mut decoder = SseDecoder::default();
+    let mut created_id = None;
+    let mut completed = None;
+    let mut output = Vec::<(usize, serde_json::Value)>::new();
+    let mut received = 0usize;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.context("read compact response")?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        received = received
+            .checked_add(data.len())
+            .context("compact response length overflow")?;
+        if received > RESPONSES_JSON_RESPONSE_LIMIT {
+            anyhow::bail!("compact response exceeds safety limit")
+        }
+        for event in decoder.push(&data)? {
+            capture_legacy_compact_event(event.value, &mut created_id, &mut completed, &mut output);
+        }
+    }
+    for event in decoder.finish()? {
+        capture_legacy_compact_event(event.value, &mut created_id, &mut completed, &mut output);
+    }
+    let completed = completed.context("compact stream ended without a terminal response")?;
+    output.sort_by_key(|(index, _)| *index);
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "object".into(),
+        serde_json::Value::String("response.compact".into()),
+    );
+    payload.insert(
+        "id".into(),
+        completed
+            .get("id")
+            .cloned()
+            .or_else(|| created_id.map(serde_json::Value::String))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    payload.insert(
+        "status".into(),
+        completed
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("completed".into())),
+    );
+    if !output.is_empty() {
+        payload.insert(
+            "output".into(),
+            serde_json::Value::Array(output.into_iter().map(|(_, item)| item).collect()),
+        );
+    } else if let Some(items) = completed
+        .get("output")
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+    {
+        payload.insert("output".into(), items.clone());
+    }
+    for key in ["usage", "error"] {
+        if let Some(value) = completed.get(key).filter(|value| !value.is_null()) {
+            payload.insert(key.into(), value.clone());
+        }
+    }
+    let bytes = bytes::Bytes::from(serde_json::to_vec(&payload)?);
+    headers::strip_hop_by_hop(&mut parts.headers);
+    parts.headers.remove("content-encoding");
+    parts
+        .headers
+        .insert(CONTENT_TYPE, "application/json".parse()?);
+    parts.headers.insert(CONTENT_LENGTH, bytes.len().into());
+    Ok(Response::from_parts(parts, bytes_body(bytes)))
+}
+
+fn capture_legacy_compact_event(
+    event: serde_json::Value,
+    created_id: &mut Option<String>,
+    completed: &mut Option<serde_json::Value>,
+    output: &mut Vec<(usize, serde_json::Value)>,
+) {
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("response.created") => {
+            if let Some(id) = event
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                *created_id = Some(id.to_owned());
+            }
+        }
+        Some("response.output_item.done") => {
+            if let Some(item) = event.get("item").filter(|item| item.is_object()) {
+                let index = event
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .unwrap_or(output.len());
+                output.push((index, item.clone()));
+            }
+        }
+        Some("response.completed" | "response.failed" | "response.incomplete") => {
+            *completed = event
+                .get("response")
+                .filter(|value| value.is_object())
+                .cloned();
+        }
+        _ => {}
+    }
+}
+
 fn is_file_create(method: &Method, path: &str) -> bool {
     *method == Method::POST && path.split('?').next() == Some("/files")
 }
@@ -4850,6 +5029,37 @@ mod tests {
         assert!(!is_safe_codex_quota_header("x-codex-turn-metadata"));
     }
 
+    #[test]
+    fn rewrites_legacy_compact_request_for_current_responses_protocol() {
+        let bytes = rewrite_legacy_compact_request(
+            br#"{"input":[{"type":"message","content":"hello"}],"store":true,"stream":false,"tools":[]}"#,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["store"], false);
+        assert!(value.get("tools").is_none());
+        assert_eq!(
+            value["input"].as_array().unwrap().last().unwrap()["type"],
+            "compaction_trigger"
+        );
+        assert_eq!(
+            responses_path_for_legacy_compact("/responses/compact?test=1"),
+            "/responses?test=1"
+        );
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-codex-turn-metadata",
+            r#"{"thread_id":"task"}"#.parse().unwrap(),
+        );
+        mark_compaction_request(&mut headers).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(headers["x-codex-turn-metadata"].to_str().unwrap()).unwrap();
+        assert_eq!(metadata["thread_id"], "task");
+        assert_eq!(metadata["request_kind"], "compaction");
+    }
+
     #[tokio::test]
     async fn direct_fresh_frame_rotates_off_exhausted_socket_account() {
         let dir = tempfile::tempdir().unwrap();
@@ -4961,7 +5171,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replays_exact_body_once_and_commits_alternate_affinity() {
+    async fn translates_legacy_compact_and_commits_alternate_affinity() {
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4999,7 +5209,15 @@ mod tests {
                                     .status(StatusCode::OK)
                                     .header(CONTENT_TYPE, "text/event-stream")
                                     .header("x-codex-turn-state", "opaque-state")
-                                    .body(Full::new(Bytes::from_static(b"data: ok\n\n")))
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"data: {"type":"response.created","response":{"id":"resp_compact","status":"in_progress"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"cmp_1","type":"compaction","encrypted_content":"ciphertext"}}
+
+data: {"type":"response.completed","response":{"id":"resp_compact","status":"completed","output":[],"usage":{"input_tokens":12}}}
+
+"#,
+                                    )))
                                     .unwrap()
                             };
                             Ok::<_, Infallible>(response)
@@ -5071,7 +5289,7 @@ mod tests {
         let client: TestClient<HttpConnector, Full<Bytes>> =
             TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
         let payload = Bytes::from_static(
-            br#"{"client_metadata":{"thread_id":"same-thread"},"input":"byte-identical"}"#,
+            br#"{"client_metadata":{"thread_id":"same-thread"},"input":[{"type":"message","content":"byte-identical"}]}"#,
         );
         for _ in 0..2 {
             let request = Request::builder()
@@ -5085,10 +5303,12 @@ mod tests {
             let response = client.request(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()["x-codex-turn-state"], "opaque-state");
-            assert_eq!(
-                response.into_body().collect().await.unwrap().to_bytes(),
-                "data: ok\n\n"
-            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["object"], "response.compact");
+            assert_eq!(body["id"], "resp_compact");
+            assert_eq!(body["output"][0]["type"], "compaction");
+            assert_eq!(body["output"][0]["encrypted_content"], "ciphertext");
         }
 
         let calls = seen.lock().unwrap().clone();
@@ -5096,12 +5316,20 @@ mod tests {
         assert_eq!(calls[0].authorization, "Bearer token-a");
         assert_eq!(calls[1].authorization, "Bearer token-b");
         assert_eq!(calls[2].authorization, "Bearer token-b");
-        assert!(calls.iter().all(|v| v.body == payload));
         assert!(
             calls
                 .iter()
-                .all(|v| v.path == "/backend-api/codex/responses/compact?test=1")
+                .all(|v| v.path == "/backend-api/codex/responses?test=1")
         );
+        for call in calls {
+            let body: serde_json::Value = serde_json::from_slice(&call.body).unwrap();
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["store"], false);
+            assert_eq!(
+                body["input"].as_array().unwrap().last().unwrap()["type"],
+                "compaction_trigger"
+            );
+        }
 
         proxy_task.abort();
         upstream_task.abort();
@@ -5152,7 +5380,9 @@ mod tests {
                 "http://{proxy_addr}/0123456789abcdef/v1/responses/compact"
             ))
             .header(AUTHORIZATION, "Bearer caller-token")
-            .body(Full::new(Bytes::from_static(br#"{"input":"compact"}"#)))
+            .body(Full::new(Bytes::from_static(
+                br#"{"input":[{"type":"message","content":"compact"}]}"#,
+            )))
             .unwrap();
         let response = client.request(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -5188,7 +5418,9 @@ mod tests {
                 "http://{proxy_addr}/0123456789abcdef/v1/responses/compact"
             ))
             .header(AUTHORIZATION, "Bearer caller-token")
-            .body(Full::new(Bytes::from_static(br#"{"input":"compact"}"#)))
+            .body(Full::new(Bytes::from_static(
+                br#"{"input":[{"type":"message","content":"compact"}]}"#,
+            )))
             .unwrap();
         let response = client.request(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);

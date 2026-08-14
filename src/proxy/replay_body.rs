@@ -1,6 +1,6 @@
 use std::{
     fs::File as StdFile,
-    io::Write,
+    io::{Read, Write},
     sync::{Arc, atomic::Ordering},
 };
 
@@ -389,6 +389,38 @@ impl ReplayBody {
 
     pub fn file_ids_overflow(&self) -> bool {
         self.file_ids_overflow
+    }
+
+    /// Materialize a replay body for protocol translation while releasing its
+    /// spool reservation. Callers can construct a replacement `ReplayBody`
+    /// without temporarily double-counting the request against the global
+    /// spool limit.
+    pub async fn into_bytes(mut self) -> Result<Bytes> {
+        let storage = std::mem::replace(&mut self.storage, Storage::Memory(Bytes::new()));
+        let bytes = match storage {
+            Storage::Memory(bytes) => bytes,
+            Storage::Files(mut files) => {
+                let mut file = files
+                    .get_mut(0)
+                    .and_then(Option::take)
+                    .context("replay body has no materializable spool")?;
+                let expected = self.len;
+                Bytes::from(
+                    tokio::task::spawn_blocking(move || {
+                        let mut bytes = Vec::with_capacity(expected);
+                        file.read_to_end(&mut bytes)?;
+                        Ok::<_, std::io::Error>(bytes)
+                    })
+                    .await
+                    .context("join replay materialization")??,
+                )
+            }
+        };
+        self.stats
+            .active_spool_bytes
+            .fetch_sub(self.len, Ordering::AcqRel);
+        self.len = 0;
+        Ok(bytes)
     }
 
     pub fn body(&mut self, attempt: usize) -> Result<ProxyBody> {
