@@ -73,6 +73,7 @@ const SSE_DECODE_SLICE_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_DIRECT_CREATES: usize = 64;
 pub(super) const RESPONSES_MISSING_CREATED_TIMEOUT: Duration = Duration::from_secs(240);
 pub(super) const RESPONSES_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const RESPONSES_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS: usize = 4_096;
 
 fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
@@ -198,6 +199,7 @@ struct HttpBridgeCapture {
     output: Vec<serde_json::Value>,
     delivered_event: bool,
     response_created: bool,
+    progress_events: u64,
 }
 
 #[derive(Debug)]
@@ -231,8 +233,12 @@ impl HttpBridgeLivenessFailure {
 
 impl HttpBridgeCapture {
     fn observe(&mut self, event: &serde_json::Value) {
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("response.created") {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str);
+        if event_type == Some("response.created") {
             self.response_created = true;
+        }
+        if self.response_created && event_type.is_some() {
+            self.progress_events = self.progress_events.saturating_add(1);
         }
         if let Some(response_id) = event
             .get("response")
@@ -279,6 +285,28 @@ async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+fn earliest_turn_deadline(
+    deadlines: &HashMap<TurnId, tokio::time::Instant>,
+) -> Option<(TurnId, tokio::time::Instant)> {
+    deadlines
+        .iter()
+        .min_by_key(|(_, deadline)| **deadline)
+        .map(|(turn_id, deadline)| (*turn_id, *deadline))
+}
+
+fn refresh_turn_deadlines<'a>(
+    deadlines: &mut HashMap<TurnId, tokio::time::Instant>,
+    turn_ids: impl IntoIterator<Item = &'a TurnId>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for turn_id in turn_ids {
+        if let Some(current) = deadlines.get_mut(turn_id) {
+            *current = deadline;
+        }
     }
 }
 
@@ -1754,6 +1782,24 @@ impl App {
         inbound_headers: &hyper::HeaderMap,
         clear_session_state: bool,
     ) -> Result<DirectUpstream> {
+        self.connect_direct_upstream_with_timeout(
+            account,
+            path,
+            inbound_headers,
+            clear_session_state,
+            RESPONSES_DIRECT_CONNECT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn connect_direct_upstream_with_timeout(
+        &self,
+        account: &str,
+        path: &str,
+        inbound_headers: &hyper::HeaderMap,
+        clear_session_state: bool,
+        connect_timeout: Duration,
+    ) -> Result<DirectUpstream> {
         for attempt in 0..2 {
             let uri = self.upstream_uri(path, false)?;
             let mut upstream_req = Request::builder()
@@ -1772,11 +1818,21 @@ impl App {
                 .await?;
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(account).await;
-            let mut response = match self.upgrade_client.request(upstream_req).await {
-                Ok(response) => response,
-                Err(error) => {
+            let connect_deadline = tokio::time::Instant::now() + connect_timeout;
+            let mut response = match tokio::time::timeout_at(
+                connect_deadline,
+                self.upgrade_client.request(upstream_req),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
                     self.router.end(account).await;
                     return Err(error.into());
+                }
+                Err(_) => {
+                    self.router.end(account).await;
+                    anyhow::bail!("upstream WebSocket handshake response timed out")
                 }
             };
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -1784,9 +1840,11 @@ impl App {
                     self.router.end(account).await;
                     anyhow::bail!("upstream selected an unoffered WebSocket subprotocol")
                 }
-                let upgrade = hyper::upgrade::on(&mut response).await;
+                let upgrade =
+                    tokio::time::timeout_at(connect_deadline, hyper::upgrade::on(&mut response))
+                        .await;
                 match upgrade {
-                    Ok(upgraded) => {
+                    Ok(Ok(upgraded)) => {
                         return Ok(DirectUpstream {
                             socket: WebSocketStream::from_raw_socket(
                                 TokioIo::new(upgraded),
@@ -1797,9 +1855,13 @@ impl App {
                             credentials,
                         });
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         self.router.end(account).await;
                         return Err(error.into());
+                    }
+                    Err(_) => {
+                        self.router.end(account).await;
+                        anyhow::bail!("upstream WebSocket protocol upgrade timed out")
                     }
                 }
             }
@@ -1854,9 +1916,10 @@ impl App {
         let mut turns = HashMap::<TurnId, DirectTurn>::new();
         let mut awaiting_response_created: Option<TurnId> = None;
         let mut missing_created_deadline: Option<tokio::time::Instant> = None;
-        let mut upstream_idle_deadline: Option<tokio::time::Instant> = None;
+        let mut upstream_idle_deadlines = HashMap::<TurnId, tokio::time::Instant>::new();
         let mut queued_creates = VecDeque::<Message>::new();
         loop {
+            let earliest_idle_deadline = earliest_turn_deadline(&upstream_idle_deadlines);
             let queued_message = if awaiting_response_created.is_none() {
                 queued_creates.pop_front()
             } else {
@@ -1882,10 +1945,10 @@ impl App {
                         .await?;
                     awaiting_response_created = None;
                     missing_created_deadline = None;
-                    upstream_idle_deadline = None;
+                    upstream_idle_deadlines.clear();
                     if close_downstream { break; }
                 }
-                _ = wait_for_optional_deadline(upstream_idle_deadline) => {
+                _ = wait_for_optional_deadline(earliest_idle_deadline.map(|(_, deadline)| deadline)) => {
                     let close_downstream = self
                         .recover_or_settle_direct_end(
                             &mut protocol,
@@ -1903,7 +1966,7 @@ impl App {
                         .await?;
                     awaiting_response_created = None;
                     missing_created_deadline = None;
-                    upstream_idle_deadline = None;
+                    upstream_idle_deadlines.clear();
                     if close_downstream { break; }
                 }
                 client_message = async {
@@ -2020,11 +2083,6 @@ impl App {
                 upstream_message = upstream.next() => {
                     match upstream_message {
                         Some(Ok(message)) => {
-                            if upstream_idle_deadline.is_some() {
-                                upstream_idle_deadline = Some(
-                                    tokio::time::Instant::now() + RESPONSES_UPSTREAM_IDLE_TIMEOUT,
-                                );
-                            }
                             if let Message::Close(frame) = &message {
                                 let end = UpstreamEnd::Close {
                                     code: frame.as_ref().map_or(1005, |frame| u16::from(frame.code)),
@@ -2058,7 +2116,7 @@ impl App {
                                             + RESPONSES_MISSING_CREATED_TIMEOUT,
                                     );
                                 }
-                                upstream_idle_deadline = None;
+                                upstream_idle_deadlines.clear();
                                 if close_downstream {
                                     break;
                                 }
@@ -2120,7 +2178,7 @@ impl App {
                                         tokio::time::Instant::now()
                                             + RESPONSES_MISSING_CREATED_TIMEOUT,
                                     );
-                                    upstream_idle_deadline = None;
+                                    upstream_idle_deadlines.clear();
                                     continue;
                                 }
                             } else if failure.kind != FailureKind::None {
@@ -2163,9 +2221,7 @@ impl App {
                                         .await?;
                                     let _ = protocol.settle(turn_id, Settlement::Failed);
                                     turns.remove(&turn_id);
-                                }
-                                if protocol.pending_len() == 0 {
-                                    upstream_idle_deadline = None;
+                                    upstream_idle_deadlines.remove(&turn_id);
                                 }
                                 continue;
                             }
@@ -2185,7 +2241,8 @@ impl App {
                                     if awaiting_response_created == Some(*turn_id) {
                                         awaiting_response_created = None;
                                         missing_created_deadline = None;
-                                        upstream_idle_deadline = Some(
+                                        upstream_idle_deadlines.insert(
+                                            *turn_id,
                                             tokio::time::Instant::now()
                                                 + RESPONSES_UPSTREAM_IDLE_TIMEOUT,
                                         );
@@ -2210,6 +2267,11 @@ impl App {
                                     }
                                 }
                             }
+                            refresh_turn_deadlines(
+                                &mut upstream_idle_deadlines,
+                                &association.turn_ids,
+                                RESPONSES_UPSTREAM_IDLE_TIMEOUT,
+                            );
                             client.send(message).await?;
                             for turn_id in &association.turn_ids {
                                 protocol
@@ -2227,9 +2289,7 @@ impl App {
                                         .settle(turn_id, settlement)
                                         .map_err(|error| anyhow::anyhow!("settle direct turn: {error:?}"))?;
                                     turns.remove(&turn_id);
-                                }
-                                if protocol.pending_len() == 0 {
-                                    upstream_idle_deadline = None;
+                                    upstream_idle_deadlines.remove(&turn_id);
                                 }
                             }
                         }
@@ -2260,7 +2320,7 @@ impl App {
                                         + RESPONSES_MISSING_CREATED_TIMEOUT,
                                 );
                             }
-                            upstream_idle_deadline = None;
+                            upstream_idle_deadlines.clear();
                             if close_downstream {
                                 return Err(error.into());
                             }
@@ -2292,7 +2352,7 @@ impl App {
                                         + RESPONSES_MISSING_CREATED_TIMEOUT,
                                 );
                             }
-                            upstream_idle_deadline = None;
+                            upstream_idle_deadlines.clear();
                             if close_downstream {
                                 break;
                             }
@@ -3628,6 +3688,7 @@ async fn pump_http_response_to_websocket(
         output: Vec::new(),
         delivered_event: false,
         response_created: false,
+        progress_events: 0,
     };
     let mut liveness = None;
     let result: Result<()> = async {
@@ -3720,9 +3781,16 @@ async fn pump_http_response_to_websocket(
                 return Ok(());
             }
         }
+        let mut upstream_idle_deadline = capture
+            .response_created
+            .then(|| tokio::time::Instant::now() + upstream_idle_timeout);
         loop {
             let next_frame = if capture.response_created {
-                tokio::time::timeout(upstream_idle_timeout, body.frame()).await
+                tokio::time::timeout_at(
+                    upstream_idle_deadline.expect("created response has idle deadline"),
+                    body.frame(),
+                )
+                .await
             } else {
                 tokio::time::timeout_at(response_created_deadline, body.frame()).await
             };
@@ -3742,6 +3810,7 @@ async fn pump_http_response_to_websocket(
             let Ok(data) = frame.into_data() else {
                 continue;
             };
+            let progress_events = capture.progress_events;
             if send_sse_data(
                 &mut decoder,
                 &data,
@@ -3754,6 +3823,10 @@ async fn pump_http_response_to_websocket(
             .await?
             {
                 return Ok(());
+            }
+            if capture.progress_events != progress_events {
+                upstream_idle_deadline =
+                    Some(tokio::time::Instant::now() + upstream_idle_timeout);
             }
         }
         if send_protocol_events(
@@ -4185,12 +4258,20 @@ mod tests {
     fn direct_test_app(
         dir: &std::path::Path,
     ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
+        direct_test_app_with_upstream(dir, ProxyConfig::default().upstream)
+    }
+
+    fn direct_test_app_with_upstream(
+        dir: &std::path::Path,
+        upstream: String,
+    ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
         let listener = ListenerConfig {
             address: "127.0.0.1:0".parse().unwrap(),
             pool: "default".into(),
         };
         let config = Arc::new(Config {
             proxy: ProxyConfig {
+                upstream,
                 responses_websocket_mode: ResponsesWebsocketMode::Direct,
                 installation_secret: "0123456789abcdef".into(),
                 affinity_key: "0123456789abcdef0123456789abcdef".into(),
@@ -4415,7 +4496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_bridge_created_switches_to_per_frame_idle_watchdog() {
+    async fn http_bridge_created_starts_semantic_progress_watchdog() {
         let dir = tempfile::tempdir().unwrap();
         let app = bridge_admission_test_app(dir.path(), 1, 500);
         let (response, _body_sender) = pending_sse_response(
@@ -4437,6 +4518,98 @@ mod tests {
         assert!(failure.delivered_event);
         let (_, message) = receiver.recv().await.unwrap();
         assert!(message.into_text().unwrap().contains("response.created"));
+    }
+
+    #[tokio::test]
+    async fn http_bridge_heartbeats_do_not_refresh_idle_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let (response, body_sender) = pending_sse_response(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_watchdog\"}}\n\n",
+        );
+        let heartbeat_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if body_sender
+                    .send(Ok(Frame::data(Bytes::from_static(b": keepalive\n\n"))))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let (failure, _) = tokio::time::timeout(
+            Duration::from_millis(150),
+            pump_with_test_watchdogs(
+                &app,
+                response,
+                Duration::from_secs(1),
+                Duration::from_millis(30),
+            ),
+        )
+        .await
+        .expect("SSE heartbeats must not keep a stalled response alive");
+        heartbeat_task.abort();
+
+        assert_eq!(
+            failure.liveness,
+            Some(HttpBridgeLivenessFailure::UpstreamIdle)
+        );
+    }
+
+    #[test]
+    fn direct_progress_refreshes_only_associated_turn_deadlines() {
+        let mut protocol = ProtocolState::new(ProtocolLimits::default()).unwrap();
+        let first = protocol
+            .admit_response_create(&serde_json::json!({"type":"response.create","input":[]}))
+            .unwrap();
+        let second = protocol
+            .admit_response_create(&serde_json::json!({"type":"response.create","input":[]}))
+            .unwrap();
+        let original = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut deadlines = HashMap::from([(first, original), (second, original)]);
+
+        refresh_turn_deadlines(&mut deadlines, [&second], Duration::from_secs(30));
+
+        assert_eq!(deadlines[&first], original);
+        assert!(deadlines[&second] > original);
+        assert_eq!(earliest_turn_deadline(&deadlines).unwrap().0, first);
+    }
+
+    #[tokio::test]
+    async fn direct_reconnect_handshake_response_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let stalled_server = tokio::spawn(async move {
+            let (_stream, _) = upstream.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (app, _, _, _) = direct_test_app_with_upstream(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        );
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer caller-token".parse().unwrap());
+
+        let error = match app
+            .connect_direct_upstream_with_timeout(
+                "a",
+                "/v1/responses",
+                &headers,
+                true,
+                Duration::from_millis(30),
+            )
+            .await
+        {
+            Ok(_) => panic!("stalled upstream handshake unexpectedly connected"),
+            Err(error) => error,
+        };
+        stalled_server.abort();
+
+        assert!(format!("{error:#}").contains("handshake response timed out"));
     }
 
     #[tokio::test]
