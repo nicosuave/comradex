@@ -8,6 +8,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AffinityKind {
     TurnState,
+    ThreadHeader,
     Session,
     ParentThread,
     TurnMetadata,
@@ -27,7 +28,7 @@ impl AffinityKind {
     /// session and cache hints that can survive across conversations.
     pub fn soft_routing_priority(self) -> Option<u8> {
         match self {
-            Self::BodyThread => Some(0),
+            Self::ThreadHeader | Self::BodyThread => Some(0),
             Self::ParentThread | Self::TurnMetadata => Some(1),
             Self::Session => Some(2),
             Self::PromptCache => Some(3),
@@ -39,7 +40,9 @@ impl AffinityKind {
         match self {
             Self::TurnState => "turn-state",
             Self::Session => "session",
-            Self::ParentThread | Self::TurnMetadata | Self::BodyThread => "thread",
+            Self::ThreadHeader | Self::ParentThread | Self::TurnMetadata | Self::BodyThread => {
+                "thread"
+            }
             Self::PreviousResponse => "previous-response",
             Self::PromptCache => "prompt-cache",
             Self::File => "file",
@@ -60,7 +63,8 @@ impl AffinityValue {
 }
 
 pub fn thread_id(headers: &HeaderMap, body: Option<&[u8]>) -> Option<String> {
-    header(headers, "x-codex-parent-thread-id")
+    header(headers, "thread-id")
+        .or_else(|| header(headers, "x-codex-parent-thread-id"))
         .or_else(|| header_json(headers, "x-codex-turn-metadata", "thread_id"))
         .or_else(|| body.and_then(body_thread_id))
 }
@@ -84,12 +88,17 @@ pub fn affinity_values(
         "session-id",
         "x-codex-session-id",
         "x-codex-conversation-id",
-        "thread-id",
     ] {
         if push_header(&mut values, headers, name, AffinityKind::Session) {
             break;
         }
     }
+    push_header(
+        &mut values,
+        headers,
+        "thread-id",
+        AffinityKind::ThreadHeader,
+    );
     push_header(
         &mut values,
         headers,
@@ -200,13 +209,15 @@ mod tests {
             HeaderValue::from_static(r#"{"thread_id":"root"}"#),
         );
         assert_eq!(thread_id(&h, None).as_deref(), Some("root"));
+        h.insert("thread-id", HeaderValue::from_static("task"));
+        assert_eq!(thread_id(&h, None).as_deref(), Some("task"));
         h.insert(
             "x-codex-parent-thread-id",
             HeaderValue::from_static("parent"),
         );
         assert_eq!(
             thread_id(&h, Some(br#"{"client_metadata":{"thread_id":"body"}}"#)).as_deref(),
-            Some("parent")
+            Some("task")
         );
 
         h.insert("x-codex-turn-state", HeaderValue::from_static("opaque"));
@@ -233,6 +244,35 @@ mod tests {
         assert!(
             AffinityKind::Session.soft_routing_priority()
                 < AffinityKind::PromptCache.soft_routing_priority()
+        );
+    }
+
+    #[test]
+    fn keeps_process_session_and_task_thread_as_distinct_affinity_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", HeaderValue::from_static("agent-tree"));
+        headers.insert("thread-id", HeaderValue::from_static("child-task"));
+
+        let values = affinity_values(&headers, None, None, Some("agent-tree"), &[]);
+
+        assert!(values.iter().any(|value| {
+            value.kind == AffinityKind::Session && value.namespaced() == "session:agent-tree"
+        }));
+        assert!(values.iter().any(|value| {
+            value.kind == AffinityKind::ThreadHeader && value.namespaced() == "thread:child-task"
+        }));
+        assert_eq!(
+            values
+                .iter()
+                .filter_map(|value| {
+                    value
+                        .kind
+                        .soft_routing_priority()
+                        .map(|priority| (priority, value.namespaced()))
+                })
+                .min_by_key(|(priority, _)| *priority)
+                .map(|(_, value)| value),
+            Some("thread:child-task".to_owned())
         );
     }
 }

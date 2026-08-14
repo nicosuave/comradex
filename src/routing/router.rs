@@ -31,8 +31,24 @@ struct AccountRuntime {
     needs_login: bool,
     needs_login_retry_at: Option<Instant>,
     quota_until: Option<Instant>,
+    quota_evidence: Option<QuotaEvidence>,
     avoid_until: Option<Instant>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum QuotaWindow {
+    Primary,
+    Secondary,
+    Tertiary,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindowEvidence {
+    used_percent: Option<f32>,
+    reset_at: Option<DateTime<Utc>>,
+}
+
+type QuotaEvidence = HashMap<QuotaWindow, WindowEvidence>;
 
 pub struct Router {
     pub affinity: Arc<AffinityStore>,
@@ -230,9 +246,12 @@ impl Router {
         }
     }
     pub async fn quota_failure(&self, account: &str, headers: &hyper::HeaderMap) {
-        let delay = quota_delay(headers);
+        let now = Utc::now();
+        let delay = quota_delay_at(headers, now);
+        let evidence = quota_evidence(headers, now);
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             a.quota_until = Some(Instant::now() + delay);
+            a.quota_evidence = (!evidence.is_empty()).then_some(evidence);
         }
     }
     pub async fn soft_failure(&self, account: &str) {
@@ -276,6 +295,7 @@ impl Router {
         }
     }
     pub async fn observe_headers(&self, account: &str, headers: &hyper::HeaderMap) {
+        let observed_evidence = quota_evidence(headers, Utc::now());
         let candidates = [
             "x-codex-primary-used-percent",
             "x-ratelimit-primary-used-percent",
@@ -288,8 +308,17 @@ impl Router {
             .filter_map(|name| headers.get(*name)?.to_str().ok()?.parse::<f32>().ok())
             .max_by(|left, right| left.total_cmp(right))
             .map(|v| v.clamp(0.0, 100.0) as u8);
-        if let (Some(usage), Some(a)) = (usage, self.accounts.lock().await.get_mut(account)) {
-            a.usage = Some(usage);
+        if let Some(a) = self.accounts.lock().await.get_mut(account) {
+            if let Some(usage) = usage {
+                a.usage = Some(usage);
+            }
+            if a.quota_evidence
+                .as_ref()
+                .is_some_and(|blocked| quota_reset_confirmed(blocked, &observed_evidence))
+            {
+                a.quota_until = None;
+                a.quota_evidence = None;
+            }
         }
     }
     pub async fn record_count(&self) -> usize {
@@ -297,8 +326,75 @@ impl Router {
     }
 }
 
-fn quota_delay(headers: &hyper::HeaderMap) -> Duration {
-    quota_delay_at(headers, Utc::now())
+fn quota_evidence(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> QuotaEvidence {
+    [
+        (QuotaWindow::Primary, "primary"),
+        (QuotaWindow::Secondary, "secondary"),
+        (QuotaWindow::Tertiary, "tertiary"),
+    ]
+    .into_iter()
+    .filter_map(|(window, name)| {
+        let used_percent = [
+            format!("x-codex-{name}-used-percent"),
+            format!("x-ratelimit-{name}-used-percent"),
+        ]
+        .into_iter()
+        .filter_map(|header| {
+            headers
+                .get(&header)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<f32>().ok())
+        })
+        .max_by(|left, right| left.total_cmp(right));
+        let reset_at = ["x-codex", "x-ratelimit"]
+            .into_iter()
+            .filter_map(|prefix| {
+                let absolute = format!("{prefix}-{name}-reset-at");
+                let relative = format!("{prefix}-{name}-reset-after-seconds");
+                headers
+                    .get(&absolute)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_reset_at)
+                    .or_else(|| {
+                        headers
+                            .get(&relative)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.trim().parse::<i64>().ok())
+                            .and_then(|seconds| {
+                                now.checked_add_signed(chrono::Duration::seconds(seconds))
+                            })
+                    })
+            })
+            .max();
+        (used_percent.is_some() || reset_at.is_some()).then_some((
+            window,
+            WindowEvidence {
+                used_percent,
+                reset_at,
+            },
+        ))
+    })
+    .collect()
+}
+
+fn quota_reset_confirmed(blocked: &QuotaEvidence, observed: &QuotaEvidence) -> bool {
+    blocked.iter().any(|(window, before)| {
+        let Some(after) = observed.get(window) else {
+            return false;
+        };
+        let usage_recovered = match (before.used_percent, after.used_percent) {
+            (Some(before), Some(after)) => after < before,
+            (None, Some(after)) => after < 100.0,
+            _ => false,
+        };
+        let reset_advanced = match (before.reset_at, after.reset_at) {
+            (Some(before), Some(after)) => {
+                after.signed_duration_since(before) > chrono::Duration::seconds(60)
+            }
+            _ => false,
+        };
+        usage_recovered && reset_advanced
+    })
 }
 
 fn quota_delay_at(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> Duration {
@@ -514,6 +610,91 @@ mod tests {
                 .account_id,
             second.account_id
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_new_quota_window_clears_stale_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.pools.get_mut("default").unwrap().members = vec!["a".into()];
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        let mut blocked = HeaderMap::new();
+        blocked.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        blocked.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("2099-01-01T00:00:00Z"),
+        );
+        router.quota_failure("a", &blocked).await;
+        assert!(router.select("default", pool, None, None).await.is_none());
+
+        let mut reset = HeaderMap::new();
+        reset.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("3"),
+        );
+        reset.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("2099-02-01T00:00:00Z"),
+        );
+        router.observe_headers("a", &reset).await;
+
+        assert!(router.select("default", pool, None, None).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn usage_alone_does_not_clear_quota_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.pools.get_mut("default").unwrap().members = vec!["a".into()];
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        let mut blocked = HeaderMap::new();
+        blocked.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        blocked.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("2099-01-01T00:00:00Z"),
+        );
+        router.quota_failure("a", &blocked).await;
+
+        let mut ambiguous = HeaderMap::new();
+        ambiguous.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("3"),
+        );
+        ambiguous.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("2099-01-01T00:00:00Z"),
+        );
+        router.observe_headers("a", &ambiguous).await;
+
+        assert!(router.select("default", pool, None, None).await.is_none());
     }
 
     #[tokio::test]
