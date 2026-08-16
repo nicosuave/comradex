@@ -22,7 +22,7 @@ pub struct Binding {
     pub account_generation: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Snapshot {
     version: u8,
     bindings: HashMap<String, Binding>,
@@ -33,6 +33,7 @@ struct Snapshot {
 #[derive(Debug, Default)]
 struct StoreState {
     snapshot: Snapshot,
+    binding_bytes: usize,
     generation: u64,
     persisted_generation: u64,
 }
@@ -75,10 +76,12 @@ impl AffinityStore {
         if account_epoch_storage_bytes(&snapshot) > ACCOUNT_EPOCH_STORAGE_BUDGET {
             anyhow::bail!("account epoch snapshot exceeds its hard storage budget")
         }
-        dirty |= trim(&mut snapshot, max_entries, max_bytes);
+        let mut binding_bytes = binding_storage_bytes(&snapshot);
+        dirty |= trim(&mut snapshot, &mut binding_bytes, max_entries, max_bytes);
         Ok(Self {
             inner: Mutex::new(StoreState {
                 snapshot,
+                binding_bytes,
                 generation: u64::from(dirty),
                 persisted_generation: 0,
             }),
@@ -117,10 +120,15 @@ impl AffinityStore {
             .bindings
             .get(&key.0)
             .is_some_and(|binding| binding.last_seen != now);
+        let previous_bytes = inner.snapshot.bindings.get(&key.0).map_or(0, json_len);
         let binding = inner.snapshot.bindings.get_mut(&key.0)?;
         binding.last_seen = now;
         let binding = binding.clone();
         if changed {
+            inner.binding_bytes = inner
+                .binding_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(json_len(&binding));
             mark_dirty(&mut inner);
         }
         Some(binding)
@@ -128,15 +136,18 @@ impl AffinityStore {
 
     pub async fn put(&self, key: ThreadKey, account_id: String, generation: u64) {
         let mut inner = self.inner.lock().await;
-        inner.snapshot.bindings.insert(
-            key.0,
-            Binding {
-                account_id,
-                last_seen: now(),
-                account_generation: generation,
-            },
-        );
-        trim(&mut inner.snapshot, self.max_entries, self.max_bytes);
+        let binding = Binding {
+            account_id,
+            last_seen: now(),
+            account_generation: generation,
+        };
+        insert_binding(&mut inner, key.0, binding);
+        let StoreState {
+            snapshot,
+            binding_bytes,
+            ..
+        } = &mut *inner;
+        trim(snapshot, binding_bytes, self.max_entries, self.max_bytes);
         mark_dirty(&mut inner);
     }
 
@@ -153,17 +164,23 @@ impl AffinityStore {
 
     pub async fn remove(&self, key: &ThreadKey) {
         let mut inner = self.inner.lock().await;
-        if inner.snapshot.bindings.remove(&key.0).is_some() {
+        if remove_binding(&mut inner, &key.0).is_some() {
             mark_dirty(&mut inner);
         }
     }
 
     pub async fn invalidate_account(&self, account: &str) {
         let mut inner = self.inner.lock().await;
-        inner
+        let removed = inner
             .snapshot
             .bindings
-            .retain(|_, v| v.account_id != account);
+            .iter()
+            .filter(|(_, binding)| binding.account_id == account)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in removed {
+            remove_binding(&mut inner, &key);
+        }
         let epoch = inner
             .snapshot
             .account_epochs
@@ -178,15 +195,20 @@ impl AffinityStore {
         let inner = self.inner.lock().await;
         (
             inner.snapshot.bindings.len(),
-            serde_json::to_vec(&inner.snapshot).map_or(0, |v| v.len()),
+            snapshot_storage_bytes(&inner.snapshot, inner.binding_bytes),
         )
     }
 
     pub async fn flush(&self) -> Result<()> {
         let _flush = self.flush_lock.lock().await;
-        let Some((generation, bytes)) = ({
+        let Some((generation, snapshot)) = ({
             let mut inner = self.inner.lock().await;
-            if trim(&mut inner.snapshot, self.max_entries, self.max_bytes) {
+            let StoreState {
+                snapshot,
+                binding_bytes,
+                ..
+            } = &mut *inner;
+            if trim(snapshot, binding_bytes, self.max_entries, self.max_bytes) {
                 mark_dirty(&mut inner);
             }
             if account_epoch_storage_bytes(&inner.snapshot) > ACCOUNT_EPOCH_STORAGE_BUDGET {
@@ -195,20 +217,24 @@ impl AffinityStore {
             if inner.persisted_generation >= inner.generation {
                 None
             } else {
-                Some((inner.generation, serde_json::to_vec(&inner.snapshot)?))
+                Some((inner.generation, inner.snapshot.clone()))
             }
         }) else {
             return Ok(());
         };
-        let parent = self
-            .path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        fs::create_dir_all(parent)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        temp.write_all(&bytes)?;
-        temp.as_file().sync_all()?;
-        temp.persist(&self.path).map_err(|error| error.error)?;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let bytes = serde_json::to_vec(&snapshot)?;
+            let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            fs::create_dir_all(parent)?;
+            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+            temp.write_all(&bytes)?;
+            temp.as_file().sync_all()?;
+            temp.persist(&path).map_err(|error| error.error)?;
+            Ok(())
+        })
+        .await
+        .context("join affinity snapshot writer")??;
         let mut inner = self.inner.lock().await;
         inner.persisted_generation = inner.persisted_generation.max(generation);
         Ok(())
@@ -219,9 +245,14 @@ fn mark_dirty(state: &mut StoreState) {
     state.generation = state.generation.saturating_add(1);
 }
 
-fn trim(snapshot: &mut Snapshot, max_entries: usize, max_bytes: usize) -> bool {
+fn trim(
+    snapshot: &mut Snapshot,
+    binding_bytes: &mut usize,
+    max_entries: usize,
+    max_bytes: usize,
+) -> bool {
     let mut changed = false;
-    while snapshot.bindings.len() > max_entries || binding_storage_bytes(snapshot) > max_bytes {
+    while snapshot.bindings.len() > max_entries || *binding_bytes > max_bytes {
         let Some(oldest) = snapshot
             .bindings
             .iter()
@@ -230,7 +261,7 @@ fn trim(snapshot: &mut Snapshot, max_entries: usize, max_bytes: usize) -> bool {
         else {
             break;
         };
-        snapshot.bindings.remove(&oldest);
+        remove_snapshot_binding(snapshot, binding_bytes, &oldest);
         changed = true;
     }
     changed
@@ -238,6 +269,57 @@ fn trim(snapshot: &mut Snapshot, max_entries: usize, max_bytes: usize) -> bool {
 
 fn binding_storage_bytes(snapshot: &Snapshot) -> usize {
     serde_json::to_vec(&snapshot.bindings).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn snapshot_storage_bytes(snapshot: &Snapshot, binding_bytes: usize) -> usize {
+    // Exact serde_json struct overhead around the two serialized maps and the u8 version.
+    42usize
+        .saturating_add(snapshot.version.to_string().len())
+        .saturating_add(binding_bytes)
+        .saturating_add(account_epoch_storage_bytes(snapshot))
+}
+
+fn json_len(value: &impl Serialize) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn binding_entry_bytes(key: &str, binding: &Binding, has_other_entries: bool) -> usize {
+    json_len(&key)
+        .saturating_add(1)
+        .saturating_add(json_len(binding))
+        .saturating_add(usize::from(has_other_entries))
+}
+
+fn insert_binding(state: &mut StoreState, key: String, binding: Binding) {
+    if let Some(previous) = state.snapshot.bindings.insert(key.clone(), binding.clone()) {
+        state.binding_bytes = state
+            .binding_bytes
+            .saturating_sub(json_len(&previous))
+            .saturating_add(json_len(&binding));
+    } else {
+        let has_other_entries = state.snapshot.bindings.len() > 1;
+        state.binding_bytes = state.binding_bytes.saturating_add(binding_entry_bytes(
+            &key,
+            &binding,
+            has_other_entries,
+        ));
+    }
+}
+
+fn remove_binding(state: &mut StoreState, key: &str) -> Option<Binding> {
+    remove_snapshot_binding(&mut state.snapshot, &mut state.binding_bytes, key)
+}
+
+fn remove_snapshot_binding(
+    snapshot: &mut Snapshot,
+    binding_bytes: &mut usize,
+    key: &str,
+) -> Option<Binding> {
+    let had_other_entries = snapshot.bindings.len() > 1;
+    let binding = snapshot.bindings.remove(key)?;
+    *binding_bytes =
+        binding_bytes.saturating_sub(binding_entry_bytes(key, &binding, had_other_entries));
+    Some(binding)
 }
 
 fn account_epoch_storage_bytes(snapshot: &Snapshot) -> usize {
@@ -373,6 +455,35 @@ mod tests {
         store.flush().await.unwrap();
         let inner = store.inner.lock().await;
         assert_eq!(inner.persisted_generation, inner.generation);
+    }
+
+    #[tokio::test]
+    async fn cached_snapshot_size_stays_exact_across_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("affinity.json");
+        let store = AffinityStore::load(
+            path.clone(),
+            "0123456789abcdef0123456789abcdef",
+            10_000,
+            10_000_000,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        for index in 0..2_000 {
+            store
+                .put(
+                    store.key(&format!("thread-{index}")),
+                    format!("account-{}", index % 3),
+                    index % 5,
+                )
+                .await;
+        }
+        store.remove(&store.key("thread-10")).await;
+        store.invalidate_account("account-2").await;
+        store.flush().await.unwrap();
+
+        let (_, cached_bytes) = store.len_and_bytes().await;
+        assert_eq!(cached_bytes, fs::read(path).unwrap().len());
     }
 
     #[tokio::test]
