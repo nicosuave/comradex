@@ -11,7 +11,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 const LABEL: &str = "com.nicosuave.comradex";
-const READY_TIMEOUT: Duration = Duration::from_secs(8);
+// launchd can take several seconds to uncork a freshly installed or upgraded
+// executable. Keep this comfortably above the 8-9 second starts observed on
+// otherwise healthy Apple Silicon hosts.
+const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -82,12 +85,13 @@ pub fn install(config_path: &Path, state_dir: &Path) -> Result<PathBuf> {
                 &domain,
                 &listener_addresses,
                 Some(&service_nonce),
+                None,
                 READY_TIMEOUT,
             )
         },
         |path| {
             bootstrap(&domain, path)?;
-            wait_until_ready(&domain, &[], None, READY_TIMEOUT)
+            wait_until_ready(&domain, &[], None, None, READY_TIMEOUT)
         },
     )?;
     Ok(plist_path)
@@ -268,7 +272,13 @@ pub fn while_daemon_stopped<T>(action: impl FnOnce() -> Result<T>) -> Result<T> 
                 bootstrap(&domain, &plist_path)?;
                 let (readiness_listeners, readiness_nonce) =
                     readiness_probe(&listener_addresses, service_nonce.as_deref());
-                wait_until_ready(&domain, readiness_listeners, readiness_nonce, READY_TIMEOUT)
+                wait_until_ready(
+                    &domain,
+                    readiness_listeners,
+                    readiness_nonce,
+                    None,
+                    READY_TIMEOUT,
+                )
             },
             action,
         )
@@ -330,6 +340,7 @@ pub fn restart() -> Result<()> {
         .collect();
     let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
     let domain = launchctl_domain();
+    let previous_pid = launchctl_print(&domain)?.and_then(|output| launchctl_output_pid(&output));
     if is_loaded(&domain)? {
         kickstart(&domain)?;
     } else {
@@ -337,7 +348,13 @@ pub fn restart() -> Result<()> {
     }
     let (readiness_listeners, readiness_nonce) =
         readiness_probe(&listener_addresses, service_nonce.as_deref());
-    wait_until_ready(&domain, readiness_listeners, readiness_nonce, READY_TIMEOUT)
+    wait_until_ready(
+        &domain,
+        readiness_listeners,
+        readiness_nonce,
+        previous_pid,
+        READY_TIMEOUT,
+    )
 }
 
 fn readiness_probe<'a>(
@@ -437,24 +454,34 @@ fn launchctl_print(domain: &str) -> Result<Option<String>> {
 
 fn launchctl_output_is_running(output: &str) -> bool {
     let running = output.lines().any(|line| line.trim() == "state = running");
-    let has_pid = output.lines().any(|line| {
+    running && launchctl_output_pid(output).is_some()
+}
+
+fn launchctl_output_pid(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
         line.trim()
             .strip_prefix("pid = ")
             .and_then(|pid| pid.parse::<u32>().ok())
-            .is_some_and(|pid| pid > 0)
-    });
-    running && has_pid
+            .filter(|pid| *pid > 0)
+    })
 }
 
 fn wait_until_ready(
     domain: &str,
     listeners: &[SocketAddr],
     service_nonce: Option<&str>,
+    previous_pid: Option<u32>,
     timeout: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        if is_running(domain)? && listeners_ready(listeners, service_nonce) {
+        let launchctl = launchctl_print(domain)?;
+        let running = launchctl
+            .as_deref()
+            .is_some_and(launchctl_output_is_running);
+        let current_pid = launchctl.as_deref().and_then(launchctl_output_pid);
+        let replaced = previous_pid.is_none_or(|previous| current_pid != Some(previous));
+        if running && replaced && listeners_ready(listeners, service_nonce) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -778,6 +805,11 @@ mod tests {
         assert!(!launchctl_output_is_running(
             "state = waiting\n\tpid = 42\n"
         ));
+        assert_eq!(
+            launchctl_output_pid("state = running\n\tpid = 42\n"),
+            Some(42)
+        );
+        assert_eq!(launchctl_output_pid("state = running\n\tpid = 0\n"), None);
     }
 
     #[test]
