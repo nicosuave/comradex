@@ -28,6 +28,7 @@ pub struct ReplayBody {
     prompt_cache_key: Option<String>,
     file_ids: Vec<String>,
     file_ids_overflow: bool,
+    nonportable_state: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,7 @@ struct MetadataScanner {
     prompt_cache_key: Option<String>,
     file_ids: Vec<String>,
     file_ids_overflow: bool,
+    nonportable_state: bool,
     disabled: bool,
 }
 
@@ -87,7 +89,7 @@ impl MetadataScanner {
                     let limit = if self.capture_value.is_some() {
                         512
                     } else {
-                        32
+                        64
                     };
                     if self.token.len() < limit {
                         self.token.push(byte);
@@ -208,6 +210,19 @@ impl MetadataScanner {
                         {
                             container.account_scoped_file =
                                 matches!(value.as_str(), "input_file" | "input_image");
+                            self.nonportable_state |= matches!(
+                                value.as_str(),
+                                "reasoning"
+                                    | "item_reference"
+                                    | "code_interpreter_call"
+                                    | "computer_call"
+                                    | "computer_call_output"
+                                    | "file_search_call"
+                                    | "image_generation_call"
+                                    | "tool_search_call"
+                                    | "tool_search_output"
+                                    | "web_search_call"
+                            );
                         }
                     }
                     KeyKind::ClientMetadata | KeyKind::Other => {}
@@ -216,6 +231,21 @@ impl MetadataScanner {
         } else if self.string_is_key {
             let in_client = self.client_depth == Some(self.containers.len());
             let at_root = self.containers.len() == 1;
+            if !self.token_overflow
+                && (matches!(
+                    self.token.as_slice(),
+                    b"encrypted_content"
+                        | b"operation_id"
+                        | b"codex_operation_id"
+                        | b"internal_chat_message_metadata_passthrough"
+                ) || (at_root
+                    && matches!(
+                        self.token.as_slice(),
+                        b"conversation" | b"prompt" | b"turn_state"
+                    )))
+            {
+                self.nonportable_state = true;
+            }
             self.key = if at_root && !self.token_overflow && self.token == b"client_metadata" {
                 Some(KeyKind::ClientMetadata)
             } else if in_client && !self.token_overflow && self.token == b"thread_id" {
@@ -305,6 +335,7 @@ impl ReplayBody {
             prompt_cache_key: metadata.prompt_cache_key,
             file_ids: metadata.file_ids,
             file_ids_overflow: metadata.file_ids_overflow,
+            nonportable_state: metadata.nonportable_state,
         })
     }
 
@@ -368,6 +399,7 @@ impl ReplayBody {
             prompt_cache_key: metadata.prompt_cache_key,
             file_ids: metadata.file_ids,
             file_ids_overflow: metadata.file_ids_overflow,
+            nonportable_state: metadata.nonportable_state,
         })
     }
 
@@ -389,6 +421,10 @@ impl ReplayBody {
 
     pub fn file_ids_overflow(&self) -> bool {
         self.file_ids_overflow
+    }
+
+    pub fn has_nonportable_state(&self) -> bool {
+        self.nonportable_state
     }
 
     /// Materialize a replay body for protocol translation while releasing its
@@ -491,5 +527,25 @@ mod tests {
             br#"{"input":[{"type":"input_file","file_id":"file_1"},{"file_id":"file_2","type":"input_image"},{"type":"function_call_output","output":{"file_id":"not_an_upload"}}]}"#,
         );
         assert_eq!(scanner.file_ids, ["file_1", "file_2"]);
+    }
+
+    #[test]
+    fn detects_account_bound_response_state_across_chunks() {
+        let mut scanner = MetadataScanner::default();
+        scanner.feed(br#"{"input":[{"type":"reas"#);
+        scanner.feed(br#"oning","encrypted_con"#);
+        scanner.feed(br#"tent":"ciphertext"}]}"#);
+        assert!(scanner.nonportable_state);
+
+        let mut operation = MetadataScanner::default();
+        operation
+            .feed(br#"{"internal_chat_message_metadata_passthrough":{"operation_id":"op_1"}}"#);
+        assert!(operation.nonportable_state);
+
+        let mut portable = MetadataScanner::default();
+        portable.feed(
+            br#"{"input":[{"type":"message","role":"user","content":"hello"}],"reasoning":{"effort":"high"}}"#,
+        );
+        assert!(!portable.nonportable_state);
     }
 }

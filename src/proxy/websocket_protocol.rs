@@ -119,6 +119,7 @@ pub struct CreateAnalysis {
     pub previous_response_id: Option<String>,
     pub input_item_count: usize,
     pub has_file_references: bool,
+    pub has_nonportable_state: bool,
     pub full_resend: FullResendSafety,
 }
 
@@ -860,6 +861,7 @@ pub fn analyze_response_create(
     let input = object.get("input");
     let input_item_count = input.and_then(Value::as_array).map_or(0, Vec::len);
     let has_file_references = input.is_some_and(has_file_reference);
+    let has_nonportable_state = frame_contains_nonportable_state(frame);
     let full_resend = analyze_full_resend(
         previous_response_id.as_deref(),
         input,
@@ -870,6 +872,7 @@ pub fn analyze_response_create(
         previous_response_id,
         input_item_count,
         has_file_references,
+        has_nonportable_state,
         full_resend,
     })
 }
@@ -1137,6 +1140,56 @@ fn has_file_reference(value: &Value) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|value| value.starts_with("sediment://"));
             direct_file || sediment || object.values().any(has_file_reference)
+        }
+        _ => false,
+    }
+}
+
+fn frame_contains_nonportable_state(value: &Value) -> bool {
+    contains_nonportable_state(value, true)
+}
+
+fn contains_nonportable_state(value: &Value, at_root: bool) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_nonportable_state(value, false)),
+        Value::Object(object) => {
+            if object.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "encrypted_content"
+                        | "operation_id"
+                        | "codex_operation_id"
+                        | "internal_chat_message_metadata_passthrough"
+                ) || (at_root && matches!(key.as_str(), "conversation" | "prompt" | "turn_state"))
+            }) {
+                return true;
+            }
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|item_type| {
+                    matches!(
+                        item_type,
+                        "reasoning"
+                            | "item_reference"
+                            | "code_interpreter_call"
+                            | "computer_call"
+                            | "computer_call_output"
+                            | "file_search_call"
+                            | "image_generation_call"
+                            | "tool_search_call"
+                            | "tool_search_output"
+                            | "web_search_call"
+                    )
+                })
+            {
+                return true;
+            }
+            object
+                .values()
+                .any(|value| contains_nonportable_state(value, false))
         }
         _ => false,
     }
@@ -1767,6 +1820,26 @@ mod tests {
             fresh_replay_without_previous_response(&frame, ProtocolLimits::default()).unwrap();
         assert!(fresh.get("previous_response_id").is_none());
         assert_eq!(fresh["input"], frame["input"]);
+    }
+
+    #[test]
+    fn encrypted_reasoning_remains_nonportable_after_anchor_removal() {
+        let frame = json!({
+            "type":"response.create",
+            "previous_response_id":"resp_old",
+            "input":[
+                {"type":"reasoning","id":"rs_owner","encrypted_content":"ciphertext"},
+                {"role":"user","content":"continue"}
+            ]
+        });
+        let analysis = analyze_response_create(&frame, ProtocolLimits::default()).unwrap();
+        assert!(analysis.has_nonportable_state);
+        assert_eq!(analysis.full_resend, FullResendSafety::Eligible);
+
+        let fresh =
+            fresh_replay_without_previous_response(&frame, ProtocolLimits::default()).unwrap();
+        assert!(fresh.get("previous_response_id").is_none());
+        assert!(frame_contains_nonportable_state(&fresh));
     }
 
     #[test]

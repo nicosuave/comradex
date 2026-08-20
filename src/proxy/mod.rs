@@ -62,7 +62,7 @@ use sse::{ProtocolEvent, SseDecoder, responses_json_events};
 use websocket_protocol::{
     DownstreamEndAction, FailureClassification, FailureKind, ProtocolLimits, ProtocolState,
     ReplayContext, ReplayMode, ReplayTarget, Settlement, TerminalKind, TurnEndDisposition, TurnId,
-    UpstreamEnd, classify_failure, fresh_replay_without_previous_response,
+    UpstreamEnd, analyze_response_create, classify_failure, fresh_replay_without_previous_response,
 };
 
 const FILE_CREATE_RESPONSE_LIMIT: usize = 1024 * 1024;
@@ -929,6 +929,8 @@ impl App {
                 .context("no eligible account")?
         };
         let mut selected = first;
+        let nonportable_payload = replay.has_nonportable_state();
+        let mut payload_dispatch_owner: Option<String> = None;
         for attempt in 0..2 {
             let account = selected.account_id.clone();
             let credentials = self
@@ -948,6 +950,9 @@ impl App {
                 .await;
             match result {
                 Ok(response) => {
+                    if nonportable_payload {
+                        payload_dispatch_owner.get_or_insert_with(|| account.clone());
+                    }
                     self.router
                         .observe_headers(&account, response.headers())
                         .await;
@@ -1050,7 +1055,7 @@ impl App {
                             self.router.soft_failure(&account).await;
                         }
                     }
-                    if retry && attempt == 0 && !hard_owner {
+                    if retry && attempt == 0 && !hard_owner && payload_dispatch_owner.is_none() {
                         let alternate = self
                             .router
                             .select(&listener.pool, pool, None, Some(&account))
@@ -2021,7 +2026,7 @@ impl App {
                                 self.config.proxy.max_spool_bytes,
                                 self.stats.clone(),
                             )?;
-                            let route = match self
+                            let mut route = match self
                                 .route_websocket_frame(&listener, &headers, &replay, Some(&account))
                                 .await
                             {
@@ -2067,6 +2072,21 @@ impl App {
                                 upstream_credentials = replacement.credentials;
                             }
                             let value = parsed.expect("response.create was checked");
+                            let analysis = match analyze_response_create(
+                                &value,
+                                ProtocolLimits::default(),
+                            ) {
+                                Ok(analysis) => analysis,
+                                Err(error) => {
+                                    send_direct_error(
+                                        &mut client,
+                                        "invalid_request_error",
+                                        &format!("response.create rejected: {error:?}"),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            };
                             let turn_id = match protocol.admit_response_create(&value) {
                                 Ok(turn_id) => turn_id,
                                 Err(error) => {
@@ -2080,6 +2100,10 @@ impl App {
                                 }
                             };
                             upstream.send(client_message.clone()).await?;
+                            if analysis.has_nonportable_state {
+                                route.hard_owner = true;
+                                route.non_previous_hard_owner = true;
+                            }
                             awaiting_response_created = Some(turn_id);
                             missing_created_deadline = Some(
                                 tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT,
@@ -2445,6 +2469,12 @@ impl App {
                 }
                 ReplayTarget::Unspecified => String::new(),
             };
+        if turn.route.non_previous_hard_owner {
+            if plan.target == ReplayTarget::AlternateAccount {
+                return Ok(None);
+            }
+            replacement_account = account.to_owned();
+        }
         if plan.target == ReplayTarget::AlternateAccount || replacement_account.is_empty() {
             if matches!(failure, FailureKind::Authentication { .. }) {
                 self.router.auth_failure(account).await;
@@ -6833,6 +6863,63 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             *seen.lock().unwrap(),
             ["Bearer token-a".to_owned(), "Bearer token-b".to_owned()]
         );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_nonportable_payload_stays_on_its_first_dispatch_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_seen = seen.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let seen = upstream_seen.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        seen.lock()
+                            .unwrap()
+                            .push(req.headers()[AUTHORIZATION].to_str().unwrap().to_owned());
+                        async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::TOO_MANY_REQUESTS)
+                                    .body(Full::new(Bytes::from_static(b"quota")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task, _) = start_two_account_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        )
+        .await;
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "http://{proxy_addr}/0123456789abcdef/v1/responses"
+            ))
+            .header(AUTHORIZATION, "Bearer inbound-ignored")
+            .body(Full::new(Bytes::from_static(
+                br#"{"model":"gpt-test","input":[{"type":"reasoning","id":"rs_owner","encrypted_content":"ciphertext"}],"stream":true}"#,
+            )))
+            .unwrap();
+
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(*seen.lock().unwrap(), ["Bearer token-a"]);
+
         proxy_task.abort();
         upstream_task.abort();
     }
