@@ -940,11 +940,20 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
         .map(|value| bounded_owned(value, MAX_CLASSIFIED_MESSAGE_BYTES));
     let normalized_message = message.as_deref().unwrap_or_default().to_ascii_lowercase();
     let normalized_code = code.as_deref().unwrap_or_default();
+    let stale_message = normalized_message
+        .strip_suffix('.')
+        .unwrap_or(&normalized_message);
 
     let previous_response_not_found = normalized_code == "previous_response_not_found"
         || (param == "previous_response_id"
             && normalized_message.contains("previous response")
-            && normalized_message.contains("not found"));
+            && normalized_message.contains("not found"))
+        || (normalized_code == "invalid_request_error"
+            && param.is_empty()
+            && matches!(
+                stale_message,
+                "invalid `previous_response_id`" | "invalid previous_response_id"
+            ));
     let quota = [
         "rate_limit_exceeded",
         "usage_limit_reached",
@@ -1715,6 +1724,37 @@ mod tests {
                 requires_reauthentication: false,
             }
         );
+
+        for message in [
+            "Invalid `previous_response_id`.",
+            "Invalid `previous_response_id`",
+            "Invalid previous_response_id.",
+        ] {
+            assert_eq!(
+                classify_failure(&json!({
+                    "type":"error",
+                    "status":400,
+                    "error":{"type":"invalid_request_error","message":message}
+                }))
+                .kind,
+                FailureKind::PreviousResponseNotFound
+            );
+        }
+
+        for message in [
+            "Invalid `other_parameter`.",
+            "Invalid `previous_response_id` because the request is malformed.",
+        ] {
+            assert_eq!(
+                classify_failure(&json!({
+                    "type":"error",
+                    "status":400,
+                    "error":{"type":"invalid_request_error","message":message}
+                }))
+                .kind,
+                FailureKind::Other
+            );
+        }
     }
 
     #[test]
