@@ -82,6 +82,12 @@ impl MetadataScanner {
                     self.token_overflow = true;
                 } else if byte == b'\\' {
                     self.escape = true;
+                    if self.string_is_key || self.capture_value == Some(KeyKind::Type) {
+                        // The upstream JSON parser decodes escaped property names and item types.
+                        // This bounded scanner intentionally does not, so an escaped routing-
+                        // relevant token must fail closed instead of silently looking portable.
+                        self.nonportable_state = true;
+                    }
                     self.token_overflow = true;
                 } else if byte == b'"' {
                     self.finish_string();
@@ -542,9 +548,18 @@ mod tests {
             .feed(br#"{"internal_chat_message_metadata_passthrough":{"operation_id":"op_1"}}"#);
         assert!(operation.nonportable_state);
 
+        for body in [
+            br#"{"input":[{"type":"reas\u006fning"}]}"#.as_slice(),
+            br#"{"input":[{"encrypted_\u0063ontent":"ciphertext"}]}"#.as_slice(),
+        ] {
+            let mut escaped = MetadataScanner::default();
+            escaped.feed(body);
+            assert!(escaped.nonportable_state);
+        }
+
         let mut portable = MetadataScanner::default();
         portable.feed(
-            br#"{"input":[{"type":"message","role":"user","content":"hello"}],"reasoning":{"effort":"high"}}"#,
+            br#"{"input":[{"type":"message","role":"user","content":"hello\nworld"}],"reasoning":{"effort":"high"}}"#,
         );
         assert!(!portable.nonportable_state);
     }
