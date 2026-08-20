@@ -918,17 +918,17 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
     else {
         return FailureClassification::none();
     };
-    let raw_code = error
-        .get("code")
-        .or_else(|| error.get("type"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
+    let nonempty_string = |key| {
+        error
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let raw_code = nonempty_string("code").or_else(|| nonempty_string("type"));
     let code =
         raw_code.map(|value| bounded_owned(value, MAX_CLASSIFIED_CODE_BYTES).to_ascii_lowercase());
-    let error_type = error
-        .get("error_type")
-        .or_else(|| error.get("type"))
-        .and_then(Value::as_str)
+    let error_type = nonempty_string("error_type")
+        .or_else(|| nonempty_string("type"))
         .map(|value| bounded_owned(value, MAX_CLASSIFIED_CODE_BYTES).to_ascii_lowercase())
         .unwrap_or_default();
     let param = error
@@ -943,11 +943,20 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
         .map(|value| bounded_owned(value, MAX_CLASSIFIED_MESSAGE_BYTES));
     let normalized_message = message.as_deref().unwrap_or_default().to_ascii_lowercase();
     let normalized_code = code.as_deref().unwrap_or_default();
+    let stale_message = normalized_message
+        .strip_suffix('.')
+        .unwrap_or(&normalized_message);
 
     let previous_response_not_found = normalized_code == "previous_response_not_found"
         || (param == "previous_response_id"
             && normalized_message.contains("previous response")
-            && normalized_message.contains("not found"));
+            && normalized_message.contains("not found"))
+        || (normalized_code == "invalid_request_error"
+            && param.is_empty()
+            && matches!(
+                stale_message,
+                "invalid `previous_response_id`" | "invalid previous_response_id"
+            ));
     let quota = [
         "rate_limit_exceeded",
         "usage_limit_reached",
@@ -1768,6 +1777,52 @@ mod tests {
                 requires_reauthentication: false,
             }
         );
+
+        for message in [
+            "Invalid `previous_response_id`.",
+            "Invalid `previous_response_id`",
+            "Invalid previous_response_id.",
+        ] {
+            assert_eq!(
+                classify_failure(&json!({
+                    "type":"error",
+                    "status":400,
+                    "error":{"type":"invalid_request_error","message":message}
+                }))
+                .kind,
+                FailureKind::PreviousResponseNotFound
+            );
+        }
+
+        assert_eq!(
+            classify_failure(&json!({
+                "type":"error",
+                "status":400,
+                "error":{
+                    "type":"invalid_request_error",
+                    "code":null,
+                    "param":null,
+                    "message":"Invalid `previous_response_id`."
+                }
+            }))
+            .kind,
+            FailureKind::PreviousResponseNotFound
+        );
+
+        for message in [
+            "Invalid `other_parameter`.",
+            "Invalid `previous_response_id` because the request is malformed.",
+        ] {
+            assert_eq!(
+                classify_failure(&json!({
+                    "type":"error",
+                    "status":400,
+                    "error":{"type":"invalid_request_error","message":message}
+                }))
+                .kind,
+                FailureKind::Other
+            );
+        }
     }
 
     #[test]
