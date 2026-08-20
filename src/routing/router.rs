@@ -107,6 +107,7 @@ impl Router {
         preferred: Option<&str>,
     ) -> Option<Selection> {
         let now = Instant::now();
+        let wall_now = Utc::now();
         let binding = match &thread {
             Some(key) => self.affinity.get(key).await,
             None => None,
@@ -125,6 +126,7 @@ impl Router {
                 runtime.needs_login = false;
                 runtime.needs_login_retry_at = None;
             }
+            reconcile_expired_quota(runtime, now, wall_now);
         }
         if let Some(binding) = binding {
             let eligible = exclude != Some(binding.account_id.as_str())
@@ -221,7 +223,11 @@ impl Router {
 
     pub async fn select_exact(&self, pool: &PoolConfig, account: &str) -> Option<Selection> {
         let now = Instant::now();
-        let accounts = self.accounts.lock().await;
+        let wall_now = Utc::now();
+        let mut accounts = self.accounts.lock().await;
+        if let Some(runtime) = accounts.get_mut(account) {
+            reconcile_expired_quota(runtime, now, wall_now);
+        }
         let eligible = pool.members.iter().any(|v| v == account)
             && accounts.get(account).is_some_and(|a| {
                 !a.needs_login
@@ -324,6 +330,27 @@ impl Router {
     pub async fn record_count(&self) -> usize {
         self.accounts.lock().await.len()
     }
+}
+
+fn reconcile_expired_quota(runtime: &mut AccountRuntime, now: Instant, wall_now: DateTime<Utc>) {
+    if runtime
+        .quota_until
+        .is_some_and(|quota_until| quota_until > now)
+        && runtime
+            .quota_evidence
+            .as_ref()
+            .is_some_and(|evidence| quota_reset_elapsed(evidence, wall_now))
+    {
+        runtime.quota_until = None;
+        runtime.quota_evidence = None;
+    }
+}
+
+fn quota_reset_elapsed(evidence: &QuotaEvidence, now: DateTime<Utc>) -> bool {
+    !evidence.is_empty()
+        && evidence
+            .values()
+            .all(|window| window.reset_at.is_some_and(|reset_at| reset_at <= now))
 }
 
 fn quota_evidence(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> QuotaEvidence {
@@ -653,6 +680,50 @@ mod tests {
         router.observe_headers("a", &reset).await;
 
         assert!(router.select("default", pool, None, None).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn elapsed_absolute_reset_clears_stale_quota_cooldown_before_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.pools.get_mut("default").unwrap().members = vec!["a".into()];
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        let mut reset = HeaderMap::new();
+        reset.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        reset.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("2020-01-01T00:00:00Z"),
+        );
+        let evidence = quota_evidence(&reset, Utc::now());
+        {
+            let mut accounts = router.accounts.lock().await;
+            let account = accounts.get_mut("a").unwrap();
+            account.quota_until = Some(Instant::now() + Duration::from_secs(3600));
+            account.quota_evidence = Some(evidence);
+        }
+
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
     }
 
     #[tokio::test]
