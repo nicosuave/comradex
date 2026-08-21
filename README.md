@@ -91,10 +91,14 @@ Use these commands to inspect or remove accounts:
 ```sh
 comradex account list
 comradex account login personal_2
+comradex account prefer personal_2
+comradex account prefer --clear
 comradex account remove personal_2
 ```
 
 `account list` shows each account's login state. `account remove` removes it from the configuration and every pool but keeps its credential directory unless `--purge` is passed.
+
+`account prefer <name>` immediately makes that account the first choice for new, unbound work in the default pool. Use `--pool <name>` for another pool and `--clear` to restore automatic selection. The daemon applies the change through an authenticated, user-only Unix socket and persists it in `comradex.toml`; it does not restart, interrupt active turns, or move sticky conversations. An unavailable, quota-limited, or over-threshold preferred account is skipped by the normal quota-aware fallback. If the daemon is not running, the preference is saved and takes effect on its next start.
 
 The equivalent manual configuration is:
 
@@ -242,4 +246,4 @@ comradex status
 comradex status --json
 ```
 
-`status` summarizes the configuration, LaunchAgent, Codex wiring, accounts, and live traffic. `--json` prints the bounded local `stats.json` snapshot written by the daemon. When running from source, use `cargo run -- status`. There is deliberately no credentialed admin HTTP endpoint.
+`status` summarizes the configuration, LaunchAgent, Codex wiring, accounts, per-pool preferred and active accounts, and live traffic. While the daemon is running, routing status comes directly from its authenticated local control socket; the bounded `stats.json` snapshot is the fallback and is also updated periodically. `--json` prints that snapshot with the latest live routing state. When running from source, use `cargo run -- status`. There is deliberately no credentialed admin HTTP endpoint.

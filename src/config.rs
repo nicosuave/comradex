@@ -146,6 +146,10 @@ pub struct ListenerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
     pub members: Vec<String>,
+    /// Account preferred for fresh, unbound work. Sticky conversations and hard ownership
+    /// always take precedence, and an unhealthy or quota-limited account is skipped.
+    #[serde(default)]
+    pub preferred: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +307,15 @@ impl Config {
         if self.listeners.is_empty() {
             bail!("at least one listener is required")
         }
+        for (pool_name, pool) in &self.pools {
+            if let Some(preferred) = &pool.preferred
+                && !pool.members.contains(preferred)
+            {
+                bail!(
+                    "pool {pool_name} prefers account {preferred}, which is not one of its members"
+                )
+            }
+        }
         for (name, listener) in &self.listeners {
             let pool = self.pools.get(&listener.pool).with_context(|| {
                 format!("listener {name} references missing pool {}", listener.pool)
@@ -322,6 +335,25 @@ impl Config {
     pub fn snapshot_interval(&self) -> Duration {
         Duration::from_secs(self.proxy.snapshot_interval_seconds.max(1))
     }
+}
+
+/// Atomically replace a configuration file only after the full loader accepts the candidate.
+/// The temporary file lives beside the target so relative paths resolve from the same directory.
+pub fn write_validated(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .suffix(".toml")
+        .tempfile_in(parent)?;
+    temp.write_all(text.as_bytes())?;
+    temp.as_file().sync_all()?;
+    Config::load(temp.path()).context("validate updated configuration")?;
+    if let Ok(metadata) = fs::metadata(path) {
+        temp.as_file().set_permissions(metadata.permissions())?;
+    }
+    temp.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -414,6 +446,19 @@ kind = "inbound"
                 .unwrap()
                 .join("accounts/managed")
         );
+    }
+
+    #[test]
+    fn preferred_account_must_be_a_pool_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        let text = config_text(None).replace(
+            "members = [\"caller\"]",
+            "members = [\"caller\"]\npreferred = \"missing\"",
+        );
+        fs::write(&path, text).unwrap();
+        let error = Config::load(&path).unwrap_err();
+        assert!(error.to_string().contains("not one of its members"));
     }
 
     #[test]

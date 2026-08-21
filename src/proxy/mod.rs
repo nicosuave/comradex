@@ -4427,6 +4427,7 @@ mod tests {
                     "default".into(),
                     PoolConfig {
                         members: vec!["managed".into()],
+                        preferred: None,
                     },
                 )]),
                 accounts: BTreeMap::from([(
@@ -4492,6 +4493,7 @@ mod tests {
                 "default".into(),
                 PoolConfig {
                     members: vec!["a".into(), "b".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([
@@ -4538,6 +4540,7 @@ mod tests {
                 "default".into(),
                 PoolConfig {
                     members: vec!["caller".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([("caller".into(), AccountConfig::Inbound)]),
@@ -5295,6 +5298,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                 "default".into(),
                 PoolConfig {
                     members: vec!["a".into(), "b".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([
@@ -5460,6 +5464,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                     "default",
                     &PoolConfig {
                         members: vec!["caller".into()],
+                        preferred: None,
                     },
                     None,
                     None,
@@ -5555,6 +5560,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                 "default".into(),
                 PoolConfig {
                     members: vec!["a".into(), "b".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([
@@ -5650,6 +5656,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                 "default".into(),
                 PoolConfig {
                     members: vec!["caller".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([("caller".into(), AccountConfig::Inbound)]),
@@ -5713,6 +5720,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                 "default".into(),
                 PoolConfig {
                     members: vec!["a".into(), "b".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([
@@ -5768,6 +5776,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                 "default".into(),
                 PoolConfig {
                     members: vec!["managed".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([(

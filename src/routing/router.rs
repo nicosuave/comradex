@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -8,6 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::error;
 
@@ -21,6 +22,14 @@ pub struct Selection {
     pub account_id: String,
     pub bound: bool,
     pub thread: Option<ThreadKey>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingSnapshot {
+    #[serde(default)]
+    pub preferred_accounts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub active_accounts: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +62,7 @@ type QuotaEvidence = HashMap<QuotaWindow, WindowEvidence>;
 pub struct Router {
     pub affinity: Arc<AffinityStore>,
     accounts: Mutex<HashMap<String, AccountRuntime>>,
+    preferred: Mutex<HashMap<String, String>>,
     active: Mutex<HashMap<String, String>>,
     sequence: AtomicU64,
     switch_at: u8,
@@ -67,6 +77,18 @@ impl Router {
                     .accounts
                     .keys()
                     .map(|k| (k.clone(), AccountRuntime::default()))
+                    .collect(),
+            ),
+            preferred: Mutex::new(
+                config
+                    .pools
+                    .iter()
+                    .filter_map(|(pool, config)| {
+                        config
+                            .preferred
+                            .as_ref()
+                            .map(|account| (pool.clone(), account.clone()))
+                    })
                     .collect(),
             ),
             active: Mutex::new(HashMap::new()),
@@ -144,6 +166,7 @@ impl Router {
                 });
             }
         }
+        let configured_preferred = self.preferred.lock().await.get(pool_name).cloned();
         let active_id = self.active.lock().await.get(pool_name).cloned();
         let eligible = |id: &str| {
             exclude != Some(id)
@@ -159,13 +182,17 @@ impl Router {
                 .and_then(|account| account.usage)
                 .is_none_or(|usage| usage < self.switch_at)
         };
-        let selected = preferred
-            .filter(|id| {
-                pool.members.iter().any(|member| member == *id)
-                    && eligible(id)
-                    && below_switch_at(id)
+        let selected = configured_preferred
+            .filter(|id| pool.members.contains(id) && eligible(id) && below_switch_at(id))
+            .or_else(|| {
+                preferred
+                    .filter(|id| {
+                        pool.members.iter().any(|member| member == *id)
+                            && eligible(id)
+                            && below_switch_at(id)
+                    })
+                    .map(str::to_owned)
             })
-            .map(str::to_owned)
             .or_else(|| {
                 active_id
                     .filter(|id| pool.members.contains(id) && eligible(id) && below_switch_at(id))
@@ -204,6 +231,39 @@ impl Router {
             bound: false,
             thread,
         })
+    }
+
+    /// Change the preferred account used for new work without disturbing bindings or in-flight
+    /// requests. The caller validates pool membership before invoking this method.
+    pub async fn set_preferred(&self, pool: &str, account: Option<String>) {
+        let mut preferred = self.preferred.lock().await;
+        match account {
+            Some(account) => {
+                preferred.insert(pool.to_owned(), account);
+            }
+            None => {
+                preferred.remove(pool);
+            }
+        }
+    }
+
+    pub async fn routing_snapshot(&self) -> RoutingSnapshot {
+        RoutingSnapshot {
+            preferred_accounts: self
+                .preferred
+                .lock()
+                .await
+                .iter()
+                .map(|(pool, account)| (pool.clone(), account.clone()))
+                .collect(),
+            active_accounts: self
+                .active
+                .lock()
+                .await
+                .iter()
+                .map(|(pool, account)| (pool.clone(), account.clone()))
+                .collect(),
+        }
     }
 
     pub async fn begin(&self, account: &str) {
@@ -520,6 +580,7 @@ mod tests {
                 "default".into(),
                 PoolConfig {
                     members: vec!["a".into(), "b".into()],
+                    preferred: None,
                 },
             )]),
             accounts: BTreeMap::from([
@@ -568,6 +629,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fresh.account_id, "b");
+    }
+
+    #[tokio::test]
+    async fn live_preference_changes_fresh_work_without_rebinding_existing_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity.clone());
+        let pool = &cfg.pools["default"];
+        let existing_key = affinity.key("existing");
+        let existing = router
+            .select("default", pool, Some(existing_key.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(existing.account_id, "a");
+
+        router.set_preferred("default", Some("b".to_owned())).await;
+
+        let bound = router
+            .select("default", pool, Some(existing_key), None)
+            .await
+            .unwrap();
+        assert_eq!(bound.account_id, "a");
+        assert!(bound.bound);
+        let fresh = router
+            .select("default", pool, Some(affinity.key("fresh")), None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.account_id, "b");
+        assert!(!fresh.bound);
+        assert_eq!(
+            router.routing_snapshot().await,
+            RoutingSnapshot {
+                preferred_accounts: BTreeMap::from([("default".into(), "b".into())]),
+                active_accounts: BTreeMap::from([("default".into(), "b".into())]),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_preference_wins_over_reused_transport_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        router.set_preferred("default", Some("b".to_owned())).await;
+
+        let selected = router.select_preferred("default", pool, "a").await.unwrap();
+        assert_eq!(selected.account_id, "b");
     }
 
     #[tokio::test]
