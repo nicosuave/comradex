@@ -10,7 +10,7 @@ use std::{
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::routing::Router;
+use crate::routing::{Router, RoutingSnapshot};
 
 #[derive(Default)]
 pub struct Stats {
@@ -36,6 +36,8 @@ pub struct StatsSnapshot {
     pub active_spool_bytes: usize,
     pub quota_records: usize,
     pub health_records: usize,
+    #[serde(default)]
+    pub routing: RoutingSnapshot,
     pub refresh_inflight: usize,
     #[serde(default)]
     pub refresh_scheduler_ticks: u64,
@@ -57,6 +59,7 @@ impl Stats {
     pub async fn write(&self, path: PathBuf, router: &Arc<Router>) -> Result<()> {
         let (affinity_entries, affinity_bytes) = router.affinity.len_and_bytes().await;
         let records = router.record_count().await;
+        let routing = router.routing_snapshot().await;
         let snapshot = StatsSnapshot {
             inflight_http: self.inflight_http.load(Ordering::Relaxed),
             open_upgrades: self.open_upgrades.load(Ordering::Relaxed),
@@ -65,6 +68,7 @@ impl Stats {
             active_spool_bytes: self.active_spool_bytes.load(Ordering::Relaxed),
             quota_records: records,
             health_records: records,
+            routing,
             refresh_inflight: self.refresh_inflight.load(Ordering::Relaxed),
             refresh_scheduler_ticks: self.refresh_scheduler_ticks.load(Ordering::Relaxed),
             refresh_accounts_checked: self.refresh_accounts_checked.load(Ordering::Relaxed),

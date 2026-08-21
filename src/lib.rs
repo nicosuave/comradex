@@ -3,6 +3,7 @@ pub mod auth;
 pub mod auth_lock;
 pub mod codex_process;
 pub mod config;
+pub mod control;
 pub mod install;
 pub mod proxy;
 pub mod routing;

@@ -13,7 +13,7 @@ use comradex::{
     auth_lock::HomeAuthLock,
     codex_process::{self, ProcessControl, SystemProcesses},
     config::Config,
-    install,
+    control, install,
     proxy::App,
     routing::{AffinityStore, Router},
     service,
@@ -89,6 +89,17 @@ enum AccountCommand {
     },
     /// List configured accounts and their sign-in state
     List,
+    /// Prefer an account for new work without interrupting active turns
+    #[command(alias = "switch")]
+    Prefer {
+        /// Account to prefer; omit when using --clear
+        name: Option<String>,
+        #[arg(long, default_value = "default")]
+        pool: String,
+        /// Return the pool to automatic account selection
+        #[arg(long, conflicts_with = "name", required_unless_present = "name")]
+        clear: bool,
+    },
     /// Sign an account in through the official Codex device flow
     Login { name: String },
     /// Remove an account from the configuration and all pools
@@ -242,6 +253,8 @@ kind = "inbound"
 }
 
 async fn serve(path: &Path) -> Result<()> {
+    let config_path =
+        fs::canonicalize(path).with_context(|| format!("resolve config {}", path.display()))?;
     let config = Arc::new(load_config(path)?);
     let state = state_dir(&config);
     fs::create_dir_all(&state)?;
@@ -254,6 +267,9 @@ async fn serve(path: &Path) -> Result<()> {
     )?);
     let router = Arc::new(Router::new(&config, affinity));
     let stats = Arc::new(Stats::default());
+    let control_server =
+        control::ControlServer::bind(&state, config_path, config.clone(), router.clone())?;
+    let mut control_task = tokio::spawn(control_server.run());
     let app = App::new(config.clone(), router.clone(), stats.clone())?;
     let mut tasks = tokio::task::JoinSet::new();
     for (name, listener) in config.listeners.clone() {
@@ -310,11 +326,22 @@ async fn serve(path: &Path) -> Result<()> {
                 Some(Err(error)) => error.into(),
                 None => anyhow::anyhow!("all listeners exited unexpectedly"),
             })
+        },
+        control = &mut control_task => {
+            Some(match control {
+                Ok(Ok(())) => anyhow::anyhow!("control server exited unexpectedly"),
+                Ok(Err(error)) => error.context("control server failed"),
+                Err(error) => error.into(),
+            })
         }
     };
     info!("shutting down");
     background.abort();
     let _ = background.await;
+    if !control_task.is_finished() {
+        control_task.abort();
+        let _ = control_task.await;
+    }
     refresh_background.abort();
     let _ = refresh_background.await;
     tasks.abort_all();
@@ -391,9 +418,13 @@ fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) 
 fn status(config_path: &Path, json: bool) -> Result<()> {
     let config = load_config(config_path)?;
     let state = state_dir(&config);
-    let snapshot = fs::read(state.join("stats.json"))
+    let mut snapshot = fs::read(state.join("stats.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<comradex::state::StatsSnapshot>(&bytes).ok());
+    let live_routing = control::routing_status(&state, &config.proxy.installation_secret).ok();
+    if let (Some(snapshot), Some(routing)) = (&mut snapshot, &live_routing) {
+        snapshot.routing = routing.clone();
+    }
     if json {
         let snapshot = snapshot.context("daemon has not written stats yet")?;
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -439,6 +470,22 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
             format!("pool {}", pools.join(", "))
         };
         println!("  {name:width$}  {:24}  {pools}", account_state(account));
+    }
+
+    let routing = live_routing
+        .as_ref()
+        .or_else(|| snapshot.as_ref().map(|snapshot| &snapshot.routing));
+    println!("\npools");
+    let width = config.pools.keys().map(String::len).max().unwrap_or(0);
+    for (name, pool) in &config.pools {
+        let preferred = routing
+            .and_then(|routing| routing.preferred_accounts.get(name))
+            .or(pool.preferred.as_ref())
+            .map_or("automatic", String::as_str);
+        let active = routing
+            .and_then(|routing| routing.active_accounts.get(name))
+            .map_or("no fresh work yet", String::as_str);
+        println!("  {name:width$}  preferred {preferred}, active {active}");
     }
 
     println!("\ntraffic");
@@ -523,6 +570,59 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             Ok(())
         }
         AccountCommand::Login { name } => login(config_path, &name),
+        AccountCommand::Prefer { name, pool, clear } => {
+            debug_assert!(name.is_some() || clear);
+            let config = load_config(config_path)?;
+            let pool_config = config
+                .pools
+                .get(&pool)
+                .with_context(|| format!("unknown pool {pool}"))?;
+            if let Some(name) = &name
+                && !pool_config.members.contains(name)
+            {
+                bail!("account {name} is not a member of pool {pool}")
+            }
+            match control::set_preferred(
+                &state_dir(&config),
+                &config.proxy.installation_secret,
+                &pool,
+                name.as_deref(),
+            ) {
+                Ok(routing) => {
+                    match name {
+                        Some(name) => println!(
+                            "pool {pool} now prefers {name} for new work; active turns were not interrupted"
+                        ),
+                        None => println!(
+                            "pool {pool} now selects accounts automatically; active turns were not interrupted"
+                        ),
+                    }
+                    if let Some(active) = routing.active_accounts.get(&pool) {
+                        println!("active account for fresh work: {active}");
+                    }
+                    Ok(())
+                }
+                Err(_control_error) if !control::socket_path(&state_dir(&config)).exists() => {
+                    let text = fs::read_to_string(config_path)
+                        .with_context(|| format!("read {}", config_path.display()))?;
+                    let updated =
+                        comradex::accounts::set_preferred_account(&text, &pool, name.as_deref())?;
+                    write_config_validated(config_path, &updated)?;
+                    match name {
+                        Some(name) => println!(
+                            "saved {name} as the preferred account for pool {pool}; it will apply when the daemon starts"
+                        ),
+                        None => println!(
+                            "saved automatic selection for pool {pool}; it will apply when the daemon starts"
+                        ),
+                    }
+                    Ok(())
+                }
+                Err(control_error) => Err(control_error).context(
+                    "live routing request did not complete; check `comradex status` before retrying",
+                ),
+            }
+        }
         AccountCommand::List => {
             let config = load_config(config_path)?;
             let width = config.accounts.keys().map(String::len).max().unwrap_or(0);
@@ -580,18 +680,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
 /// candidate is written next to the config so relative paths resolve
 /// identically, validated with Config::load, then swapped into place.
 fn write_config_validated(config_path: &Path, text: &str) -> Result<()> {
-    let parent = config_path.parent().unwrap_or(Path::new("."));
-    let mut temp = tempfile::Builder::new()
-        .suffix(".toml")
-        .tempfile_in(parent)?;
-    std::io::Write::write_all(&mut temp, text.as_bytes())?;
-    temp.as_file().sync_all()?;
-    Config::load(temp.path()).context("validate updated configuration")?;
-    if let Ok(metadata) = fs::metadata(config_path) {
-        temp.as_file().set_permissions(metadata.permissions())?;
-    }
-    temp.persist(config_path).map_err(|error| error.error)?;
-    Ok(())
+    comradex::config::write_validated(config_path, text)
 }
 
 /// Bounce the daemon after a config change when it is installed as a service;
@@ -761,5 +850,36 @@ mod tests {
         .unwrap();
         assert_eq!(path, PathBuf::from("/Users/example/.codex/config.toml"));
         assert!(default_codex_config_path(None, None).is_err());
+    }
+
+    #[test]
+    fn account_prefer_cli_accepts_an_account_or_clear_but_not_both() {
+        let cli =
+            Cli::try_parse_from(["comradex", "account", "prefer", "work", "--pool", "p"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Account {
+                command: AccountCommand::Prefer {
+                    name: Some(name),
+                    pool,
+                    clear: false,
+                },
+            } if name == "work" && pool == "p"
+        ));
+
+        let cli = Cli::try_parse_from(["comradex", "account", "prefer", "--clear"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Account {
+                command: AccountCommand::Prefer {
+                    name: None,
+                    pool,
+                    clear: true,
+                },
+            } if pool == "default"
+        ));
+
+        assert!(Cli::try_parse_from(["comradex", "account", "prefer", "work", "--clear"]).is_err());
+        assert!(Cli::try_parse_from(["comradex", "account", "prefer"]).is_err());
     }
 }

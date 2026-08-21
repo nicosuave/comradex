@@ -4,4 +4,4 @@ pub mod metadata;
 pub mod router;
 
 pub use affinity::{AffinityStore, ThreadKey};
-pub use router::{Router, Selection};
+pub use router::{Router, RoutingSnapshot, Selection};

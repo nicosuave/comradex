@@ -71,9 +71,49 @@ pub fn remove_account(text: &str, name: &str) -> Result<(String, Option<String>)
                 members.retain(|member| member.as_str() != Some(name));
                 members.fmt();
             }
+            if pool.get("preferred").and_then(Item::as_str) == Some(name) {
+                pool.as_table_like_mut()
+                    .expect("pool was already accessed as a table")
+                    .remove("preferred");
+            }
         }
     }
     Ok((doc.to_string(), home))
+}
+
+/// Set or clear the preferred account for a pool while preserving surrounding formatting.
+pub fn set_preferred_account(text: &str, pool_name: &str, account: Option<&str>) -> Result<String> {
+    if let Some(account) = account {
+        validate_name(account)?;
+    }
+    let mut doc: DocumentMut = text.parse().context("parse comradex.toml")?;
+    let pool = doc
+        .get_mut("pools")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|pools| pools.get_mut(pool_name))
+        .with_context(|| format!("unknown pool {pool_name}"))?
+        .as_table_like_mut()
+        .with_context(|| format!("pool {pool_name} is not a table"))?;
+    match account {
+        Some(account) => {
+            let is_member = pool
+                .get("members")
+                .and_then(Item::as_array)
+                .is_some_and(|members| {
+                    members
+                        .iter()
+                        .any(|member| member.as_str() == Some(account))
+                });
+            if !is_member {
+                bail!("account {account} is not a member of pool {pool_name}")
+            }
+            pool.insert("preferred", value(account));
+        }
+        None => {
+            pool.remove("preferred");
+        }
+    }
+    Ok(doc.to_string())
 }
 
 #[cfg(test)]
@@ -140,5 +180,24 @@ kind = "inbound"
                 .to_string()
                 .contains("unknown account")
         );
+    }
+
+    #[test]
+    fn preferred_account_is_set_cleared_and_removed_with_the_account() {
+        let added = add_account(TEMPLATE, "work2", "default").unwrap();
+        let preferred = set_preferred_account(&added, "default", Some("work2")).unwrap();
+        assert!(preferred.contains("preferred = \"work2\""));
+
+        let cleared = set_preferred_account(&preferred, "default", None).unwrap();
+        assert!(!cleared.contains("preferred"));
+
+        let (removed, _) = remove_account(&preferred, "work2").unwrap();
+        assert!(!removed.contains("preferred"));
+    }
+
+    #[test]
+    fn preferred_account_must_belong_to_the_pool() {
+        let error = set_preferred_account(TEMPLATE, "default", Some("missing")).unwrap_err();
+        assert!(error.to_string().contains("not a member"));
     }
 }
