@@ -2,9 +2,7 @@
 
 > Workers of all accounts, unite.
 
-Comradex is a small Rust relay that gives the native Codex App/CLI a sticky, quota-aware collective of ChatGPT accounts without rewriting Codex sessions or rollouts. Raw mode preserves Responses WebSocket bytes; the two frame-aware modes intentionally inspect and, where required for safe recovery, reframe Responses traffic.
-
-The current implementation intentionally supports only native Codex traffic. It has no provider translation, request history, GUI, telemetry, or conversation cache.
+Comradex is a small Rust relay that gives the native Codex App/CLI a sticky, quota-aware collective of ChatGPT accounts.
 
 ## Quick start
 
