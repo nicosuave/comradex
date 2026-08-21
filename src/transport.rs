@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use hyper_rustls::HttpsConnector as RustlsHttpsConnector;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
 
 /// Builds the same transport-default TLS shape used by Codex's reqwest 0.12 client.
 ///
@@ -39,10 +39,22 @@ fn codex_websocket_tls_config() -> Result<ClientConfig> {
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .context("select Codex Rustls protocol versions")?;
-    let mut roots = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
-    roots.add_parsable_certificates(native.certs);
+    let roots = root_store_from_native_certs(native.certs, native.errors.len())?;
     Ok(builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+fn root_store_from_native_certs(
+    certs: Vec<CertificateDer<'static>>,
+    load_error_count: usize,
+) -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    let (valid_count, invalid_count) = roots.add_parsable_certificates(certs);
+    ensure!(
+        valid_count > 0,
+        "load platform TLS roots: no usable certificates ({load_error_count} load errors, {invalid_count} parse errors)"
+    );
+    Ok(roots)
 }
 
 #[cfg(test)]
@@ -56,7 +68,50 @@ mod tests {
     use sha2::Sha256;
     use tokio::{io::AsyncReadExt, net::TcpListener};
 
-    use super::{codex_http_connector, codex_websocket_connector};
+    use rustls::pki_types::CertificateDer;
+
+    use super::{codex_http_connector, codex_websocket_connector, root_store_from_native_certs};
+
+    #[test]
+    fn websocket_root_store_rejects_no_native_certificates() {
+        let error = root_store_from_native_certs(Vec::new(), 2).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "load platform TLS roots: no usable certificates (2 load errors, 0 parse errors)"
+        );
+    }
+
+    #[test]
+    fn websocket_root_store_rejects_only_unparsable_certificates() {
+        let error = root_store_from_native_certs(
+            vec![CertificateDer::from(vec![0xde, 0xad, 0xbe, 0xef])],
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "load platform TLS roots: no usable certificates (0 load errors, 1 parse errors)"
+        );
+    }
+
+    #[test]
+    fn websocket_root_store_tolerates_bad_certificates_when_a_root_is_usable() {
+        let native = rustls_native_certs::load_native_certs();
+        let valid = native
+            .certs
+            .into_iter()
+            .find(|cert| {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(cert.clone()).is_ok()
+            })
+            .expect("test platform should provide at least one usable TLS root");
+        let roots = root_store_from_native_certs(
+            vec![CertificateDer::from(vec![0xde, 0xad, 0xbe, 0xef]), valid],
+            1,
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 1);
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct ClientHelloProfile {
