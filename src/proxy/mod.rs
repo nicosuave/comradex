@@ -30,7 +30,8 @@ use hyper::{
     },
     service::service_fn,
 };
-use hyper_rustls::HttpsConnector;
+use hyper_rustls::HttpsConnector as RustlsHttpsConnector;
+use hyper_tls::HttpsConnector as NativeHttpsConnector;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
@@ -56,6 +57,7 @@ use crate::{
         metadata,
     },
     state::Stats,
+    transport::{codex_http_connector, codex_websocket_connector},
 };
 use replay_body::{ProxyBody, ReplayBody, bytes_body, empty_body, incoming_body, json_body};
 use sse::{ProtocolEvent, SseDecoder, responses_json_events};
@@ -85,7 +87,8 @@ fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
     )
 }
 
-type HttpClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
+type HttpClient = Client<NativeHttpsConnector<HttpConnector>, ProxyBody>;
+type UpgradeHttpClient = Client<RustlsHttpsConnector<HttpConnector>, ProxyBody>;
 type UpgradedWebSocket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 struct WebSocketFrameRoute {
@@ -453,7 +456,7 @@ pub struct App {
     config: Arc<Config>,
     router: Arc<Router>,
     client: HttpClient,
-    upgrade_client: HttpClient,
+    upgrade_client: UpgradeHttpClient,
     stats: Arc<Stats>,
     http_slots: Arc<Semaphore>,
     upgrade_slots: Arc<Semaphore>,
@@ -486,17 +489,8 @@ impl App {
     }
 
     fn build(config: Arc<Config>, router: Arc<Router>, stats: Arc<Stats>) -> Result<Arc<Self>> {
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        let upgrade_https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
+        let https = codex_http_connector()?;
+        let upgrade_https = codex_websocket_connector()?;
         let client = Client::builder(TokioExecutor::new()).build(https);
         let upgrade_client = Client::builder(TokioExecutor::new()).build(upgrade_https);
         let state_dir = config.proxy.state_dir.clone().unwrap_or_else(|| ".".into());
