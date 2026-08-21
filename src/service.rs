@@ -285,6 +285,7 @@ pub fn while_daemon_stopped<T>(action: impl FnOnce() -> Result<T>) -> Result<T> 
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn maintenance_transaction<T>(
     was_loaded: bool,
     stop: impl FnOnce() -> Result<()>,
