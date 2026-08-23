@@ -8,6 +8,57 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertTrue(StatusIcon.image.isTemplate)
     }
 
+    @MainActor
+    func testNativeMenuRendersAccountsAndActionableCommands() throws {
+        let data = Data(#"""
+        {
+          "ok": true,
+          "status": {
+            "daemon_running": true,
+            "accounts": [
+              {"name":"app","kind":"inbound","signed_in":true,"auth_state":"inbound","pools":["default"]},
+              {"name":"sq","kind":"codex_home","signed_in":true,"auth_state":"signed_in","pools":["default"]}
+            ],
+            "pools": [{"name":"default","members":["app","sq"],"preferred":"app","active":"app"}]
+          }
+        }
+        """#.utf8)
+        let snapshot = try ControlSocketClient.decode(
+            UIStatusSnapshot.self,
+            from: data,
+            preferredKeys: ["status"]
+        )
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: snapshot)
+        let controller = MenuBarController(store: store)
+
+        controller.rebuildMenu()
+
+        let items = controller.renderedMenu.items
+        XCTAssertFalse(controller.renderedMenu.autoenablesItems)
+        XCTAssertTrue(items.contains { $0.title == "default · Active: app" })
+        XCTAssertEqual(items.first(where: { $0.title == "app" })?.state, .on)
+        XCTAssertNotNil(items.first(where: { $0.title == "sq" })?.action)
+        XCTAssertEqual(items.first(where: { $0.title == "Refresh" })?.keyEquivalent, "r")
+        XCTAssertNotNil(items.first(where: { $0.title == "Refresh" })?.action)
+        XCTAssertEqual(items.first(where: { $0.title == "Quit Comradex" })?.keyEquivalent, "q")
+        XCTAssertNotNil(items.first(where: { $0.title == "Quit Comradex" })?.action)
+    }
+
+    @MainActor
+    func testNativeMenuExplainsPoolWithNoAccounts() {
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(
+            daemonRunning: true,
+            pools: [PoolSnapshot(name: "default", members: [], preferred: nil, active: nil)]
+        ))
+        let controller = MenuBarController(store: store)
+
+        controller.rebuildMenu()
+
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title == "No accounts configured" })
+    }
+
     func testStatusDecodesFromEnvelopeAndIgnoresExtraTrafficFields() throws {
         let data = Data(#"""
         {
