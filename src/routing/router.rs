@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -267,6 +267,17 @@ impl Router {
                 .map(|(pool, account)| (pool.clone(), account.clone()))
                 .collect(),
         }
+    }
+
+    /// Accounts the router currently excludes because their credentials need repair.
+    pub async fn accounts_needing_login(&self) -> BTreeSet<String> {
+        self.accounts
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, runtime)| runtime.needs_login)
+            .map(|(account, _)| account.clone())
+            .collect()
     }
 
     pub async fn begin(&self, account: &str) {

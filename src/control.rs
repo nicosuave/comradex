@@ -117,7 +117,7 @@ pub enum UiAccountKind {
     CodexHome,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiAccountAuthState {
     Inbound,
@@ -762,6 +762,7 @@ async fn build_ui_status(
 ) -> UiStatus {
     let traffic = stats.snapshot(router).await;
     let routing = traffic.routing.clone();
+    let accounts_needing_login = router.accounts_needing_login().await;
     let accounts = config
         .accounts
         .iter()
@@ -783,6 +784,15 @@ async fn build_ui_status(
                         UiAccountKind::CodexHome,
                         path.join("auth.json").exists(),
                         UiAccountAuthState::LoginInProgress,
+                    )
+                }
+                crate::config::AccountConfig::CodexHome { .. }
+                    if accounts_needing_login.contains(name) =>
+                {
+                    (
+                        UiAccountKind::CodexHome,
+                        false,
+                        UiAccountAuthState::SignedOut,
                     )
                 }
                 crate::config::AccountConfig::CodexHome { path }
@@ -1260,6 +1270,26 @@ path = "accounts/work"
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn ui_status_reports_router_reauthentication_even_with_auth_file() {
+        let (_dir, config, router) = managed_login_fixture();
+        let home = managed_account_home(&config, "work").unwrap();
+        fs::create_dir_all(home).unwrap();
+        fs::write(home.join("auth.json"), "{}").unwrap();
+        router.reauth_required("work").await;
+        let login_manager = LoginManager::new(Arc::new(SystemLoginRunner), router.clone());
+
+        let status = build_ui_status(&config, &router, &Stats::default(), &login_manager).await;
+        let work = status
+            .accounts
+            .iter()
+            .find(|account| account.name == "work")
+            .unwrap();
+
+        assert!(!work.signed_in);
+        assert_eq!(work.auth_state, UiAccountAuthState::SignedOut);
     }
 
     #[tokio::test]
