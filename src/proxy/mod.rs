@@ -712,12 +712,11 @@ impl App {
                             ));
                         }
                     };
-                    self.stats.inflight_http.fetch_add(1, Ordering::Relaxed);
+                    let _inflight = InflightGuard::new(&self.stats.inflight_http);
                     let result = self
                         .handle_http(req, &listener, path)
                         .await
                         .unwrap_or_else(internal_error);
-                    self.stats.inflight_http.fetch_sub(1, Ordering::Relaxed);
                     drop(permit);
                     result
                 }
@@ -4300,7 +4299,7 @@ mod tests {
     use http_body_util::{BodyExt, Full};
     use hyper_util::client::legacy::{Client as TestClient, connect::HttpConnector};
     use std::{collections::BTreeMap, fs, path::PathBuf, sync::Mutex, time::Duration};
-    use tokio::net::TcpStream;
+    use tokio::{io::AsyncWriteExt, net::TcpStream};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     #[derive(Clone, Debug)]
@@ -4324,6 +4323,39 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn http_inflight_counter_clears_when_connection_task_is_aborted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, mut listener, _, stats) = direct_test_app(dir.path());
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.address = tcp.local_addr().unwrap();
+        let proxy = tokio::spawn(
+            app.clone()
+                .serve_tcp("default".into(), listener.clone(), tcp),
+        );
+        let mut stream = TcpStream::connect(listener.address).await.unwrap();
+        stream
+            .write_all(
+                b"POST /0123456789abcdef/v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nAuthorization: Bearer caller\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.inflight_http.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request should acquire an in-flight slot");
+
+        app.shutdown_connections().await;
+        assert_eq!(stats.inflight_http.load(Ordering::Relaxed), 0);
+
+        drop(stream);
+        proxy.abort();
     }
 
     #[test]
