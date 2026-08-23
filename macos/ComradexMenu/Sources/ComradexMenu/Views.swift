@@ -12,12 +12,16 @@ struct MenuContentView: View {
             Divider()
 
             if let snapshot = store.snapshot {
-                VStack(alignment: .leading, spacing: 0) {
-                    if store.errorMessage != nil { staleDataWarning }
-                    statusContent(snapshot)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        if store.errorMessage != nil { staleDataWarning }
+                        statusContent(snapshot)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .scrollBounceBehavior(.basedOnSize)
+                .frame(maxHeight: 360)
             } else if let error = store.errorMessage {
                 errorState(error)
                     .padding(16)
