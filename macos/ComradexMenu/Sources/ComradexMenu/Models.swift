@@ -58,6 +58,14 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     var isSignedIn: Bool {
         signedIn ?? ["signed_in", "authenticated", "ready"].contains(authState?.lowercased())
     }
+    var isInbound: Bool {
+        kind.caseInsensitiveCompare("inbound") == .orderedSame
+            || authState?.caseInsensitiveCompare("inbound") == .orderedSame
+    }
+    var needsLoginAction: Bool {
+        guard !isInbound else { return false }
+        return authState?.caseInsensitiveCompare("signed_out") == .orderedSame
+    }
 
     enum CodingKeys: String, CodingKey {
         case name, kind, pools

@@ -1,6 +1,6 @@
 # Comradex Menu
 
-A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; choosing a pool's preferred account (or automatic selection); and completing account login or re-login.
+A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; choosing a pool's preferred account; and completing account login when authentication is required.
 
 The app talks directly to the daemon's newline-delimited JSON protocol at `~/.config/comradex/state/control.sock`. It does not invoke the Comradex CLI, read configuration files, expose subprocess output, or handle credentials. Device login polling uses the daemon-issued random session ID and displays only the verification URI, user code, coarse state, and safe error text. Set `COMRADEX_CONTROL_SOCKET` before launching to use another socket path.
 
