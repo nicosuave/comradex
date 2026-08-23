@@ -7,16 +7,17 @@ struct MenuContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
             Divider()
 
             if let snapshot = store.snapshot {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 0) {
                     if store.errorMessage != nil { staleDataWarning }
                     statusContent(snapshot)
                 }
-                .padding(12)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
             } else if let error = store.errorMessage {
                 errorState(error)
                     .padding(16)
@@ -26,50 +27,26 @@ struct MenuContentView: View {
                     .padding(16)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            Divider()
+            commands
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
         }
         .frame(width: 340)
         .task { await store.refreshLoop() }
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Comradex")
-                    .font(.headline)
-                Label(connectionLabel, systemImage: "circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(connectionColor)
-                    .labelStyle(CompactStatusLabelStyle())
-            }
-            Spacer()
-
-            if store.isRefreshing {
-                ProgressView()
-                    .controlSize(.small)
-            } else {
-                Button {
-                    Task { await store.refresh() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh")
-                .keyboardShortcut("r")
-            }
-
-            Menu {
-                Button("Refresh") { Task { await store.refresh() } }
-                    .keyboardShortcut("r")
-                Divider()
-                Button("Quit Comradex") { NSApplication.shared.terminate(nil) }
-                    .keyboardShortcut("q")
-            } label: {
-                Image(systemName: "ellipsis.circle")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("More")
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Comradex")
+                .font(.title3.weight(.medium))
+            Label(connectionLabel, systemImage: "circle.fill")
+                .font(.caption)
+                .foregroundStyle(connectionColor)
+                .labelStyle(CompactStatusLabelStyle())
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -79,100 +56,159 @@ struct MenuContentView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
         } else {
             if !snapshot.pools.isEmpty {
-                sectionTitle("Pools")
                 VStack(spacing: 0) {
-                    ForEach(Array(snapshot.pools.enumerated()), id: \.element.id) { index, pool in
-                        poolRow(pool)
-                        if index < snapshot.pools.count - 1 { Divider() }
+                    ForEach(snapshot.pools) { pool in
+                        poolGroup(pool, snapshot: snapshot)
                     }
                 }
             }
 
-            if !snapshot.pools.isEmpty && !snapshot.accounts.isEmpty { Divider() }
-
-            if !snapshot.accounts.isEmpty {
-                sectionTitle("Accounts")
+            let renderedAccountNames = Set(snapshot.pools.flatMap(\.members))
+            let standaloneAccounts = snapshot.accounts.filter { !renderedAccountNames.contains($0.name) }
+            if !standaloneAccounts.isEmpty {
                 VStack(spacing: 0) {
-                    ForEach(Array(snapshot.accounts.enumerated()), id: \.element.id) { index, account in
-                        accountRow(account)
-                        if index < snapshot.accounts.count - 1 { Divider() }
+                    ForEach(standaloneAccounts) { account in
+                        accountRow(account, pool: nil, isPreferred: false)
                     }
                 }
+                .padding(.top, snapshot.pools.isEmpty ? 0 : 8)
             }
         }
     }
 
-    private func sectionTitle(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
-    }
-
-    private func poolRow(_ pool: PoolSnapshot) -> some View {
-        HStack(spacing: 10) {
+    private func poolGroup(_ pool: PoolSnapshot, snapshot: UIStatusSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(pool.name)
-                    .font(.callout.weight(.medium))
-                Text("Active: \(pool.active ?? "None")")
+                Text(pool.name).font(.callout.weight(.medium))
+                Text("Pool · Active: \(pool.active ?? "None")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Spacer()
-            preferenceMenu(pool)
-        }
-        .padding(.vertical, 7)
-    }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
 
-    private func preferenceMenu(_ pool: PoolSnapshot) -> some View {
-        Menu(pool.preferred ?? "Automatic") {
-            Button {
-                Task { await store.setPreferred(pool: pool.name, account: nil) }
-            } label: {
-                if pool.preferred == nil { Label("Automatic", systemImage: "checkmark") }
-                else { Text("Automatic") }
-            }
-            Divider()
-            ForEach(pool.members, id: \.self) { account in
-                Button {
-                    Task { await store.setPreferred(pool: pool.name, account: account) }
-                } label: {
-                    if pool.preferred == account { Label(account, systemImage: "checkmark") }
-                    else { Text(account) }
+            ForEach(pool.members, id: \.self) { member in
+                if let account = snapshot.accounts.first(where: { $0.name == member }) {
+                    accountRow(account, pool: pool, isPreferred: pool.preferred == member)
+                } else {
+                    missingAccountRow(member, pool: pool)
                 }
             }
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .disabled(store.updatingPool != nil)
+        .padding(.bottom, 8)
     }
 
-    private func accountRow(_ account: AccountSnapshot) -> some View {
+    private func accountRow(_ account: AccountSnapshot, pool: PoolSnapshot?, isPreferred: Bool) -> some View {
         HStack(spacing: 9) {
             Image(systemName: accountIcon(account))
                 .foregroundStyle(accountColor(account))
                 .frame(width: 16)
             VStack(alignment: .leading, spacing: 2) {
-                Text(account.name)
-                    .font(.callout.weight(.medium))
-                Text(accountSubtitle(account))
+                Text(account.name).font(.callout.weight(.medium))
+                Text(accountSubtitle(account, poolName: pool?.name))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            Spacer()
+            Spacer(minLength: 8)
 
-            if account.kind.caseInsensitiveCompare("inbound") != .orderedSame {
-                Button(account.isSignedIn ? "Re-login" : "Login") {
-                    openWindow(id: "account-login")
-                    store.beginLogin(account: account.name)
-                }
-                .buttonStyle(.borderless)
-                .disabled(store.isLoginRunning)
+            if let pool {
+                preferenceButton(account: account.name, pool: pool, isPreferred: isPreferred)
+            }
+
+            if account.needsLoginAction {
+                Button("Re-login") { beginLogin(account.name) }
+                    .buttonStyle(.borderless)
+                    .disabled(store.isLoginRunning)
+                    .accessibilityLabel("Re-login \(account.name)")
+            } else if account.authState?.lowercased() == "login_in_progress" {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Login in progress for \(account.name)")
             }
         }
+        .padding(.horizontal, 8)
         .padding(.vertical, 7)
+    }
+
+    private func missingAccountRow(_ name: String, pool: PoolSnapshot) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: "questionmark.circle")
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(name).font(.callout.weight(.medium))
+                Text("Unavailable · \(pool.name)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+    }
+
+    @ViewBuilder
+    private func preferenceButton(account: String, pool: PoolSnapshot, isPreferred: Bool) -> some View {
+        if isPreferred {
+            Text("Preferred")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.tint)
+                .accessibilityLabel("\(account) is preferred for \(pool.name)")
+        } else {
+            Button("Prefer") {
+                Task { await store.setPreferred(pool: pool.name, account: account) }
+            }
+            .buttonStyle(.borderless)
+            .disabled(store.updatingPool != nil)
+            .accessibilityLabel("Prefer \(account) for \(pool.name)")
+        }
+    }
+
+    private func beginLogin(_ account: String) {
+        openWindow(id: "account-login")
+        store.beginLogin(account: account)
+    }
+
+    private var commands: some View {
+        VStack(spacing: 0) {
+            commandButton("Refresh", shortcut: "⌘ R", key: "r", disabled: store.isRefreshing) {
+                Task { await store.refresh() }
+            }
+            commandButton("Quit Comradex", shortcut: "⌘ Q", key: "q") {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+    }
+
+    private func commandButton(
+        _ title: String,
+        shortcut: String,
+        key: KeyEquivalent,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                Spacer()
+                if title == "Refresh", store.isRefreshing {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text(shortcut)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(key, modifiers: .command)
+        .disabled(disabled)
     }
 
     private var staleDataWarning: some View {
@@ -198,7 +234,6 @@ struct MenuContentView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Button("Try Again") { Task { await store.refresh() } }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -221,7 +256,7 @@ struct MenuContentView: View {
         }
     }
 
-    private func accountSubtitle(_ account: AccountSnapshot) -> String {
+    private func accountSubtitle(_ account: AccountSnapshot, poolName: String?) -> String {
         let state: String
         switch account.authState?.lowercased() {
         case "login_in_progress": state = "Login in progress"
@@ -230,6 +265,7 @@ struct MenuContentView: View {
         case "signed_out": state = "Signed out"
         default: state = account.isSignedIn ? "Signed in" : "Signed out"
         }
+        if let poolName { return "\(state) · \(poolName)" }
         guard !account.pools.isEmpty else { return state }
         return "\(state) · \(account.pools.joined(separator: ", "))"
     }

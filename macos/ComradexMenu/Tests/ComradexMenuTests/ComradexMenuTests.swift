@@ -31,6 +31,20 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertEqual(value.pools.first?.active, "work")
     }
 
+    func testLoginActionOnlyAppearsForSignedOutManagedAccounts() throws {
+        let signedIn = try decodeAccount(#"{"name":"healthy","kind":"codex_home","signed_in":true,"auth_state":"signed_in"}"#)
+        let signedOut = try decodeAccount(#"{"name":"broken","kind":"codex_home","signed_in":false,"auth_state":"signed_out"}"#)
+        let inbound = try decodeAccount(#"{"name":"app","kind":"inbound","signed_in":true,"auth_state":"inbound"}"#)
+        let inProgress = try decodeAccount(#"{"name":"pending","kind":"codex_home","signed_in":false,"auth_state":"login_in_progress"}"#)
+        let unknown = try decodeAccount(#"{"name":"legacy","kind":"codex_home","signed_in":false}"#)
+
+        XCTAssertFalse(signedIn.needsLoginAction)
+        XCTAssertTrue(signedOut.needsLoginAction)
+        XCTAssertFalse(inbound.needsLoginAction)
+        XCTAssertFalse(inProgress.needsLoginAction)
+        XCTAssertFalse(unknown.needsLoginAction)
+    }
+
     func testLoginDecodesOnlyAllowlistedDeviceFlowFields() throws {
         let data = Data(#"{"ok":true,"account":"work","session_id":"random","state":"running","verification_uri":"https://auth.openai.com/codex/device","user_code":"ABCD-EFGH","output":"must not be decoded"}"#.utf8)
         let value = try ControlSocketClient.decode(
@@ -192,6 +206,10 @@ final class ComradexMenuTests: XCTestCase {
 
         XCTAssertThrowsError(try ControlSocketClient.send(Data(repeating: 0x41, count: 64 * 1024), to: path))
         wait(for: [closed], timeout: 2)
+    }
+
+    private func decodeAccount(_ json: String) throws -> AccountSnapshot {
+        try JSONDecoder().decode(AccountSnapshot.self, from: Data(json.utf8))
     }
 }
 
