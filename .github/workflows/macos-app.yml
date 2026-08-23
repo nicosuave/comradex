@@ -1,0 +1,43 @@
+name: macOS app
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-app-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-package:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Test menu app
+        run: swift test --package-path macos/ComradexMenu
+      - name: Package universal menu app
+        working-directory: macos/ComradexMenu
+        env:
+          ARCHES: arm64 x86_64
+          SIGNING_MODE: adhoc
+        run: Scripts/package_app.sh release
+      - name: Verify app bundle
+        working-directory: macos/ComradexMenu
+        run: |
+          set -euo pipefail
+          test "$(lipo -archs ComradexMenu.app/Contents/MacOS/ComradexMenu)" = "x86_64 arm64" \
+            || test "$(lipo -archs ComradexMenu.app/Contents/MacOS/ComradexMenu)" = "arm64 x86_64"
+          plutil -lint ComradexMenu.app/Contents/Info.plist
+          codesign --verify --deep --strict --verbose=2 ComradexMenu.app
+          ditto --norsrc -c -k --keepParent ComradexMenu.app ComradexMenu-macos-universal.zip
+      - name: Upload menu app
+        uses: actions/upload-artifact@v7
+        with:
+          name: ComradexMenu-macos-universal
+          path: macos/ComradexMenu/ComradexMenu-macos-universal.zip

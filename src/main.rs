@@ -267,8 +267,13 @@ async fn serve(path: &Path) -> Result<()> {
     )?);
     let router = Arc::new(Router::new(&config, affinity));
     let stats = Arc::new(Stats::default());
-    let control_server =
-        control::ControlServer::bind(&state, config_path, config.clone(), router.clone())?;
+    let control_server = control::ControlServer::bind(
+        &state,
+        config_path,
+        config.clone(),
+        router.clone(),
+        stats.clone(),
+    )?;
     let mut control_task = tokio::spawn(control_server.run());
     let app = App::new(config.clone(), router.clone(), stats.clone())?;
     let mut tasks = tokio::task::JoinSet::new();
