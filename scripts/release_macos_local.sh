@@ -22,8 +22,8 @@ if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "$tag^{commit}")" ]]; then
   echo "HEAD must be the commit tagged $tag" >&2
   exit 1
 fi
-if ! git diff --quiet HEAD -- Cargo.toml Cargo.lock src; then
-  echo "Refusing to release with uncommitted source changes" >&2
+if ! git diff --quiet HEAD -- Cargo.toml Cargo.lock src macos scripts; then
+  echo "Refusing to release with uncommitted macOS source changes" >&2
   exit 1
 fi
 if ! gh release view "$tag" >/dev/null 2>&1; then
@@ -70,11 +70,48 @@ build_package_notarize() {
 build_package_notarize aarch64-apple-darwin arm64
 build_package_notarize x86_64-apple-darwin x86_64
 
+build_package_notarize_app() {
+  local app_root="$root/macos/ComradexMenu"
+  local app="$app_root/ComradexMenu.app"
+  local artifact="comradex-menu-${version}-macos-universal.zip"
+  local notary_zip="$artifacts/comradex-menu-${version}-notarization.zip"
+  local build_number
+  build_number="$(git rev-list --count HEAD)"
+
+  (
+    cd "$app_root"
+    MARKETING_VERSION="$version" \
+      BUILD_NUMBER="$build_number" \
+      ARCHES="arm64 x86_64" \
+      APP_IDENTITY="$identity" \
+      SIGNING_MODE=developer-id \
+      Scripts/package_app.sh release
+  )
+  codesign --verify --deep --strict --verbose=2 "$app"
+
+  rm -f "$notary_zip"
+  ditto --norsrc -c -k --keepParent "$app" "$notary_zip"
+  xcrun notarytool submit "$notary_zip" \
+    --keychain-profile "$notary_profile" \
+    --wait
+  xcrun stapler staple "$app"
+  xcrun stapler validate "$app"
+  spctl -a -t exec -vv "$app"
+
+  ditto --norsrc -c -k --keepParent "$app" "$artifacts/$artifact"
+  (cd "$artifacts" && shasum -a 256 "$artifact" > "$artifact.sha256")
+  rm -f "$notary_zip"
+}
+
+build_package_notarize_app
+
 gh release upload "$tag" \
   "$artifacts/comradex-${version}-macos-arm64.tar.gz" \
   "$artifacts/comradex-${version}-macos-arm64.tar.gz.sha256" \
   "$artifacts/comradex-${version}-macos-x86_64.tar.gz" \
   "$artifacts/comradex-${version}-macos-x86_64.tar.gz.sha256" \
+  "$artifacts/comradex-menu-${version}-macos-universal.zip" \
+  "$artifacts/comradex-menu-${version}-macos-universal.zip.sha256" \
   --clobber
 
 update_homebrew() {

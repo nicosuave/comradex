@@ -27,7 +27,7 @@ pub struct Stats {
     pub refresh_last_success_unix: AtomicU64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub inflight_http: usize,
     pub open_upgrades: usize,
@@ -56,11 +56,11 @@ pub struct StatsSnapshot {
 }
 
 impl Stats {
-    pub async fn write(&self, path: PathBuf, router: &Arc<Router>) -> Result<()> {
+    pub async fn snapshot(&self, router: &Router) -> StatsSnapshot {
         let (affinity_entries, affinity_bytes) = router.affinity.len_and_bytes().await;
         let records = router.record_count().await;
         let routing = router.routing_snapshot().await;
-        let snapshot = StatsSnapshot {
+        StatsSnapshot {
             inflight_http: self.inflight_http.load(Ordering::Relaxed),
             open_upgrades: self.open_upgrades.load(Ordering::Relaxed),
             affinity_entries,
@@ -77,7 +77,11 @@ impl Stats {
             refresh_reauth_required: self.refresh_reauth_required.load(Ordering::Relaxed),
             refresh_last_sweep_unix: self.refresh_last_sweep_unix.load(Ordering::Relaxed),
             refresh_last_success_unix: self.refresh_last_success_unix.load(Ordering::Relaxed),
-        };
+        }
+    }
+
+    pub async fn write(&self, path: PathBuf, router: &Arc<Router>) -> Result<()> {
+        let snapshot = self.snapshot(router).await;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }

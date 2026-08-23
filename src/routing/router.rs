@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -39,6 +39,7 @@ struct AccountRuntime {
     last_assigned: u64,
     needs_login: bool,
     needs_login_retry_at: Option<Instant>,
+    login_in_progress: bool,
     quota_until: Option<Instant>,
     quota_evidence: Option<QuotaEvidence>,
     avoid_until: Option<Instant>,
@@ -156,6 +157,7 @@ impl Router {
                 && accounts.get(&binding.account_id).is_some_and(|a| {
                     binding_epoch == Some(binding.account_generation)
                         && !a.needs_login
+                        && !a.login_in_progress
                         && a.quota_until.is_none_or(|v| v <= now)
                 });
             if eligible {
@@ -172,6 +174,7 @@ impl Router {
             exclude != Some(id)
                 && accounts.get(id).is_some_and(|a| {
                     !a.needs_login
+                        && !a.login_in_progress
                         && a.quota_until.is_none_or(|v| v <= now)
                         && a.avoid_until.is_none_or(|v| v <= now)
                 })
@@ -266,6 +269,17 @@ impl Router {
         }
     }
 
+    /// Accounts the router currently excludes because their credentials need repair.
+    pub async fn accounts_needing_login(&self) -> BTreeSet<String> {
+        self.accounts
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, runtime)| runtime.needs_login)
+            .map(|(account, _)| account.clone())
+            .collect()
+    }
+
     pub async fn begin(&self, account: &str) {
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             a.inflight += 1;
@@ -291,6 +305,7 @@ impl Router {
         let eligible = pool.members.iter().any(|v| v == account)
             && accounts.get(account).is_some_and(|a| {
                 !a.needs_login
+                    && !a.login_in_progress
                     && a.quota_until.is_none_or(|v| v <= now)
                     && a.avoid_until.is_none_or(|v| v <= now)
             });
@@ -358,6 +373,33 @@ impl Router {
             && a.needs_login_retry_at.is_none()
         {
             a.needs_login = false;
+        }
+    }
+
+    /// Reserve an account for exclusive credential maintenance. While set, both fresh and
+    /// affinity-bound selections skip the account without changing its quota or auth state.
+    pub async fn begin_login(&self, account: &str) -> bool {
+        let mut accounts = self.accounts.lock().await;
+        let Some(runtime) = accounts.get_mut(account) else {
+            return false;
+        };
+        if runtime.login_in_progress {
+            return false;
+        }
+        runtime.login_in_progress = true;
+        true
+    }
+
+    /// End credential maintenance. A successful official login clears authentication failure
+    /// state and its retry delay, but deliberately preserves quota cooldown evidence.
+    pub async fn finish_login(&self, account: &str, succeeded: bool) {
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account) {
+            runtime.login_in_progress = false;
+            if succeeded {
+                runtime.needs_login = false;
+                runtime.needs_login_retry_at = None;
+                runtime.avoid_until = None;
+            }
         }
     }
     pub async fn observe_headers(&self, account: &str, headers: &hyper::HeaderMap) {
@@ -765,6 +807,67 @@ mod tests {
                 .unwrap()
                 .account_id,
             second.account_id
+        );
+    }
+
+    #[tokio::test]
+    async fn login_maintenance_excludes_bound_and_exact_selection_then_clears_auth_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity.clone());
+        let pool = &cfg.pools["default"];
+        let key = affinity.key("bound-login");
+        assert!(router.bind(key.clone(), "a").await);
+        router.reauth_required("a").await;
+        assert!(router.begin_login("a").await);
+        assert!(!router.begin_login("a").await);
+        assert!(router.select_exact(pool, "a").await.is_none());
+        let selection = router
+            .select("default", pool, Some(key), None)
+            .await
+            .unwrap();
+        assert_eq!(selection.account_id, "b");
+
+        router.finish_login("a", true).await;
+        assert!(router.select_exact(pool, "a").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn successful_login_maintenance_preserves_quota_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("3600"));
+        router.quota_failure("a", &headers).await;
+        assert!(router.begin_login("a").await);
+        router.finish_login("a", true).await;
+
+        assert!(
+            router
+                .select_exact(&cfg.pools["default"], "a")
+                .await
+                .is_none()
         );
     }
 
