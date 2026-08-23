@@ -15,23 +15,21 @@ enum StatusIcon {
 
 @main
 struct ComradexMenuApp: App {
-    @StateObject private var store = ComradexStore()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuContentView()
-                .environmentObject(store)
-        } label: {
-            Image(nsImage: StatusIcon.image)
-                .renderingMode(.template)
-                .accessibilityLabel("Comradex")
-        }
-        .menuBarExtraStyle(.window)
+        Settings { EmptyView() }
+    }
+}
 
-        Window("Account Login", id: "account-login") {
-            LoginWindowView()
-                .environmentObject(store)
-        }
-        .defaultSize(width: 440, height: 300)
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let store = ComradexStore()
+    private var menuController: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let controller = MenuBarController(store: store)
+        menuController = controller
+        controller.start()
     }
 }
