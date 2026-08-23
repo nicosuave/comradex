@@ -14,7 +14,7 @@ private final class PreferredAccountAction: NSObject {
 @MainActor
 final class MenuBarController: NSObject, NSMenuDelegate {
     private let store: ComradexStore
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private var statusItem: NSStatusItem?
     private let menu = NSMenu()
     private var refreshTask: Task<Void, Never>?
     private var loginWindowController: NSWindowController?
@@ -31,10 +31,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     deinit {
         refreshTask?.cancel()
-        NSStatusBar.system.removeStatusItem(statusItem)
+        if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+        }
     }
 
     func start() {
+        let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.statusItem = statusItem
         statusItem.button?.image = StatusIcon.image
         statusItem.button?.toolTip = "Comradex"
         menu.delegate = self
