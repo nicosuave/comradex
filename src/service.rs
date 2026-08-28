@@ -3,10 +3,13 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
+
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 

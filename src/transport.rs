@@ -124,9 +124,11 @@ mod tests {
 
     use rustls::pki_types::CertificateDer;
 
+    #[cfg(target_os = "macos")]
+    use super::TLS_ROOT_RETRY_DELAYS;
     use super::{
-        TLS_ROOT_RETRY_DELAYS, codex_http_connector, codex_websocket_connector,
-        load_platform_root_store_with, root_store_from_native_certs,
+        codex_http_connector, codex_websocket_connector, load_platform_root_store_with,
+        root_store_from_native_certs,
     };
 
     #[test]
