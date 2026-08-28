@@ -258,6 +258,19 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private func accountState(_ account: AccountSnapshot) -> String {
+        if !account.available {
+            switch account.unavailableReason?.lowercased() {
+            case "quota":
+                if let retry = retryDescription(account.retryAtUnix) {
+                    return "Rate limited · retry in \(retry)"
+                }
+                return "Rate limited"
+            case "temporary_failure": return "Temporarily unavailable"
+            case "login_in_progress": return "Login in progress"
+            case "needs_login": return "Sign-in required"
+            default: return "Unavailable"
+            }
+        }
         switch account.authState?.lowercased() {
         case "login_in_progress": return "Login in progress"
         case "inbound": return "Inbound"
@@ -268,10 +281,24 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private func accountIcon(_ account: AccountSnapshot) -> String {
+        if !account.available {
+            return account.unavailableReason?.lowercased() == "quota"
+                ? "clock.arrow.circlepath"
+                : "exclamationmark.circle.fill"
+        }
         switch account.authState?.lowercased() {
         case "login_in_progress": return "clock.fill"
         case "inbound": return "arrow.down.circle.fill"
         default: return account.isSignedIn ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
         }
+    }
+
+    private func retryDescription(_ retryAtUnix: Int64?) -> String? {
+        guard let retryAtUnix else { return nil }
+        let now = Int64(Date().timeIntervalSince1970)
+        let seconds = max(0, retryAtUnix - now)
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m \(seconds % 60)s" }
+        return "\(seconds / 3_600)h \((seconds % 3_600) / 60)m"
     }
 }

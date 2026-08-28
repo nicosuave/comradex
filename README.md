@@ -157,18 +157,19 @@ An installed Comradex binary can manage its own LaunchAgent:
 
 ```sh
 comradex service install
+comradex service start
 comradex service status
 comradex service restart
 comradex service uninstall
 ```
 
-`service restart` validates the edited configuration before stopping anything, then restarts the LaunchAgent and waits for every listener to answer a health probe. A broken edit fails validation and leaves the running daemon untouched. The configuration path comes from the installed plist, so the service always restarts against the configuration it actually uses regardless of `--config`.
+`service start` is idempotent: it loads an installed but unloaded LaunchAgent, revives a stopped job, and leaves an already-running daemon uninterrupted after verifying its listeners. `service restart` validates the edited configuration before stopping anything, then restarts the LaunchAgent and waits for every listener to answer a health probe. A broken edit fails validation and leaves the running daemon untouched. Both commands use the configuration path recorded in the installed plist regardless of `--config`.
 
-The installer records the exact executable and configuration paths, validates the generated plist, starts the daemon at login, and writes logs beneath Comradex's state directory. Installation waits for launchd to report a running PID and verifies every configured listener with a Comradex-specific HTTP probe. A failed replacement restores the previous Comradex plist and loaded job when possible.
+The installer records the exact executable and configuration paths, validates the generated plist, starts the daemon at login, and writes logs beneath Comradex's state directory. Early-login platform certificate loading is retried for up to 7.75 seconds so a temporarily unavailable macOS trust store does not strand the LaunchAgent. Installation waits for launchd to report a running PID and verifies every configured listener with a Comradex-specific HTTP probe. A failed replacement restores the previous Comradex plist and loaded job when possible.
 
 The service manages only `com.nicosuave.comradex`; it does not inspect, stop, or remove OpenCodex or any other relay. Stop OpenCodex first if it owns the same listener port. Codex configuration installation and service installation are separate reversible operations.
 
-`service status` reports whether launchd currently has a running Comradex process. On SIGTERM, Comradex stops the listeners, aborts and joins tracked HTTP/WebSocket connection tasks, clears in-flight counters, and only then writes final affinity, file-owner, and statistics snapshots. Active requests are terminated rather than gracefully completed during shutdown.
+`service status` reports whether launchd currently has a running Comradex process. When an installed service is down, it shows the last bounded stderr line and the exact start command; launchctl permission and communication failures are reported as errors instead of being mistaken for an unloaded job. On SIGTERM, Comradex stops the listeners, aborts and joins tracked HTTP/WebSocket connection tasks, clears in-flight counters, and only then writes final affinity, file-owner, and statistics snapshots. Active requests are terminated rather than gracefully completed during shutdown.
 
 ## How routing works
 
@@ -187,6 +188,8 @@ HTTP requests and the frame-aware WebSocket modes enforce file ownership found i
 Existing healthy bindings stay put even after usage crosses `switch_at`; the threshold controls only admission of new threads.
 
 A pre-output quota response, account-scoped connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Responses bodies carrying encrypted reasoning, hosted operation state, or durable operation metadata become bound to the first account that actually receives them; a proven pre-dispatch connection failure does not create that binding. Shared DNS and network-reachability failures remain account-neutral and do not rotate credentials. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry, and a 401/403 never crosses accounts. No response is retried after visible output. When no alternate is eligible, the original upstream rejection and its `Retry-After` or reset headers are preserved; primary, secondary, and tertiary reset windows bound quota cooldowns.
+
+Quota cooldowns recover automatically on the next selection or status request. When upstream reports several quota windows, only windows explicitly reported at 100% constrain a quota rejection; unrelated longer windows do not keep the account blocked. `comradex status` and `comradex status --json` expose each account's availability, retry deadline, usage, and blocking quota windows. Neither Comradex nor Codex needs to be restarted when a quota window resets.
 
 Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file, and all bodies have a hard cap. Responses and upgraded streams are forwarded with backpressure and are never retained.
 

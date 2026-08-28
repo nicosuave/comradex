@@ -1,11 +1,11 @@
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -232,6 +232,61 @@ pub fn installed() -> Result<bool> {
     Ok(plist_path()?.exists())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastStderrLine {
+    pub line: String,
+    pub log_modified_at_unix: Option<u64>,
+}
+
+/// Return the last daemon stderr line and log modification time recorded by
+/// the installed LaunchAgent. This is intentionally bounded so status remains
+/// safe even when a log has grown large. It is diagnostic history, not proof
+/// that the latest launch attempt failed.
+pub fn last_stderr_line() -> Result<Option<LastStderrLine>> {
+    platform_check()?;
+    let plist_path = plist_path()?;
+    let plist = match fs::read_to_string(&plist_path) {
+        Ok(plist) => plist,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
+    };
+    let Some(path) = plist_string_after(&plist, "<key>StandardErrorPath</key><string>") else {
+        return Ok(None);
+    };
+    read_last_nonempty_line(Path::new(&path))
+}
+
+fn read_last_nonempty_line(path: &Path) -> Result<Option<LastStderrLine>> {
+    const MAX_READ: u64 = 64 * 1024;
+    const MAX_LINE_CHARS: usize = 500;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let metadata = file.metadata()?;
+    let length = metadata.len();
+    let start = length.saturating_sub(MAX_READ);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .map(|line| line.chars().take(MAX_LINE_CHARS).collect());
+    Ok(line.map(|line| LastStderrLine {
+        line,
+        log_modified_at_unix: metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
+    }))
+}
+
 /// Run account maintenance while an installed LaunchAgent is unloaded. The
 /// previous loaded state is restored even when the maintenance operation
 /// fails, preventing the daemon from racing an external credential writer.
@@ -316,6 +371,64 @@ fn maintenance_transaction<T>(
 /// bounced so a broken edit fails here instead of taking the service down.
 pub fn restart() -> Result<()> {
     platform_check()?;
+    let service = installed_service()?;
+    let domain = launchctl_domain();
+    let state = launchctl_print(&domain)?
+        .as_deref()
+        .map_or(LaunchAgentState::Unloaded, launchctl_output_state);
+    let previous_pid = state.pid();
+    match state {
+        LaunchAgentState::Unloaded => bootstrap(&domain, &service.plist_path)?,
+        LaunchAgentState::LoadedStopped { .. } | LaunchAgentState::Running { .. } => {
+            kickstart(&domain)?
+        }
+    }
+    service.wait_until_ready(&domain, previous_pid)
+}
+
+/// Start an installed LaunchAgent without bouncing an already-running daemon.
+///
+/// This is intentionally idempotent: an unloaded job is bootstrapped, a loaded
+/// but stopped job is kickstarted, and a running job is left alone. All three
+/// paths verify launchd state and, for current plists, the nonce-protected
+/// listener health endpoints before returning.
+pub fn start() -> Result<()> {
+    platform_check()?;
+    let service = installed_service()?;
+    let domain = launchctl_domain();
+    let state = launchctl_print(&domain)?
+        .as_deref()
+        .map_or(LaunchAgentState::Unloaded, launchctl_output_state);
+    execute_start(
+        state,
+        || bootstrap(&domain, &service.plist_path),
+        || kickstart(&domain),
+        |previous_pid| service.wait_until_ready(&domain, previous_pid),
+    )
+}
+
+struct InstalledService {
+    plist_path: PathBuf,
+    listener_addresses: Vec<SocketAddr>,
+    service_nonce: Option<String>,
+}
+
+impl InstalledService {
+    fn wait_until_ready(&self, domain: &str, previous_pid: Option<u32>) -> Result<()> {
+        let (readiness_listeners, readiness_nonce) =
+            readiness_probe(&self.listener_addresses, self.service_nonce.as_deref());
+        wait_until_ready(
+            domain,
+            readiness_listeners,
+            readiness_nonce,
+            previous_pid,
+            READY_TIMEOUT,
+        )
+    }
+}
+
+/// Read and validate every installed input before changing launchd state.
+fn installed_service() -> Result<InstalledService> {
     let plist_path = plist_path()?;
     let plist = match fs::read_to_string(&plist_path) {
         Ok(text) => text,
@@ -324,9 +437,17 @@ pub fn restart() -> Result<()> {
         }
         Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
     };
+    validate_plist(&plist_path)
+        .with_context(|| format!("validate installed service {}", plist_path.display()))?;
     let config_path = plist_program_config(&plist)
         .with_context(|| format!("no --config argument recorded in {}", plist_path.display()))?;
-    if let Some(executable) = plist_executable(&plist).filter(|path| !path.exists()) {
+    let executable = plist_executable(&plist).with_context(|| {
+        format!(
+            "no executable recorded in ProgramArguments in {}",
+            plist_path.display()
+        )
+    })?;
+    if !executable.is_file() {
         bail!(
             "the service executable {} no longer exists (removed by an upgrade?); \
              run `comradex service install` to re-point the service at the current binary",
@@ -339,23 +460,63 @@ pub fn restart() -> Result<()> {
         .values()
         .map(|listener| listener.address)
         .collect();
-    let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
-    let domain = launchctl_domain();
-    let previous_pid = launchctl_print(&domain)?.and_then(|output| launchctl_output_pid(&output));
-    if is_loaded(&domain)? {
-        kickstart(&domain)?;
-    } else {
-        bootstrap(&domain, &plist_path)?;
+    if listener_addresses.iter().any(|address| address.port() == 0) {
+        bail!("installed service configuration requires fixed non-zero listener ports")
     }
-    let (readiness_listeners, readiness_nonce) =
-        readiness_probe(&listener_addresses, service_nonce.as_deref());
-    wait_until_ready(
-        &domain,
-        readiness_listeners,
-        readiness_nonce,
-        previous_pid,
-        READY_TIMEOUT,
-    )
+    let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
+    Ok(InstalledService {
+        plist_path,
+        listener_addresses,
+        service_nonce,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchAgentState {
+    Unloaded,
+    LoadedStopped { previous_pid: Option<u32> },
+    Running { pid: u32 },
+}
+
+impl LaunchAgentState {
+    fn pid(self) -> Option<u32> {
+        match self {
+            Self::Unloaded => None,
+            Self::LoadedStopped { previous_pid } => previous_pid,
+            Self::Running { pid } => Some(pid),
+        }
+    }
+}
+
+fn launchctl_output_state(output: &str) -> LaunchAgentState {
+    let pid = launchctl_output_pid(output);
+    if output.lines().any(|line| line.trim() == "state = running")
+        && let Some(pid) = pid
+    {
+        LaunchAgentState::Running { pid }
+    } else {
+        LaunchAgentState::LoadedStopped { previous_pid: pid }
+    }
+}
+
+fn execute_start(
+    state: LaunchAgentState,
+    bootstrap_job: impl FnOnce() -> Result<()>,
+    kickstart_job: impl FnOnce() -> Result<()>,
+    wait: impl FnOnce(Option<u32>) -> Result<()>,
+) -> Result<()> {
+    let previous_pid = match state {
+        LaunchAgentState::Unloaded => {
+            bootstrap_job()?;
+            None
+        }
+        LaunchAgentState::LoadedStopped { previous_pid } => {
+            kickstart_job()?;
+            previous_pid
+        }
+        LaunchAgentState::Running { .. } => None,
+    };
+    wait(previous_pid)
 }
 
 fn readiness_probe<'a>(
@@ -444,13 +605,28 @@ fn is_running(domain: &str) -> Result<bool> {
 fn launchctl_print(domain: &str) -> Result<Option<String>> {
     let output = Command::new("launchctl")
         .args(["print", &format!("{domain}/{LABEL}")])
-        .stderr(Stdio::null())
         .output()
         .context("launch launchctl print")?;
-    if !output.status.success() {
+    classify_launchctl_print(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn classify_launchctl_print(success: bool, stdout: &str, stderr: &str) -> Result<Option<String>> {
+    if success {
+        return Ok(Some(stdout.to_owned()));
+    }
+    let normalized = stderr.to_ascii_lowercase();
+    if normalized.contains("could not find service") || normalized.contains("service not found") {
         return Ok(None);
     }
-    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        bail!("launchctl print failed without an error message")
+    }
+    bail!("launchctl print failed: {detail}")
 }
 
 fn launchctl_output_is_running(output: &str) -> bool {
@@ -811,6 +987,156 @@ mod tests {
             Some(42)
         );
         assert_eq!(launchctl_output_pid("state = running\n\tpid = 0\n"), None);
+    }
+
+    #[test]
+    fn launchctl_print_distinguishes_missing_jobs_from_real_failures() {
+        assert_eq!(
+            classify_launchctl_print(
+                false,
+                "",
+                "Bad request.\nCould not find service com.nicosuave.comradex in domain"
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            classify_launchctl_print(false, "", "Operation not permitted")
+                .unwrap_err()
+                .to_string()
+                .contains("Operation not permitted")
+        );
+        assert_eq!(
+            classify_launchctl_print(true, "state = running\n", "")
+                .unwrap()
+                .as_deref(),
+            Some("state = running\n")
+        );
+    }
+
+    #[test]
+    fn last_stderr_reader_is_bounded_and_uses_last_nonempty_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stderr.log");
+        fs::write(
+            &path,
+            format!("{}\nfirst\nlast failure\n\n", "x".repeat(70_000)),
+        )
+        .unwrap();
+        let stderr = read_last_nonempty_line(&path).unwrap().unwrap();
+        assert_eq!(stderr.line, "last failure");
+        assert!(stderr.log_modified_at_unix.is_some());
+        assert_eq!(
+            read_last_nonempty_line(&dir.path().join("missing")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn launchctl_state_distinguishes_unrunning_loaded_jobs() {
+        assert_eq!(
+            launchctl_output_state("state = running\n\tpid = 42\n"),
+            LaunchAgentState::Running { pid: 42 }
+        );
+        assert_eq!(
+            launchctl_output_state("state = waiting\n\tpid = 41\n"),
+            LaunchAgentState::LoadedStopped {
+                previous_pid: Some(41)
+            }
+        );
+        assert_eq!(
+            launchctl_output_state("state = waiting\n"),
+            LaunchAgentState::LoadedStopped { previous_pid: None }
+        );
+    }
+
+    #[test]
+    fn start_bootstraps_only_an_unloaded_job_then_waits() {
+        let bootstraps = Cell::new(0);
+        let kickstarts = Cell::new(0);
+        let waits = Cell::new(0);
+
+        execute_start(
+            LaunchAgentState::Unloaded,
+            || {
+                bootstraps.set(bootstraps.get() + 1);
+                Ok(())
+            },
+            || {
+                kickstarts.set(kickstarts.get() + 1);
+                Ok(())
+            },
+            |previous_pid| {
+                waits.set(waits.get() + 1);
+                assert_eq!(previous_pid, None);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bootstraps.get(), 1);
+        assert_eq!(kickstarts.get(), 0);
+        assert_eq!(waits.get(), 1);
+    }
+
+    #[test]
+    fn start_kickstarts_only_a_loaded_stopped_job_then_waits_for_a_new_pid() {
+        let bootstraps = Cell::new(0);
+        let kickstarts = Cell::new(0);
+        let waits = Cell::new(0);
+
+        execute_start(
+            LaunchAgentState::LoadedStopped {
+                previous_pid: Some(41),
+            },
+            || {
+                bootstraps.set(bootstraps.get() + 1);
+                Ok(())
+            },
+            || {
+                kickstarts.set(kickstarts.get() + 1);
+                Ok(())
+            },
+            |previous_pid| {
+                waits.set(waits.get() + 1);
+                assert_eq!(previous_pid, Some(41));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bootstraps.get(), 0);
+        assert_eq!(kickstarts.get(), 1);
+        assert_eq!(waits.get(), 1);
+    }
+
+    #[test]
+    fn start_leaves_a_running_job_alone_and_checks_readiness() {
+        let bootstraps = Cell::new(0);
+        let kickstarts = Cell::new(0);
+        let waits = Cell::new(0);
+
+        execute_start(
+            LaunchAgentState::Running { pid: 42 },
+            || {
+                bootstraps.set(bootstraps.get() + 1);
+                Ok(())
+            },
+            || {
+                kickstarts.set(kickstarts.get() + 1);
+                Ok(())
+            },
+            |previous_pid| {
+                waits.set(waits.get() + 1);
+                assert_eq!(previous_pid, None);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bootstraps.get(), 0);
+        assert_eq!(kickstarts.get(), 0);
+        assert_eq!(waits.get(), 1);
     }
 
     #[test]

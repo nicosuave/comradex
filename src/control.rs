@@ -108,6 +108,10 @@ pub struct UiAccountStatus {
     pub signed_in: bool,
     pub auth_state: UiAccountAuthState,
     pub pools: Vec<String>,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub retry_at_unix: Option<i64>,
+    pub usage_percent: Option<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -812,6 +816,22 @@ async fn build_ui_status(
                 signed_in,
                 auth_state,
                 pools,
+                available: routing
+                    .account_states
+                    .get(name)
+                    .is_none_or(|state| state.available),
+                unavailable_reason: routing
+                    .account_states
+                    .get(name)
+                    .and_then(|state| state.unavailable_reason.clone()),
+                retry_at_unix: routing
+                    .account_states
+                    .get(name)
+                    .and_then(|state| state.retry_at_unix),
+                usage_percent: routing
+                    .account_states
+                    .get(name)
+                    .and_then(|state| state.usage_percent),
             }
         })
         .collect();
@@ -1290,6 +1310,9 @@ path = "accounts/work"
 
         assert!(!work.signed_in);
         assert_eq!(work.auth_state, UiAccountAuthState::SignedOut);
+        assert!(!work.available);
+        assert_eq!(work.unavailable_reason.as_deref(), Some("needs_login"));
+        assert!(work.retry_at_unix.is_none());
     }
 
     #[tokio::test]

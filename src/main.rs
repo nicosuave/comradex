@@ -114,6 +114,8 @@ enum AccountCommand {
 #[derive(Subcommand)]
 enum ServiceCommand {
     Install,
+    /// Start an installed service without interrupting it when already running
+    Start,
     Uninstall,
     Status,
     /// Restart the daemon so it reloads comradex.toml (needed after config
@@ -386,6 +388,10 @@ fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
             let plist = service::install(config_path, &state_dir(&config))?;
             println!("installed and started {}", plist.display());
         }
+        ServiceCommand::Start => {
+            service::start()?;
+            println!("service is running");
+        }
         ServiceCommand::Uninstall => match service::uninstall()? {
             Some(path) => println!("stopped service and removed {}", path.display()),
             None => println!("service is not installed"),
@@ -393,8 +399,18 @@ fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
         ServiceCommand::Status => {
             if service::status()? {
                 println!("service is running");
+            } else if service::installed()? {
+                println!("service is installed but not running");
+                if let Some(stderr) = service::last_stderr_line()? {
+                    println!(
+                        "last stderr line{}: {}",
+                        stderr_timestamp_suffix(stderr.log_modified_at_unix),
+                        stderr.line
+                    );
+                }
+                println!("run `comradex service start`");
             } else {
-                println!("service is not running");
+                println!("service is not installed (run `comradex service install`)");
             }
         }
         ServiceCommand::Restart => {
@@ -446,7 +462,20 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
 
     let service = match (service::installed(), service::status()) {
         (Ok(true), Ok(true)) => "running".to_owned(),
-        (Ok(true), Ok(false)) => "installed but not running".to_owned(),
+        (Ok(true), Ok(false)) => {
+            let suffix = service::last_stderr_line()
+                .ok()
+                .flatten()
+                .map(|stderr| {
+                    format!(
+                        "; last stderr line{}: {}",
+                        stderr_timestamp_suffix(stderr.log_modified_at_unix),
+                        stderr.line
+                    )
+                })
+                .unwrap_or_default();
+            format!("installed but not running{suffix} (run `comradex service start`)")
+        }
         (Ok(false), _) => "not installed (run `comradex service install`)".to_owned(),
         (Err(error), _) | (_, Err(error)) => format!("unknown ({error})"),
     };
@@ -460,6 +489,9 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         None => println!("codex    not routed through Comradex (run `comradex install`)"),
     }
 
+    let routing = live_routing
+        .as_ref()
+        .or_else(|| snapshot.as_ref().map(|snapshot| &snapshot.routing));
     println!("\naccounts");
     let width = config.accounts.keys().map(String::len).max().unwrap_or(0);
     for (name, account) in &config.accounts {
@@ -474,12 +506,16 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         } else {
             format!("pool {}", pools.join(", "))
         };
-        println!("  {name:width$}  {:24}  {pools}", account_state(account));
+        let availability = routing
+            .and_then(|routing| routing.account_states.get(name))
+            .map(account_availability)
+            .unwrap_or_default();
+        println!(
+            "  {name:width$}  {:24}  {pools}{availability}",
+            account_state(account)
+        );
     }
 
-    let routing = live_routing
-        .as_ref()
-        .or_else(|| snapshot.as_ref().map(|snapshot| &snapshot.routing));
     println!("\npools");
     let width = config.pools.keys().map(String::len).max().unwrap_or(0);
     for (name, pool) in &config.pools {
@@ -529,6 +565,46 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         None => println!("  no snapshot yet (the daemon writes one every few seconds)"),
     }
     Ok(())
+}
+
+fn stderr_timestamp_suffix(timestamp: Option<u64>) -> String {
+    timestamp
+        .map(|timestamp| format!(" (log modified unix {timestamp})"))
+        .unwrap_or_default()
+}
+
+fn account_availability(status: &comradex::routing::AccountRoutingStatus) -> String {
+    if status.available {
+        return String::new();
+    }
+    let reason = match status
+        .unavailable_reason
+        .as_deref()
+        .unwrap_or("unavailable")
+    {
+        "quota" => "rate limited",
+        "temporary_failure" => "temporarily unavailable",
+        "login_in_progress" => "login in progress",
+        "needs_login" => "sign-in required",
+        reason => reason,
+    };
+    let retry = status.retry_at_unix.and_then(|deadline| {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let deadline = u64::try_from(deadline).ok()?;
+        Some(human_duration(deadline.saturating_sub(now)))
+    });
+    match retry {
+        Some(retry) => format!("; {reason}, retry in {retry}"),
+        None => format!("; {reason}"),
+    }
+}
+
+fn human_duration(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60),
+    }
 }
 
 /// Short, plain-language state for one account.
@@ -886,5 +962,23 @@ mod tests {
 
         assert!(Cli::try_parse_from(["comradex", "account", "prefer", "work", "--clear"]).is_err());
         assert!(Cli::try_parse_from(["comradex", "account", "prefer"]).is_err());
+    }
+
+    #[test]
+    fn service_start_is_a_first_class_command() {
+        let cli = Cli::try_parse_from(["comradex", "service", "start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Service {
+                command: ServiceCommand::Start
+            }
+        ));
+    }
+
+    #[test]
+    fn durations_are_concise_for_status_output() {
+        assert_eq!(human_duration(12), "12s");
+        assert_eq!(human_duration(125), "2m 5s");
+        assert_eq!(human_duration(7_500), "2h 5m");
     }
 }
