@@ -1,10 +1,24 @@
-use std::sync::Arc;
+use std::{sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use hyper_rustls::HttpsConnector as RustlsHttpsConnector;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
+
+// macOS can briefly return an empty trust store while a user's login session is
+// still coming up. Keep this well below the service's 20-second readiness
+// timeout while allowing the platform security services time to settle.
+#[cfg(target_os = "macos")]
+const TLS_ROOT_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+#[cfg(not(target_os = "macos"))]
+const TLS_ROOT_RETRY_DELAYS: &[Duration] = &[];
 
 /// Builds the same transport-default TLS shape used by Codex's reqwest 0.12 client.
 ///
@@ -39,9 +53,48 @@ fn codex_websocket_tls_config() -> Result<ClientConfig> {
     let builder = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .context("select Codex Rustls protocol versions")?;
-    let native = rustls_native_certs::load_native_certs();
-    let roots = root_store_from_native_certs(native.certs, native.errors.len())?;
+    let roots = load_platform_root_store()?;
     Ok(builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+fn load_platform_root_store() -> Result<RootCertStore> {
+    load_platform_root_store_with(
+        || {
+            let native = rustls_native_certs::load_native_certs();
+            (native.certs, native.errors.len())
+        },
+        thread::sleep,
+        TLS_ROOT_RETRY_DELAYS,
+    )
+}
+
+fn load_platform_root_store_with<Load, Sleep>(
+    mut load: Load,
+    mut sleep: Sleep,
+    retry_delays: &[Duration],
+) -> Result<RootCertStore>
+where
+    Load: FnMut() -> (Vec<CertificateDer<'static>>, usize),
+    Sleep: FnMut(Duration),
+{
+    let mut attempt = 1;
+    loop {
+        let (certs, load_error_count) = load();
+        match root_store_from_native_certs(certs, load_error_count) {
+            Ok(roots) => return Ok(roots),
+            Err(error) => match retry_delays.get(attempt - 1) {
+                Some(delay) => {
+                    sleep(*delay);
+                    attempt += 1;
+                }
+                None => {
+                    return Err(error).with_context(|| {
+                        format!("load platform TLS roots after {attempt} attempts")
+                    });
+                }
+            },
+        }
+    }
 }
 
 fn root_store_from_native_certs(
@@ -60,6 +113,7 @@ fn root_store_from_native_certs(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     use http_body_util::Empty;
     use hyper::{Request, body::Bytes};
@@ -70,7 +124,12 @@ mod tests {
 
     use rustls::pki_types::CertificateDer;
 
-    use super::{codex_http_connector, codex_websocket_connector, root_store_from_native_certs};
+    #[cfg(target_os = "macos")]
+    use super::TLS_ROOT_RETRY_DELAYS;
+    use super::{
+        codex_http_connector, codex_websocket_connector, load_platform_root_store_with,
+        root_store_from_native_certs,
+    };
 
     #[test]
     fn websocket_root_store_rejects_no_native_certificates() {
@@ -111,6 +170,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn websocket_root_store_retries_until_platform_roots_are_available() {
+        let native = rustls_native_certs::load_native_certs();
+        let valid = native
+            .certs
+            .into_iter()
+            .find(|cert| {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(cert.clone()).is_ok()
+            })
+            .expect("test platform should provide at least one usable TLS root");
+        let mut loads = 0;
+        let mut sleeps = Vec::new();
+        let roots = load_platform_root_store_with(
+            || {
+                loads += 1;
+                if loads < 3 {
+                    (Vec::new(), loads)
+                } else {
+                    (vec![valid.clone()], 0)
+                }
+            },
+            |delay| sleeps.push(delay),
+            &[
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(loads, 3);
+        assert_eq!(
+            sleeps,
+            [Duration::from_millis(10), Duration::from_millis(20)]
+        );
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn websocket_root_store_fails_after_bounded_retries() {
+        let mut loads = 0;
+        let mut sleeps = Vec::new();
+        let error = load_platform_root_store_with(
+            || {
+                loads += 1;
+                (Vec::new(), loads)
+            },
+            |delay| sleeps.push(delay),
+            &[Duration::from_millis(10), Duration::from_millis(20)],
+        )
+        .unwrap_err();
+
+        assert_eq!(loads, 3);
+        assert_eq!(
+            sleeps,
+            [Duration::from_millis(10), Duration::from_millis(20)]
+        );
+        assert_eq!(
+            error.to_string(),
+            "load platform TLS roots after 3 attempts"
+        );
+        assert_eq!(
+            error.root_cause().to_string(),
+            "load platform TLS roots: no usable certificates (3 load errors, 0 parse errors)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn websocket_root_store_retry_budget_stays_below_service_ready_timeout() {
+        let total: Duration = TLS_ROOT_RETRY_DELAYS.iter().sum();
+        assert_eq!(total, Duration::from_millis(7_750));
+        assert!(total < Duration::from_secs(20));
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -322,7 +457,9 @@ mod tests {
     }
 
     fn parse_u16_list(data: &[u8]) -> Vec<u16> {
-        data.chunks_exact(2)
+        data.as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect()
     }

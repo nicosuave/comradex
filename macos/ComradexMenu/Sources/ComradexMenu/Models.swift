@@ -53,6 +53,10 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     let signedIn: Bool?
     let authState: String?
     let pools: [String]
+    let available: Bool
+    let unavailableReason: String?
+    let retryAtUnix: Int64?
+    let usagePercent: Int?
 
     var id: String { name }
     var isSignedIn: Bool {
@@ -68,9 +72,12 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, kind, pools
+        case name, kind, pools, available
         case signedIn = "signed_in"
         case authState = "auth_state"
+        case unavailableReason = "unavailable_reason"
+        case retryAtUnix = "retry_at_unix"
+        case usagePercent = "usage_percent"
     }
 
     init(from decoder: Decoder) throws {
@@ -80,6 +87,10 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         signedIn = try container.decodeIfPresent(Bool.self, forKey: .signedIn)
         authState = try container.decodeIfPresent(String.self, forKey: .authState)
         pools = try container.decodeIfPresent([String].self, forKey: .pools) ?? []
+        available = try container.decodeIfPresent(Bool.self, forKey: .available) ?? true
+        unavailableReason = try container.decodeIfPresent(String.self, forKey: .unavailableReason)
+        retryAtUnix = try container.decodeIfPresent(Int64.self, forKey: .retryAtUnix)
+        usagePercent = try container.decodeIfPresent(Int.self, forKey: .usagePercent)
     }
 }
 

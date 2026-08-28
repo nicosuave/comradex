@@ -30,6 +30,30 @@ pub struct RoutingSnapshot {
     pub preferred_accounts: BTreeMap<String, String>,
     #[serde(default)]
     pub active_accounts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub account_states: BTreeMap<String, AccountRoutingStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRoutingStatus {
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_percent: Option<u8>,
+    pub inflight: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quota_windows: BTreeMap<String, QuotaWindowStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaWindowStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -41,6 +65,7 @@ struct AccountRuntime {
     needs_login_retry_at: Option<Instant>,
     login_in_progress: bool,
     quota_until: Option<Instant>,
+    quota_reset_at: Option<DateTime<Utc>>,
     quota_evidence: Option<QuotaEvidence>,
     avoid_until: Option<Instant>,
 }
@@ -251,6 +276,17 @@ impl Router {
     }
 
     pub async fn routing_snapshot(&self) -> RoutingSnapshot {
+        let now = Instant::now();
+        let wall_now = Utc::now();
+        let mut accounts = self.accounts.lock().await;
+        for runtime in accounts.values_mut() {
+            reconcile_runtime(runtime, now, wall_now);
+        }
+        let account_states = accounts
+            .iter()
+            .map(|(name, runtime)| (name.clone(), account_routing_status(runtime, now, wall_now)))
+            .collect();
+        drop(accounts);
         RoutingSnapshot {
             preferred_accounts: self
                 .preferred
@@ -266,6 +302,7 @@ impl Router {
                 .iter()
                 .map(|(pool, account)| (pool.clone(), account.clone()))
                 .collect(),
+            account_states,
         }
     }
 
@@ -328,10 +365,13 @@ impl Router {
     }
     pub async fn quota_failure(&self, account: &str, headers: &hyper::HeaderMap) {
         let now = Utc::now();
-        let delay = quota_delay_at(headers, now);
-        let evidence = quota_evidence(headers, now);
+        let evidence = blocking_quota_evidence(headers, now);
+        let delay = quota_delay_at(headers, now, &evidence);
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             a.quota_until = Some(Instant::now() + delay);
+            a.quota_reset_at = now.checked_add_signed(
+                chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX),
+            );
             a.quota_evidence = (!evidence.is_empty()).then_some(evidence);
         }
     }
@@ -425,6 +465,7 @@ impl Router {
                 .is_some_and(|blocked| quota_reset_confirmed(blocked, &observed_evidence))
             {
                 a.quota_until = None;
+                a.quota_reset_at = None;
                 a.quota_evidence = None;
             }
         }
@@ -439,20 +480,72 @@ fn reconcile_expired_quota(runtime: &mut AccountRuntime, now: Instant, wall_now:
         .quota_until
         .is_some_and(|quota_until| quota_until > now)
         && runtime
-            .quota_evidence
-            .as_ref()
-            .is_some_and(|evidence| quota_reset_elapsed(evidence, wall_now))
+            .quota_reset_at
+            .is_some_and(|reset_at| reset_at <= wall_now)
     {
         runtime.quota_until = None;
+        runtime.quota_reset_at = None;
         runtime.quota_evidence = None;
     }
 }
 
-fn quota_reset_elapsed(evidence: &QuotaEvidence, now: DateTime<Utc>) -> bool {
-    !evidence.is_empty()
-        && evidence
-            .values()
-            .all(|window| window.reset_at.is_some_and(|reset_at| reset_at <= now))
+fn reconcile_runtime(runtime: &mut AccountRuntime, now: Instant, wall_now: DateTime<Utc>) {
+    if runtime.needs_login
+        && runtime
+            .needs_login_retry_at
+            .is_some_and(|retry_at| retry_at <= now)
+    {
+        runtime.needs_login = false;
+        runtime.needs_login_retry_at = None;
+    }
+    reconcile_expired_quota(runtime, now, wall_now);
+}
+
+fn account_routing_status(
+    runtime: &AccountRuntime,
+    now: Instant,
+    wall_now: DateTime<Utc>,
+) -> AccountRoutingStatus {
+    let (unavailable_reason, retry_at) = if runtime.login_in_progress {
+        (Some("login_in_progress".to_owned()), None)
+    } else if runtime.needs_login {
+        (Some("needs_login".to_owned()), runtime.needs_login_retry_at)
+    } else if runtime.quota_until.is_some_and(|until| until > now) {
+        (Some("quota".to_owned()), runtime.quota_until)
+    } else if runtime.avoid_until.is_some_and(|until| until > now) {
+        (Some("temporary_failure".to_owned()), runtime.avoid_until)
+    } else {
+        (None, None)
+    };
+    let retry_at_unix = retry_at.map(|deadline| {
+        wall_now.timestamp()
+            + i64::try_from(deadline.saturating_duration_since(now).as_secs()).unwrap_or(i64::MAX)
+    });
+    let quota_windows = runtime
+        .quota_evidence
+        .as_ref()
+        .into_iter()
+        .flat_map(|evidence| evidence.iter())
+        .map(|(window, evidence)| {
+            (
+                window.name().to_owned(),
+                QuotaWindowStatus {
+                    used_percent: evidence
+                        .used_percent
+                        .map(|percent| percent.clamp(0.0, 100.0).round() as u8),
+                    reset_at_unix: evidence.reset_at.map(|reset_at| reset_at.timestamp()),
+                },
+            )
+        })
+        .collect();
+    AccountRoutingStatus {
+        available: unavailable_reason.is_none(),
+        unavailable_reason,
+        retry_at_unix,
+        usage_percent: runtime.usage,
+        inflight: runtime.inflight,
+        quota_windows,
+    }
 }
 
 fn quota_evidence(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> QuotaEvidence {
@@ -506,62 +599,82 @@ fn quota_evidence(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> QuotaEviden
     .collect()
 }
 
-fn quota_reset_confirmed(blocked: &QuotaEvidence, observed: &QuotaEvidence) -> bool {
-    blocked.iter().any(|(window, before)| {
-        let Some(after) = observed.get(window) else {
-            return false;
-        };
-        let usage_recovered = match (before.used_percent, after.used_percent) {
-            (Some(before), Some(after)) => after < before,
-            (None, Some(after)) => after < 100.0,
-            _ => false,
-        };
-        let reset_advanced = match (before.reset_at, after.reset_at) {
-            (Some(before), Some(after)) => {
-                after.signed_duration_since(before) > chrono::Duration::seconds(60)
-            }
-            _ => false,
-        };
-        usage_recovered && reset_advanced
-    })
+fn blocking_quota_evidence(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> QuotaEvidence {
+    let evidence = quota_evidence(headers, now);
+    let exhausted = evidence
+        .iter()
+        .filter(|(_, window)| window.used_percent.is_some_and(|used| used >= 100.0))
+        .map(|(window, evidence)| (*window, *evidence))
+        .collect::<QuotaEvidence>();
+    if exhausted.is_empty() {
+        evidence
+    } else {
+        exhausted
+    }
 }
 
-fn quota_delay_at(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> Duration {
-    let seconds = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name = name.as_str();
-            let value = value.to_str().ok()?.trim();
-            if name == "retry-after" {
-                return value.parse::<u64>().ok().or_else(|| {
-                    parse_http_date(value).map(|reset_at| seconds_until(reset_at, now))
-                });
-            }
-            if !is_quota_reset_header(name) {
-                return None;
-            }
-            if name.ends_with("-reset-after-seconds") {
-                value.parse::<u64>().ok()
-            } else {
-                parse_reset_at(value).map(|reset_at| seconds_until(reset_at, now))
-            }
+fn quota_reset_confirmed(blocked: &QuotaEvidence, observed: &QuotaEvidence) -> bool {
+    !blocked.is_empty()
+        && blocked.iter().all(|(window, before)| {
+            let Some(after) = observed.get(window) else {
+                return false;
+            };
+            let usage_recovered = match (before.used_percent, after.used_percent) {
+                (Some(before), Some(after)) => after < before,
+                (None, Some(after)) => after < 100.0,
+                _ => false,
+            };
+            let reset_advanced = match (before.reset_at, after.reset_at) {
+                (Some(before), Some(after)) => {
+                    after.signed_duration_since(before) > chrono::Duration::seconds(60)
+                }
+                _ => false,
+            };
+            usage_recovered && reset_advanced
         })
+}
+
+fn quota_delay_at(
+    headers: &hyper::HeaderMap,
+    now: DateTime<Utc>,
+    evidence: &QuotaEvidence,
+) -> Duration {
+    let retry_after = headers.get("retry-after").and_then(|value| {
+        let value = value.to_str().ok()?.trim();
+        value
+            .parse::<u64>()
+            .ok()
+            .or_else(|| parse_http_date(value).map(|reset_at| seconds_until(reset_at, now)))
+    });
+    let generic_reset = [
+        "x-codex-reset-after-seconds",
+        "x-ratelimit-reset-after-seconds",
+    ]
+    .into_iter()
+    .filter_map(|name| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok())
+    .max();
+    let seconds = retry_after
+        .into_iter()
+        .chain(generic_reset)
+        .chain(
+            evidence
+                .values()
+                .filter_map(|window| window.reset_at.map(|reset_at| seconds_until(reset_at, now))),
+        )
         .max()
         .unwrap_or(60)
         .clamp(1, 24 * 60 * 60);
     Duration::from_secs(seconds)
 }
 
-fn is_quota_reset_header(name: &str) -> bool {
-    let supported_prefix = name.starts_with("x-codex-") || name.starts_with("x-ratelimit-");
-    let supported_window = ["-primary-", "-secondary-", "-tertiary-"]
-        .iter()
-        .any(|window| name.contains(window));
-    supported_prefix
-        && (name == "x-codex-reset-after-seconds"
-            || name == "x-ratelimit-reset-after-seconds"
-            || (supported_window
-                && (name.ends_with("-reset-after-seconds") || name.ends_with("-reset-at"))))
+impl QuotaWindow {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::Tertiary => "tertiary",
+        }
+    }
 }
 
 fn parse_reset_at(value: &str) -> Option<DateTime<Utc>> {
@@ -715,6 +828,22 @@ mod tests {
             RoutingSnapshot {
                 preferred_accounts: BTreeMap::from([("default".into(), "b".into())]),
                 active_accounts: BTreeMap::from([("default".into(), "b".into())]),
+                account_states: BTreeMap::from([
+                    (
+                        "a".into(),
+                        AccountRoutingStatus {
+                            available: true,
+                            ..Default::default()
+                        }
+                    ),
+                    (
+                        "b".into(),
+                        AccountRoutingStatus {
+                            available: true,
+                            ..Default::default()
+                        }
+                    ),
+                ]),
             }
         );
     }
@@ -945,6 +1074,7 @@ mod tests {
             let mut accounts = router.accounts.lock().await;
             let account = accounts.get_mut("a").unwrap();
             account.quota_until = Some(Instant::now() + Duration::from_secs(3600));
+            account.quota_reset_at = Some(DateTime::from_timestamp(1_577_836_800, 0).unwrap());
             account.quota_evidence = Some(evidence);
         }
 
@@ -956,6 +1086,57 @@ mod tests {
                 .account_id,
             "a"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_after_deadline_prevents_early_window_reset_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.pools.get_mut("default").unwrap().members = vec!["a".into()];
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        let wall_now = Utc::now();
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("120"));
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "x-codex-primary-reset-after-seconds",
+            HeaderValue::from_static("45"),
+        );
+        router.quota_failure("a", &headers).await;
+
+        {
+            let mut accounts = router.accounts.lock().await;
+            let account = accounts.get_mut("a").unwrap();
+            account.quota_until = Some(Instant::now() + Duration::from_secs(3600));
+            account.quota_reset_at = Some(wall_now + chrono::Duration::seconds(120));
+            reconcile_expired_quota(
+                account,
+                Instant::now(),
+                wall_now + chrono::Duration::seconds(46),
+            );
+            assert!(account.quota_until.is_some());
+            reconcile_expired_quota(
+                account,
+                Instant::now(),
+                wall_now + chrono::Duration::seconds(121),
+            );
+            assert!(account.quota_until.is_none());
+        }
+        assert!(router.select("default", pool, None, None).await.is_some());
     }
 
     #[tokio::test]
@@ -1041,6 +1222,11 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn quota_delay(headers: &HeaderMap, now: DateTime<Utc>) -> Duration {
+        let evidence = blocking_quota_evidence(headers, now);
+        quota_delay_at(headers, now, &evidence)
+    }
+
     #[test]
     fn quota_delay_accepts_tertiary_only_evidence() {
         let mut headers = HeaderMap::new();
@@ -1049,10 +1235,7 @@ mod tests {
             HeaderValue::from_static("321"),
         );
 
-        assert_eq!(
-            quota_delay_at(&headers, fixed_now()),
-            Duration::from_secs(321)
-        );
+        assert_eq!(quota_delay(&headers, fixed_now()), Duration::from_secs(321));
     }
 
     #[test]
@@ -1063,17 +1246,14 @@ mod tests {
             "x-codex-primary-reset-at",
             HeaderValue::from_str(&(now.timestamp() + 450).to_string()).unwrap(),
         );
-        assert_eq!(
-            quota_delay_at(&epoch_headers, now),
-            Duration::from_secs(450)
-        );
+        assert_eq!(quota_delay(&epoch_headers, now), Duration::from_secs(450));
 
         let mut iso_headers = HeaderMap::new();
         iso_headers.insert(
             "x-ratelimit-secondary-reset-at",
             HeaderValue::from_static("2026-08-11T12:07:31Z"),
         );
-        assert_eq!(quota_delay_at(&iso_headers, now), Duration::from_secs(451));
+        assert_eq!(quota_delay(&iso_headers, now), Duration::from_secs(451));
     }
 
     #[test]
@@ -1084,10 +1264,7 @@ mod tests {
             HeaderValue::from_static("Tue, 11 Aug 2026 12:02:03 GMT"),
         );
 
-        assert_eq!(
-            quota_delay_at(&headers, fixed_now()),
-            Duration::from_secs(123)
-        );
+        assert_eq!(quota_delay(&headers, fixed_now()), Duration::from_secs(123));
     }
 
     #[test]
@@ -1107,9 +1284,108 @@ mod tests {
             HeaderValue::from_static("90"),
         );
 
-        assert_eq!(
-            quota_delay_at(&headers, fixed_now()),
-            Duration::from_secs(90)
+        assert_eq!(quota_delay(&headers, fixed_now()), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn quota_delay_ignores_non_exhausted_longer_windows() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
         );
+        headers.insert(
+            "x-codex-primary-reset-after-seconds",
+            HeaderValue::from_static("45"),
+        );
+        headers.insert(
+            "x-codex-secondary-used-percent",
+            HeaderValue::from_static("12"),
+        );
+        headers.insert(
+            "x-codex-secondary-reset-after-seconds",
+            HeaderValue::from_static("86400"),
+        );
+
+        let evidence = blocking_quota_evidence(&headers, fixed_now());
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence.contains_key(&QuotaWindow::Primary));
+        assert_eq!(
+            quota_delay_at(&headers, fixed_now(), &evidence),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn quota_reset_confirmation_requires_every_blocking_window_to_recover() {
+        let now = fixed_now();
+        let mut blocked_headers = HeaderMap::new();
+        for (usage, reset) in [
+            ("x-codex-primary-used-percent", "x-codex-primary-reset-at"),
+            (
+                "x-codex-secondary-used-percent",
+                "x-codex-secondary-reset-at",
+            ),
+        ] {
+            blocked_headers.insert(usage, HeaderValue::from_static("100"));
+            blocked_headers.insert(reset, HeaderValue::from_static("2026-08-11T13:00:00Z"));
+        }
+        let blocked = blocking_quota_evidence(&blocked_headers, now);
+        let mut observed = HeaderMap::new();
+        observed.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("1"),
+        );
+        observed.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("2026-08-12T13:00:00Z"),
+        );
+        observed.insert(
+            "x-codex-secondary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        observed.insert(
+            "x-codex-secondary-reset-at",
+            HeaderValue::from_static("2026-08-11T13:00:00Z"),
+        );
+        assert!(!quota_reset_confirmed(
+            &blocked,
+            &quota_evidence(&observed, now)
+        ));
+    }
+
+    #[tokio::test]
+    async fn routing_snapshot_exposes_quota_deadline_and_blocking_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                100,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("120"));
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "x-codex-primary-reset-after-seconds",
+            HeaderValue::from_static("120"),
+        );
+        router.quota_failure("a", &headers).await;
+
+        let snapshot = router.routing_snapshot().await;
+        let account = &snapshot.account_states["a"];
+        assert!(!account.available);
+        assert_eq!(account.unavailable_reason.as_deref(), Some("quota"));
+        assert!(account.retry_at_unix.is_some());
+        assert_eq!(account.quota_windows["primary"].used_percent, Some(100));
     }
 }
