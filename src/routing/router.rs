@@ -252,7 +252,9 @@ impl Router {
             .insert(pool_name.to_owned(), selected.clone());
         if let Some(key) = thread.clone() {
             let generation = self.affinity.account_epoch(&selected).await;
-            self.affinity.put(key, selected.clone(), generation).await;
+            if !self.affinity.put(key, selected.clone(), generation).await {
+                return None;
+            }
         }
         Some(Selection {
             account_id: selected,
@@ -328,8 +330,7 @@ impl Router {
             return false;
         }
         let generation = self.affinity.account_epoch(account).await;
-        self.affinity.put(key, account.to_owned(), generation).await;
-        true
+        self.affinity.put(key, account.to_owned(), generation).await
     }
 
     pub async fn select_exact(&self, pool: &PoolConfig, account: &str) -> Option<Selection> {
@@ -390,9 +391,8 @@ impl Router {
             a.needs_login_retry_at = Some(retry_at);
             a.avoid_until = Some(retry_at);
         }
-        self.affinity.invalidate_account(account).await;
-        if let Err(error) = self.affinity.flush().await {
-            error!(%error, account, "failed to persist account affinity invalidation");
+        if !self.affinity.invalidate_account(account).await {
+            error!(account, "failed to invalidate durable affinity bindings");
         }
     }
 
@@ -753,8 +753,6 @@ mod tests {
             AffinityStore::load(
                 PathBuf::from(dir.path()).join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -794,8 +792,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -856,8 +852,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -878,8 +872,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -908,8 +900,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -947,8 +937,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -979,8 +967,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -1009,8 +995,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -1052,8 +1036,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -1097,8 +1079,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -1148,8 +1128,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -1189,8 +1167,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -1362,8 +1338,6 @@ mod tests {
             AffinityStore::load(
                 dir.path().join("a.json"),
                 &cfg.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),

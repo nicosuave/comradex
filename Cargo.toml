@@ -43,6 +43,7 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 libc = "0.2"
 native-tls = "=0.2.14"
 rand = "0.9"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = { version = "=0.23.36", default-features = false, features = ["aws_lc_rs", "std"] }
 rustls-native-certs = "=0.8.3"
 serde = { version = "1", features = ["derive"] }

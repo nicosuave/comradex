@@ -263,8 +263,6 @@ async fn serve(path: &Path) -> Result<()> {
     let affinity = Arc::new(AffinityStore::load(
         state.join("affinity.json"),
         &config.proxy.affinity_key,
-        config.proxy.max_affinity_entries,
-        config.proxy.max_affinity_bytes,
         Duration::from_secs(config.proxy.affinity_idle_days * 86_400),
     )?);
     let router = Arc::new(Router::new(&config, affinity));
@@ -285,17 +283,10 @@ async fn serve(path: &Path) -> Result<()> {
     let background_config = config.clone();
     let background_router = router.clone();
     let background_stats = stats.clone();
-    let background_app = app.clone();
     let background = tokio::spawn(async move {
         let mut interval = tokio::time::interval(background_config.snapshot_interval());
         loop {
             interval.tick().await;
-            if let Err(e) = background_router.affinity.flush().await {
-                warn!(error = %e, "affinity snapshot failed");
-            }
-            if let Err(e) = background_app.flush_file_owners().await {
-                warn!(error = %e, "file-owner snapshot failed");
-            }
             if let Err(e) = background_stats
                 .write(
                     state_dir(&background_config).join("stats.json"),
@@ -355,8 +346,6 @@ async fn serve(path: &Path) -> Result<()> {
     while tasks.join_next().await.is_some() {}
     app.shutdown_connections().await;
     router.clear_inflight().await;
-    router.affinity.flush().await?;
-    app.flush_file_owners().await?;
     stats.write(state.join("stats.json"), &router).await?;
     if let Some(error) = listener_error {
         return Err(error);

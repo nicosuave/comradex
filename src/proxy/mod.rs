@@ -623,8 +623,6 @@ impl App {
         let file_owners = Arc::new(AffinityStore::load(
             state_dir.join("file-owners.json"),
             &config.proxy.affinity_key,
-            config.proxy.max_affinity_entries,
-            config.proxy.max_affinity_bytes,
             Duration::from_secs(config.proxy.affinity_idle_days * 86_400),
         )?);
         Ok(Arc::new(Self {
@@ -659,10 +657,6 @@ impl App {
             shutting_down: AtomicBool::new(false),
             service_nonce: std::env::var("COMRADEX_SERVICE_NONCE").ok(),
         }))
-    }
-
-    pub async fn flush_file_owners(&self) -> Result<()> {
-        self.file_owners.flush().await
     }
 
     /// Sweep every configured managed account by stable ID. Accounts are intentionally handled
@@ -1314,10 +1308,10 @@ impl App {
             .map(str::to_owned)
             .context("successful file-create response has no file_id")?;
         let key = self.router.affinity.key(&format!("file:{file_id}"));
-        self.file_owners.put(key, account.to_owned(), 0).await;
-        if let Err(error) = self.file_owners.flush().await {
-            error!(%error, "file-owner snapshot failed after creation");
-        }
+        anyhow::ensure!(
+            self.file_owners.put(key, account.to_owned(), 0).await,
+            "persist file owner after creation"
+        );
         headers::strip_hop_by_hop(&mut parts.headers);
         let bytes = bytes.freeze();
         parts.headers.insert(CONTENT_LENGTH, bytes.len().into());
@@ -1351,10 +1345,10 @@ impl App {
         let authoritative_success = is_authoritative_file_finalize_success(&bytes);
         if authoritative_success {
             let key = self.router.affinity.key(&format!("file:{file_id}"));
-            self.file_owners.put(key, account.to_owned(), 0).await;
-            if let Err(error) = self.file_owners.flush().await {
-                error!(%error, "file-owner snapshot failed after finalization");
-            }
+            anyhow::ensure!(
+                self.file_owners.put(key, account.to_owned(), 0).await,
+                "persist file owner after finalization"
+            );
         }
         headers::strip_hop_by_hop(&mut parts.headers);
         let bytes = bytes.freeze();
@@ -4749,8 +4743,6 @@ mod tests {
                 AffinityStore::load(
                     dir.path().join("affinity.json"),
                     &config.proxy.affinity_key,
-                    100,
-                    100_000,
                     Duration::from_secs(60),
                 )
                 .unwrap(),
@@ -4815,8 +4807,6 @@ mod tests {
             AffinityStore::load(
                 dir.join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -4859,8 +4849,6 @@ mod tests {
             AffinityStore::load(
                 dir.join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -5620,8 +5608,6 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             AffinityStore::load(
                 PathBuf::from(dir.path()).join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -5889,8 +5875,6 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             AffinityStore::load(
                 dir.path().join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -5982,8 +5966,6 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             AffinityStore::load(
                 dir.join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -6049,8 +6031,6 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             AffinityStore::load(
                 dir.join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -6105,8 +6085,6 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             AffinityStore::load(
                 dir.join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
