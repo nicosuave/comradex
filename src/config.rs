@@ -41,12 +41,6 @@ fn default_request_limit() -> usize {
 fn default_global_spool() -> usize {
     512 * 1024 * 1024
 }
-fn default_affinity_entries() -> usize {
-    100_000
-}
-fn default_affinity_bytes() -> usize {
-    16 * 1024 * 1024
-}
 fn default_affinity_days() -> u64 {
     180
 }
@@ -96,10 +90,6 @@ pub struct ProxyConfig {
     pub max_request_bytes: usize,
     #[serde(default = "default_global_spool")]
     pub max_spool_bytes: usize,
-    #[serde(default = "default_affinity_entries")]
-    pub max_affinity_entries: usize,
-    #[serde(default = "default_affinity_bytes")]
-    pub max_affinity_bytes: usize,
     #[serde(default = "default_affinity_days")]
     pub affinity_idle_days: u64,
     #[serde(default = "default_flush_seconds")]
@@ -126,8 +116,6 @@ impl Default for ProxyConfig {
             replay_memory_bytes: default_replay_memory(),
             max_request_bytes: default_request_limit(),
             max_spool_bytes: default_global_spool(),
-            max_affinity_entries: default_affinity_entries(),
-            max_affinity_bytes: default_affinity_bytes(),
             affinity_idle_days: default_affinity_days(),
             snapshot_interval_seconds: default_flush_seconds(),
             state_dir: None,

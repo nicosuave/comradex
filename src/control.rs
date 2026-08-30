@@ -1008,8 +1008,6 @@ kind = "inbound"
             AffinityStore::load(
                 state_dir.join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),
@@ -1206,8 +1204,6 @@ path = "accounts/work"
             AffinityStore::load(
                 state_dir.join("affinity.json"),
                 &config.proxy.affinity_key,
-                100,
-                100_000,
                 Duration::from_secs(60),
             )
             .unwrap(),

@@ -1,16 +1,19 @@
 use std::{
     collections::HashMap,
     fs,
-    io::Write,
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::oneshot;
+use tracing::error;
 
-const ACCOUNT_EPOCH_STORAGE_BUDGET: usize = 1024 * 1024;
+const DATABASE_VERSION: i64 = 1;
+const MAX_TOUCH_PERSIST_INTERVAL_SECONDS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ThreadKey(pub String);
@@ -22,74 +25,97 @@ pub struct Binding {
     pub account_generation: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Snapshot {
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct LegacySnapshot {
     version: u8,
     bindings: HashMap<String, Binding>,
     #[serde(default)]
     account_epochs: HashMap<String, u64>,
 }
 
-#[derive(Debug, Default)]
-struct StoreState {
-    snapshot: Snapshot,
-    binding_bytes: usize,
-    generation: u64,
-    persisted_generation: u64,
+type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+
+struct DatabaseWorker {
+    sender: mpsc::Sender<Job>,
+    path: PathBuf,
+}
+
+impl DatabaseWorker {
+    fn start(path: PathBuf, legacy_path: PathBuf, idle: Duration) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let worker_path = path.clone();
+        std::thread::Builder::new()
+            .name("comradex-affinity-db".into())
+            .spawn(move || {
+                let mut connection = match open_database(&worker_path, &legacy_path, idle) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                        return;
+                    }
+                };
+                if ready_sender.send(Ok(())).is_err() {
+                    return;
+                }
+                let cleanup_interval = cleanup_interval(idle);
+                let mut next_cleanup = Instant::now() + cleanup_interval;
+                loop {
+                    let wait = next_cleanup.saturating_duration_since(Instant::now());
+                    match receiver.recv_timeout(wait) {
+                        Ok(job) => job(&mut connection),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let current = Instant::now();
+                    if current >= next_cleanup {
+                        if let Err(error) = expire_stale_bindings(&connection, idle) {
+                            error!(%error, "periodic affinity expiration failed");
+                        }
+                        next_cleanup = current + cleanup_interval;
+                    }
+                }
+            })
+            .context("spawn affinity database worker")?;
+        ready_receiver
+            .recv()
+            .context("affinity database worker stopped during startup")??;
+        Ok(Self { sender, path })
+    }
+
+    async fn call<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let (completed, result) = oneshot::channel();
+        self.sender
+            .send(Box::new(move |connection| {
+                let _ = completed.send(operation(connection));
+            }))
+            .map_err(|_| anyhow::anyhow!("affinity database worker stopped"))?;
+        result
+            .await
+            .context("affinity database worker dropped response")?
+    }
 }
 
 pub struct AffinityStore {
-    inner: Mutex<StoreState>,
-    flush_lock: Mutex<()>,
-    path: PathBuf,
+    database: Arc<DatabaseWorker>,
     key: [u8; 32],
-    max_entries: usize,
-    max_bytes: usize,
     idle: Duration,
 }
 
 impl AffinityStore {
-    pub fn load(
-        path: PathBuf,
-        key_text: &str,
-        max_entries: usize,
-        max_bytes: usize,
-        idle: Duration,
-    ) -> Result<Self> {
-        let key = *blake3::hash(key_text.as_bytes()).as_bytes();
-        let (mut snapshot, mut dirty) = match fs::read(&path) {
-            Ok(bytes) if bytes.len() <= max_bytes.saturating_add(ACCOUNT_EPOCH_STORAGE_BUDGET) => (
-                serde_json::from_slice(&bytes).context("parse affinity snapshot")?,
-                false,
-            ),
-            Ok(_) => anyhow::bail!("affinity snapshot exceeds the hard storage limit"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Snapshot::default(), false),
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        };
-        let cutoff = now().saturating_sub(idle.as_secs());
-        let before_expiry = snapshot.bindings.len();
-        snapshot
-            .bindings
-            .retain(|_, value| value.last_seen >= cutoff);
-        dirty |= snapshot.bindings.len() != before_expiry;
-        dirty |= trim_stale_account_epochs(&mut snapshot, "");
-        if account_epoch_storage_bytes(&snapshot) > ACCOUNT_EPOCH_STORAGE_BUDGET {
-            anyhow::bail!("account epoch snapshot exceeds its hard storage budget")
+    pub fn load(legacy_path: PathBuf, key_text: &str, idle: Duration) -> Result<Self> {
+        let database_path = legacy_path.with_extension("sqlite3");
+        if let Some(parent) = database_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create affinity state directory {}", parent.display()))?;
         }
-        let mut binding_bytes = binding_storage_bytes(&snapshot);
-        dirty |= trim(&mut snapshot, &mut binding_bytes, max_entries, max_bytes);
         Ok(Self {
-            inner: Mutex::new(StoreState {
-                snapshot,
-                binding_bytes,
-                generation: u64::from(dirty),
-                persisted_generation: 0,
-            }),
-            flush_lock: Mutex::new(()),
-            path,
-            key,
-            max_entries,
-            max_bytes,
+            database: Arc::new(DatabaseWorker::start(database_path, legacy_path, idle)?),
+            key: *blake3::hash(key_text.as_bytes()).as_bytes(),
             idle,
         })
     }
@@ -103,250 +129,438 @@ impl AffinityStore {
     }
 
     pub async fn get(&self, key: &ThreadKey) -> Option<Binding> {
-        let mut inner = self.inner.lock().await;
+        let key = key.0.clone();
         let now = now();
-        let expired = inner
-            .snapshot
-            .bindings
-            .get(&key.0)
-            .is_some_and(|v| now.saturating_sub(v.last_seen) > self.idle.as_secs());
-        if expired {
-            inner.snapshot.bindings.remove(&key.0);
-            mark_dirty(&mut inner);
-            return None;
+        let idle_seconds = self.idle.as_secs();
+        let touch_interval = idle_seconds
+            .saturating_div(4)
+            .clamp(1, MAX_TOUCH_PERSIST_INTERVAL_SECONDS);
+        match self
+            .database
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let binding = transaction
+                    .query_row(
+                        "select account_id, last_seen, account_generation from bindings where key = ?1",
+                        [&key],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                    )
+                    .optional()?;
+                let Some((account_id, last_seen, account_generation)) = binding else {
+                    transaction.commit()?;
+                    return Ok(None);
+                };
+                let mut binding = Binding {
+                    account_id,
+                    last_seen: from_sql_u64(last_seen, "binding last_seen")?,
+                    account_generation: from_sql_u64(
+                        account_generation,
+                        "binding account_generation",
+                    )?,
+                };
+                if now.saturating_sub(binding.last_seen) > idle_seconds {
+                    transaction.execute("delete from bindings where key = ?1", [&key])?;
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                if now.saturating_sub(binding.last_seen) >= touch_interval {
+                    transaction.execute(
+                        "update bindings set last_seen = ?2 where key = ?1",
+                        params![key, to_sql_u64(now, "binding last_seen")?],
+                    )?;
+                    binding.last_seen = now;
+                }
+                transaction.commit()?;
+                Ok(Some(binding))
+            })
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                error!(%error, "affinity lookup failed");
+                None
+            }
         }
-        let changed = inner
-            .snapshot
-            .bindings
-            .get(&key.0)
-            .is_some_and(|binding| binding.last_seen != now);
-        let previous_bytes = inner.snapshot.bindings.get(&key.0).map_or(0, json_len);
-        let binding = inner.snapshot.bindings.get_mut(&key.0)?;
-        binding.last_seen = now;
-        let binding = binding.clone();
-        if changed {
-            inner.binding_bytes = inner
-                .binding_bytes
-                .saturating_sub(previous_bytes)
-                .saturating_add(json_len(&binding));
-            mark_dirty(&mut inner);
-        }
-        Some(binding)
     }
 
-    pub async fn put(&self, key: ThreadKey, account_id: String, generation: u64) {
-        let mut inner = self.inner.lock().await;
-        let binding = Binding {
-            account_id,
-            last_seen: now(),
-            account_generation: generation,
-        };
-        insert_binding(&mut inner, key.0, binding);
-        let StoreState {
-            snapshot,
-            binding_bytes,
-            ..
-        } = &mut *inner;
-        trim(snapshot, binding_bytes, self.max_entries, self.max_bytes);
-        mark_dirty(&mut inner);
+    pub async fn put(&self, key: ThreadKey, account_id: String, generation: u64) -> bool {
+        let now = now();
+        match self
+            .database
+            .call(move |connection| {
+                connection.execute(
+                    "insert into bindings (key, account_id, last_seen, account_generation) values (?1, ?2, ?3, ?4) on conflict(key) do update set account_id = excluded.account_id, last_seen = excluded.last_seen, account_generation = excluded.account_generation",
+                    params![
+                        key.0,
+                        account_id,
+                        to_sql_u64(now, "binding last_seen")?,
+                        to_sql_u64(generation, "binding account_generation")?
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                error!(%error, "affinity write failed");
+                false
+            }
+        }
     }
 
     pub async fn account_epoch(&self, account: &str) -> u64 {
-        self.inner
-            .lock()
+        let account = account.to_owned();
+        match self
+            .database
+            .call(move |connection| {
+                let generation = connection
+                    .query_row(
+                        "select generation from account_epochs where account_id = ?1",
+                        [account],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                from_sql_u64(generation, "account generation")
+            })
             .await
-            .snapshot
-            .account_epochs
-            .get(account)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub async fn remove(&self, key: &ThreadKey) {
-        let mut inner = self.inner.lock().await;
-        if remove_binding(&mut inner, &key.0).is_some() {
-            mark_dirty(&mut inner);
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                error!(%error, "affinity account epoch lookup failed");
+                u64::MAX
+            }
         }
     }
 
-    pub async fn invalidate_account(&self, account: &str) {
-        let mut inner = self.inner.lock().await;
-        let removed = inner
-            .snapshot
-            .bindings
-            .iter()
-            .filter(|(_, binding)| binding.account_id == account)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        for key in removed {
-            remove_binding(&mut inner, &key);
+    pub async fn remove(&self, key: &ThreadKey) -> bool {
+        let key = key.0.clone();
+        match self
+            .database
+            .call(move |connection| {
+                connection.execute("delete from bindings where key = ?1", [key])?;
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                error!(%error, "affinity removal failed");
+                false
+            }
         }
-        let epoch = inner
-            .snapshot
-            .account_epochs
-            .entry(account.to_owned())
-            .or_default();
-        *epoch = epoch.saturating_add(1);
-        trim_stale_account_epochs(&mut inner.snapshot, account);
-        mark_dirty(&mut inner);
+    }
+
+    pub async fn invalidate_account(&self, account: &str) -> bool {
+        let account = account.to_owned();
+        let logged_account = account.clone();
+        match self
+            .database
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                transaction.execute("delete from bindings where account_id = ?1", [&account])?;
+                transaction.execute(
+                    "insert into account_epochs (account_id, generation) values (?1, 1) on conflict(account_id) do update set generation = generation + 1",
+                    [&account],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                error!(%error, account = logged_account, "affinity account invalidation failed");
+                false
+            }
+        }
     }
 
     pub async fn len_and_bytes(&self) -> (usize, usize) {
-        let inner = self.inner.lock().await;
-        (
-            inner.snapshot.bindings.len(),
-            snapshot_storage_bytes(&inner.snapshot, inner.binding_bytes),
-        )
-    }
-
-    pub async fn flush(&self) -> Result<()> {
-        let _flush = self.flush_lock.lock().await;
-        let Some((generation, snapshot)) = ({
-            let mut inner = self.inner.lock().await;
-            let StoreState {
-                snapshot,
-                binding_bytes,
-                ..
-            } = &mut *inner;
-            if trim(snapshot, binding_bytes, self.max_entries, self.max_bytes) {
-                mark_dirty(&mut inner);
-            }
-            if account_epoch_storage_bytes(&inner.snapshot) > ACCOUNT_EPOCH_STORAGE_BUDGET {
-                anyhow::bail!("account epoch snapshot exceeds its hard storage budget")
-            }
-            if inner.persisted_generation >= inner.generation {
-                None
-            } else {
-                Some((inner.generation, inner.snapshot.clone()))
-            }
-        }) else {
-            return Ok(());
-        };
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let bytes = serde_json::to_vec(&snapshot)?;
-            let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-            fs::create_dir_all(parent)?;
-            let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-            temp.write_all(&bytes)?;
-            temp.as_file().sync_all()?;
-            temp.persist(&path).map_err(|error| error.error)?;
-            Ok(())
-        })
-        .await
-        .context("join affinity snapshot writer")??;
-        let mut inner = self.inner.lock().await;
-        inner.persisted_generation = inner.persisted_generation.max(generation);
-        Ok(())
-    }
-}
-
-fn mark_dirty(state: &mut StoreState) {
-    state.generation = state.generation.saturating_add(1);
-}
-
-fn trim(
-    snapshot: &mut Snapshot,
-    binding_bytes: &mut usize,
-    max_entries: usize,
-    max_bytes: usize,
-) -> bool {
-    let mut changed = false;
-    while snapshot.bindings.len() > max_entries || *binding_bytes > max_bytes {
-        let Some(oldest) = snapshot
-            .bindings
-            .iter()
-            .min_by_key(|(_, v)| v.last_seen)
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        remove_snapshot_binding(snapshot, binding_bytes, &oldest);
-        changed = true;
-    }
-    changed
-}
-
-fn binding_storage_bytes(snapshot: &Snapshot) -> usize {
-    serde_json::to_vec(&snapshot.bindings).map_or(usize::MAX, |bytes| bytes.len())
-}
-
-fn snapshot_storage_bytes(snapshot: &Snapshot, binding_bytes: usize) -> usize {
-    // Exact serde_json struct overhead around the two serialized maps and the u8 version.
-    42usize
-        .saturating_add(snapshot.version.to_string().len())
-        .saturating_add(binding_bytes)
-        .saturating_add(account_epoch_storage_bytes(snapshot))
-}
-
-fn json_len(value: &impl Serialize) -> usize {
-    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
-}
-
-fn binding_entry_bytes(key: &str, binding: &Binding, has_other_entries: bool) -> usize {
-    json_len(&key)
-        .saturating_add(1)
-        .saturating_add(json_len(binding))
-        .saturating_add(usize::from(has_other_entries))
-}
-
-fn insert_binding(state: &mut StoreState, key: String, binding: Binding) {
-    if let Some(previous) = state.snapshot.bindings.insert(key.clone(), binding.clone()) {
-        state.binding_bytes = state
-            .binding_bytes
-            .saturating_sub(json_len(&previous))
-            .saturating_add(json_len(&binding));
-    } else {
-        let has_other_entries = state.snapshot.bindings.len() > 1;
-        state.binding_bytes = state.binding_bytes.saturating_add(binding_entry_bytes(
-            &key,
-            &binding,
-            has_other_entries,
-        ));
-    }
-}
-
-fn remove_binding(state: &mut StoreState, key: &str) -> Option<Binding> {
-    remove_snapshot_binding(&mut state.snapshot, &mut state.binding_bytes, key)
-}
-
-fn remove_snapshot_binding(
-    snapshot: &mut Snapshot,
-    binding_bytes: &mut usize,
-    key: &str,
-) -> Option<Binding> {
-    let had_other_entries = snapshot.bindings.len() > 1;
-    let binding = snapshot.bindings.remove(key)?;
-    *binding_bytes =
-        binding_bytes.saturating_sub(binding_entry_bytes(key, &binding, had_other_entries));
-    Some(binding)
-}
-
-fn account_epoch_storage_bytes(snapshot: &Snapshot) -> usize {
-    serde_json::to_vec(&snapshot.account_epochs).map_or(usize::MAX, |bytes| bytes.len())
-}
-
-fn trim_stale_account_epochs(snapshot: &mut Snapshot, preserve: &str) -> bool {
-    let mut changed = false;
-    while account_epoch_storage_bytes(snapshot) > ACCOUNT_EPOCH_STORAGE_BUDGET {
-        let removable = snapshot
-            .account_epochs
-            .keys()
-            .find(|account| {
-                account.as_str() != preserve
-                    && !snapshot
-                        .bindings
-                        .values()
-                        .any(|binding| binding.account_id == account.as_str())
+        let entries = match self
+            .database
+            .call(|connection| {
+                let entries = connection.query_row("select count(*) from bindings", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                usize::try_from(entries).context("negative affinity binding count")
             })
-            .cloned();
-        let Some(removable) = removable else {
-            break;
+            .await
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                error!(%error, "affinity statistics query failed");
+                0
+            }
         };
-        snapshot.account_epochs.remove(&removable);
-        changed = true;
+        let database_bytes = file_len(&self.database.path)
+            .saturating_add(file_len(&self.database.path.with_extension("sqlite3-wal")));
+        (entries, database_bytes)
     }
-    changed
+}
+
+fn open_database(database_path: &Path, legacy_path: &Path, idle: Duration) -> Result<Connection> {
+    if database_path.exists() {
+        let connection = Connection::open(database_path)
+            .with_context(|| format!("open affinity database {}", database_path.display()))?;
+        anyhow::ensure!(
+            legacy_migration_complete(&connection)?,
+            "affinity database exists without a completed legacy migration marker"
+        );
+        configure_database(&connection)?;
+        create_schema(&connection)?;
+        expire_stale_bindings(&connection, idle)?;
+        return Ok(connection);
+    }
+
+    let migration_path = sqlite_path_with_suffix(database_path, ".migrating");
+    remove_incomplete_database(&migration_path);
+    let migration = (|| {
+        let mut connection = Connection::open(&migration_path).with_context(|| {
+            format!(
+                "open affinity migration database {}",
+                migration_path.display()
+            )
+        })?;
+        configure_migration_database(&connection)?;
+        create_schema(&connection)?;
+        migrate_legacy_snapshot(&mut connection, legacy_path, idle)?;
+        expire_stale_bindings(&connection, idle)?;
+        drop(connection);
+        fs::rename(&migration_path, database_path).with_context(|| {
+            format!(
+                "publish affinity database {} as {}",
+                migration_path.display(),
+                database_path.display()
+            )
+        })?;
+        sync_parent_directory(database_path)?;
+        Ok(())
+    })();
+    if let Err(error) = migration {
+        remove_incomplete_database(&migration_path);
+        return Err(error);
+    }
+
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("open affinity database {}", database_path.display()))?;
+    configure_database(&connection)?;
+    Ok(connection)
+}
+
+fn legacy_migration_complete(connection: &Connection) -> Result<bool> {
+    let has_metadata = connection.query_row(
+        "select exists(select 1 from sqlite_master where type = 'table' and name = 'metadata')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_metadata {
+        return Ok(false);
+    }
+    Ok(connection
+        .query_row(
+            "select value from metadata where key = 'legacy_import_complete'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn remove_incomplete_database(database_path: &Path) {
+    for path in [
+        database_path.to_path_buf(),
+        sqlite_path_with_suffix(database_path, "-wal"),
+        sqlite_path_with_suffix(database_path, "-shm"),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                error!(%error, path = %path.display(), "failed to remove incomplete affinity database")
+            }
+        }
+    }
+}
+
+fn sqlite_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    value.into()
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn configure_migration_database(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "synchronous", "full")?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
+}
+
+fn configure_database(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "journal_mode", "wal")?;
+    connection.pragma_update(None, "synchronous", "normal")?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    Ok(())
+}
+
+fn create_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "
+        create table if not exists metadata (
+            key text primary key,
+            value text not null
+        );
+        create table if not exists bindings (
+            key text primary key,
+            account_id text not null,
+            last_seen integer not null,
+            account_generation integer not null
+        );
+        create index if not exists bindings_last_seen on bindings(last_seen);
+        create index if not exists bindings_account on bindings(account_id);
+        create table if not exists account_epochs (
+            account_id text primary key,
+            generation integer not null
+        );
+        ",
+    )?;
+    connection.pragma_update(None, "user_version", DATABASE_VERSION)?;
+    Ok(())
+}
+
+fn migrate_legacy_snapshot(
+    connection: &mut Connection,
+    legacy_path: &Path,
+    idle: Duration,
+) -> Result<()> {
+    let imported = connection
+        .query_row(
+            "select value from metadata where key = 'legacy_import_complete'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some();
+    if imported {
+        return Ok(());
+    }
+    let snapshot = match fs::read(legacy_path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<LegacySnapshot>(&bytes).with_context(|| {
+                format!("parse legacy affinity snapshot {}", legacy_path.display())
+            })?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read legacy affinity snapshot {}", legacy_path.display())
+            });
+        }
+    };
+    let cutoff = now().saturating_sub(idle.as_secs());
+    let transaction = connection.transaction()?;
+    let mut imported_bindings = 0usize;
+    let mut imported_epochs = 0usize;
+    if let Some(snapshot) = snapshot {
+        let _legacy_version = snapshot.version;
+        {
+            let mut insert = transaction.prepare(
+                "insert or replace into bindings (key, account_id, last_seen, account_generation) values (?1, ?2, ?3, ?4)",
+            )?;
+            for (key, binding) in snapshot.bindings {
+                if binding.last_seen < cutoff {
+                    continue;
+                }
+                insert.execute(params![
+                    key,
+                    binding.account_id,
+                    to_sql_u64(binding.last_seen, "legacy binding last_seen")?,
+                    to_sql_u64(
+                        binding.account_generation,
+                        "legacy binding account_generation",
+                    )?
+                ])?;
+                imported_bindings += 1;
+            }
+        }
+        {
+            let mut insert = transaction.prepare(
+                "insert or replace into account_epochs (account_id, generation) values (?1, ?2)",
+            )?;
+            for (account, generation) in snapshot.account_epochs {
+                insert.execute(params![
+                    account,
+                    to_sql_u64(generation, "legacy account generation")?
+                ])?;
+                imported_epochs += 1;
+            }
+        }
+    }
+    let stored_bindings = transaction.query_row("select count(*) from bindings", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let stored_bindings = usize::try_from(stored_bindings).context("negative binding count")?;
+    anyhow::ensure!(
+        stored_bindings == imported_bindings,
+        "legacy affinity migration count mismatch: imported {imported_bindings}, stored {stored_bindings}"
+    );
+    let stored_epochs =
+        transaction.query_row("select count(*) from account_epochs", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+    let stored_epochs = usize::try_from(stored_epochs).context("negative account epoch count")?;
+    anyhow::ensure!(
+        stored_epochs == imported_epochs,
+        "legacy account epoch migration count mismatch: imported {imported_epochs}, stored {stored_epochs}"
+    );
+    transaction.execute(
+        "insert into metadata (key, value) values ('legacy_import_complete', '1')",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn expire_stale_bindings(connection: &Connection, idle: Duration) -> Result<()> {
+    let cutoff = now().saturating_sub(idle.as_secs());
+    connection.execute(
+        "delete from bindings where last_seen < ?1",
+        [to_sql_u64(cutoff, "binding expiration cutoff")?],
+    )?;
+    Ok(())
+}
+
+fn cleanup_interval(idle: Duration) -> Duration {
+    Duration::from_secs(idle.as_secs().saturating_div(4).clamp(1, 60 * 60))
+}
+
+fn to_sql_u64(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("{field} exceeds SQLite integer range"))
+}
+
+fn from_sql_u64(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value).with_context(|| format!("{field} is negative"))
+}
+
+fn file_len(path: &Path) -> usize {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0)
 }
 
 fn now() -> u64 {
@@ -359,192 +573,252 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
-    #[tokio::test]
-    async fn persists_hashes_only_and_enforces_count_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("affinity.json");
-        let store = AffinityStore::load(
-            path.clone(),
-            "0123456789abcdef0123456789abcdef",
-            3,
-            10_000,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        for raw in ["raw-thread-one", "raw-thread-two", "raw-thread-three"] {
-            store.put(store.key(raw), "account".into(), 0).await;
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    fn legacy_binding(account: &str) -> Binding {
+        Binding {
+            account_id: account.into(),
+            last_seen: now(),
+            account_generation: 0,
         }
-        store.flush().await.unwrap();
-        let bytes = fs::read(&path).unwrap();
-        assert!(!String::from_utf8_lossy(&bytes).contains("raw-thread"));
-        assert_eq!(store.len_and_bytes().await.0, 3);
-        let loaded = AffinityStore::load(
-            path,
-            "0123456789abcdef0123456789abcdef",
-            2,
-            10_000,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        assert_eq!(loaded.len_and_bytes().await.0, 2);
     }
 
     #[tokio::test]
-    async fn concurrent_flushes_preserve_the_latest_generation() {
+    async fn migrates_legacy_snapshot_without_rewriting_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("affinity.json");
-        let store = Arc::new(
-            AffinityStore::load(
-                path.clone(),
-                "0123456789abcdef0123456789abcdef",
-                100,
-                100_000,
-                Duration::from_secs(60),
-            )
-            .unwrap(),
-        );
-        let mut tasks = Vec::new();
-        for index in 0..32 {
-            let store = store.clone();
-            tasks.push(tokio::spawn(async move {
-                let key = store.key(&format!("thread-{index}"));
-                store.put(key, format!("account-{index}"), 0).await;
-                store.flush().await.unwrap();
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
-        store.flush().await.unwrap();
+        let legacy_path = dir.path().join("affinity.json");
+        let snapshot = LegacySnapshot {
+            version: 0,
+            bindings: HashMap::from([
+                ("hashed-one".into(), legacy_binding("a")),
+                ("hashed-two".into(), legacy_binding("b")),
+            ]),
+            account_epochs: HashMap::from([("a".into(), 3)]),
+        };
+        let legacy_bytes = serde_json::to_vec(&snapshot).unwrap();
+        fs::write(&legacy_path, &legacy_bytes).unwrap();
 
-        let loaded = AffinityStore::load(
-            path,
-            "0123456789abcdef0123456789abcdef",
-            100,
-            100_000,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        assert_eq!(loaded.len_and_bytes().await.0, 32);
-    }
-
-    #[tokio::test]
-    async fn mutation_after_flush_remains_dirty_until_next_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = AffinityStore::load(
-            dir.path().join("affinity.json"),
-            "0123456789abcdef0123456789abcdef",
-            10,
-            100_000,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        store.put(store.key("first"), "a".into(), 0).await;
-        store.flush().await.unwrap();
-        {
-            let inner = store.inner.lock().await;
-            assert_eq!(inner.persisted_generation, inner.generation);
-        }
-        store.put(store.key("second"), "b".into(), 0).await;
-        {
-            let inner = store.inner.lock().await;
-            assert!(inner.generation > inner.persisted_generation);
-        }
-        store.flush().await.unwrap();
-        let inner = store.inner.lock().await;
-        assert_eq!(inner.persisted_generation, inner.generation);
-    }
-
-    #[tokio::test]
-    async fn cached_snapshot_size_stays_exact_across_mutations() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("affinity.json");
-        let store = AffinityStore::load(
-            path.clone(),
-            "0123456789abcdef0123456789abcdef",
-            10_000,
-            10_000_000,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        for index in 0..2_000 {
+        let store = AffinityStore::load(legacy_path.clone(), KEY, Duration::from_secs(60)).unwrap();
+        assert_eq!(store.len_and_bytes().await.0, 2);
+        assert_eq!(store.account_epoch("a").await, 3);
+        assert_eq!(
             store
-                .put(
-                    store.key(&format!("thread-{index}")),
-                    format!("account-{}", index % 3),
-                    index % 5,
-                )
-                .await;
-        }
-        store.remove(&store.key("thread-10")).await;
-        store.invalidate_account("account-2").await;
-        store.flush().await.unwrap();
+                .get(&ThreadKey("hashed-one".into()))
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        assert!(
+            store
+                .put(ThreadKey("hashed-three".into()), "c".into(), 0)
+                .await
+        );
+        assert_eq!(fs::read(legacy_path).unwrap(), legacy_bytes);
+    }
 
-        let (_, cached_bytes) = store.len_and_bytes().await;
-        assert_eq!(cached_bytes, fs::read(path).unwrap().len());
+    #[test]
+    fn existing_database_never_rereads_legacy_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("affinity.json");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&LegacySnapshot::default()).unwrap(),
+        )
+        .unwrap();
+        drop(AffinityStore::load(
+            legacy_path.clone(),
+            KEY,
+            Duration::from_secs(60),
+        ));
+        fs::write(&legacy_path, b"now-malformed").unwrap();
+
+        assert!(
+            AffinityStore::load(legacy_path, KEY, Duration::from_secs(60)).is_ok(),
+            "an existing completed database must not reread legacy JSON"
+        );
+    }
+
+    #[test]
+    fn unmarked_existing_database_fails_without_importing_legacy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("affinity.json");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&LegacySnapshot::default()).unwrap(),
+        )
+        .unwrap();
+        let database_path = dir.path().join("affinity.sqlite3");
+        drop(Connection::open(&database_path).unwrap());
+
+        let error = AffinityStore::load(legacy_path, KEY, Duration::from_secs(60))
+            .err()
+            .expect("unmarked existing database must fail closed");
+        assert!(format!("{error:#}").contains("without a completed legacy migration marker"));
+        let connection = Connection::open(database_path).unwrap();
+        assert!(!legacy_migration_complete(&connection).unwrap());
     }
 
     #[tokio::test]
-    async fn account_epochs_survive_restart_with_invalidation() {
+    async fn interrupted_first_migration_is_retried_from_legacy_state() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("affinity.json");
-        let store = AffinityStore::load(
-            path.clone(),
-            "0123456789abcdef0123456789abcdef",
-            100,
-            100_000,
-            Duration::from_secs(60),
+        let legacy_path = dir.path().join("affinity.json");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&LegacySnapshot {
+                version: 0,
+                bindings: HashMap::from([("expected".into(), legacy_binding("a"))]),
+                account_epochs: HashMap::new(),
+            })
+            .unwrap(),
         )
         .unwrap();
+        let database_path = dir.path().join("affinity.sqlite3");
+        let migration_path = sqlite_path_with_suffix(&database_path, ".migrating");
+        let connection = Connection::open(&migration_path).unwrap();
+        configure_migration_database(&connection).unwrap();
+        create_schema(&connection).unwrap();
+        connection
+            .execute(
+                "insert into bindings (key, account_id, last_seen, account_generation) values ('partial', 'wrong', 0, 0)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = AffinityStore::load(legacy_path, KEY, Duration::from_secs(60)).unwrap();
+        assert_eq!(store.len_and_bytes().await.0, 1);
+        assert!(store.get(&ThreadKey("partial".into())).await.is_none());
+        assert_eq!(
+            store
+                .get(&ThreadKey("expected".into()))
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        assert!(!migration_path.exists());
+    }
+
+    #[tokio::test]
+    async fn inserts_past_the_old_hundred_thousand_record_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("affinity.json");
+        let mut bindings = HashMap::with_capacity(100_000);
+        for index in 0..100_000 {
+            bindings.insert(format!("key-{index:06}"), legacy_binding("account"));
+        }
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&LegacySnapshot {
+                version: 0,
+                bindings,
+                account_epochs: HashMap::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = AffinityStore::load(legacy_path, KEY, Duration::from_secs(60)).unwrap();
+        assert_eq!(store.len_and_bytes().await.0, 100_000);
+        assert!(
+            store
+                .put(store.key("record-100001"), "account".into(), 0)
+                .await
+        );
+        assert_eq!(store.len_and_bytes().await.0, 100_001);
+    }
+
+    #[tokio::test]
+    async fn individual_mutations_persist_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("affinity.json");
+        let key;
+        {
+            let store =
+                AffinityStore::load(legacy_path.clone(), KEY, Duration::from_secs(60)).unwrap();
+            key = store.key("thread");
+            assert!(store.put(key.clone(), "a".into(), 0).await);
+        }
+        let restored = AffinityStore::load(legacy_path, KEY, Duration::from_secs(60)).unwrap();
+        assert_eq!(restored.get(&key).await.unwrap().account_id, "a");
+    }
+
+    #[tokio::test]
+    async fn account_invalidation_is_atomic_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("affinity.json");
+        let store = AffinityStore::load(legacy_path.clone(), KEY, Duration::from_secs(60)).unwrap();
         let old = store.key("old");
-        let new = store.key("new");
-        store.put(old.clone(), "a".into(), 0).await;
-        store.flush().await.unwrap();
-        store.invalidate_account("a").await;
+        assert!(store.put(old.clone(), "a".into(), 0).await);
+        assert!(store.invalidate_account("a").await);
+        assert!(store.get(&old).await.is_none());
         assert_eq!(store.account_epoch("a").await, 1);
-        store.put(new.clone(), "a".into(), 1).await;
-        store.flush().await.unwrap();
         drop(store);
 
-        let restored = AffinityStore::load(
-            path,
-            "0123456789abcdef0123456789abcdef",
-            100,
-            100_000,
-            Duration::from_secs(60),
-        )
-        .unwrap();
+        let restored = AffinityStore::load(legacy_path, KEY, Duration::from_secs(60)).unwrap();
         assert!(restored.get(&old).await.is_none());
         assert_eq!(restored.account_epoch("a").await, 1);
-        assert_eq!(restored.get(&new).await.unwrap().account_generation, 1);
     }
 
     #[tokio::test]
-    async fn epoch_storage_is_outside_the_binding_byte_budget() {
+    async fn stale_bindings_expire_while_store_remains_running() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("affinity.json");
-        let store = AffinityStore::load(
-            path.clone(),
-            "0123456789abcdef0123456789abcdef",
-            1,
-            2,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        store.invalidate_account("account-with-an-epoch").await;
-        store.flush().await.unwrap();
-        drop(store);
+        let legacy_path = dir.path().join("affinity.json");
+        let store = AffinityStore::load(legacy_path, KEY, Duration::from_secs(1)).unwrap();
+        let key = store.key("abandoned");
+        assert!(store.put(key.clone(), "a".into(), 0).await);
+        store
+            .database
+            .call(move |connection| {
+                connection.execute("update bindings set last_seen = 0 where key = ?1", [key.0])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
-        let restored = AffinityStore::load(
-            path,
-            "0123456789abcdef0123456789abcdef",
-            1,
-            2,
-            Duration::from_secs(60),
-        )
-        .unwrap();
-        assert_eq!(restored.account_epoch("account-with-an-epoch").await, 1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if store.len_and_bytes().await.0 == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("periodic cleanup did not expire the stale binding");
+    }
+
+    #[test]
+    fn malformed_legacy_snapshot_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("affinity.json");
+        let malformed = b"not-json";
+        fs::write(&legacy_path, malformed).unwrap();
+        let error = AffinityStore::load(legacy_path.clone(), KEY, Duration::from_secs(60))
+            .err()
+            .expect("malformed migration must fail");
+        assert!(format!("{error:#}").contains("parse legacy affinity snapshot"));
+        assert_eq!(fs::read(legacy_path).unwrap(), malformed);
+        assert!(!dir.path().join("affinity.sqlite3").exists());
+        assert!(!dir.path().join("affinity.sqlite3.migrating").exists());
+    }
+
+    #[test]
+    fn expiry_query_uses_last_seen_index() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        let detail: String = connection
+            .query_row(
+                "explain query plan delete from bindings where last_seen < ?1",
+                [0],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            detail.contains("bindings_last_seen"),
+            "query plan: {detail}"
+        );
     }
 }
