@@ -15,6 +15,7 @@ use crate::routing::{Router, RoutingSnapshot};
 #[derive(Default)]
 pub struct Stats {
     pub inflight_http: AtomicUsize,
+    pub inflight_bridge_turns: AtomicUsize,
     pub open_upgrades: AtomicUsize,
     pub active_spool_bytes: AtomicUsize,
     pub refresh_inflight: AtomicUsize,
@@ -30,6 +31,8 @@ pub struct Stats {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     pub inflight_http: usize,
+    #[serde(default)]
+    pub inflight_bridge_turns: usize,
     pub open_upgrades: usize,
     pub affinity_entries: usize,
     pub affinity_bytes: usize,
@@ -62,6 +65,7 @@ impl Stats {
         let routing = router.routing_snapshot().await;
         StatsSnapshot {
             inflight_http: self.inflight_http.load(Ordering::Relaxed),
+            inflight_bridge_turns: self.inflight_bridge_turns.load(Ordering::Relaxed),
             open_upgrades: self.open_upgrades.load(Ordering::Relaxed),
             affinity_entries,
             affinity_bytes,
