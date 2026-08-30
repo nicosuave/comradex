@@ -44,6 +44,7 @@ const MAX_REFRESH_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_OAUTH_EXPIRES_IN_SECONDS: u64 = 60 * 60;
 const MAX_OAUTH_EXPIRES_IN_SECONDS: u64 = 24 * 60 * 60;
 const ACCESS_TOKEN_EXPIRES_AT_KEY: &str = "comradex_access_token_expires_at";
+const REQUEST_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 
 type AuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -53,6 +54,7 @@ pub struct Credentials {
     pub account_id: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Resolver {
     client: AuthClient,
     locks: HashMap<PathBuf, Arc<Mutex<()>>>,
@@ -131,6 +133,33 @@ impl Resolver {
         account: &AccountConfig,
         inbound: &HeaderMap,
     ) -> Result<Credentials> {
+        self.resolve_with_timeout(account, inbound, REQUEST_AUTH_TIMEOUT)
+            .await
+    }
+
+    async fn resolve_with_timeout(
+        &self,
+        account: &AccountConfig,
+        inbound: &HeaderMap,
+        timeout: Duration,
+    ) -> Result<Credentials> {
+        let resolver = self.clone();
+        let account = account.clone();
+        let inbound = inbound.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(timeout, resolver.resolve_unbounded(&account, &inbound))
+                .await
+                .context("credential resolution timed out")?
+        })
+        .await
+        .context("join credential resolution")?
+    }
+
+    async fn resolve_unbounded(
+        &self,
+        account: &AccountConfig,
+        inbound: &HeaderMap,
+    ) -> Result<Credentials> {
         match account {
             AccountConfig::Inbound => inbound_credentials(inbound),
             AccountConfig::CodexHome { path } => {
@@ -151,6 +180,26 @@ impl Resolver {
     }
 
     pub async fn force_refresh(
+        &self,
+        account: &AccountConfig,
+        previous: &Credentials,
+    ) -> Result<Option<Credentials>> {
+        let resolver = self.clone();
+        let account = account.clone();
+        let previous = previous.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                REQUEST_AUTH_TIMEOUT,
+                resolver.force_refresh_unbounded(&account, &previous),
+            )
+            .await
+            .context("credential refresh timed out")?
+        })
+        .await
+        .context("join credential refresh")?
+    }
+
+    async fn force_refresh_unbounded(
         &self,
         account: &AccountConfig,
         previous: &Credentials,
@@ -803,6 +852,24 @@ mod tests {
             HomeAuthLock::try_acquire(&stalled_home).unwrap().is_some(),
             "timeout cancellation must release the cross-process auth lock"
         );
+    }
+
+    #[tokio::test]
+    async fn request_resolution_bounds_a_stalled_refresh_and_releases_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("stalled");
+        write_managed_auth(&home, &jwt(1, "expired"));
+        let refresh_url = serve_paused_refresh_response().await;
+        let resolver = test_resolver(&[&home], refresh_url);
+        let account = AccountConfig::CodexHome { path: home.clone() };
+
+        let error = resolver
+            .resolve_with_timeout(&account, &HeaderMap::new(), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("credential resolution timed out"));
+        assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+        assert!(resolver.lock(&home).unwrap().try_lock().is_ok());
     }
 
     #[tokio::test]

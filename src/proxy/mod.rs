@@ -39,7 +39,7 @@ use hyper_util::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
 };
 use tokio_tungstenite::{
@@ -70,6 +70,9 @@ use websocket_protocol::{
 const FILE_CREATE_RESPONSE_LIMIT: usize = 1024 * 1024;
 const RESPONSES_JSON_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 const BRIDGE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_UPSTREAM_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UNKNOWN_CONTENT_SNIFF_BYTES: usize = 4 * 1024;
 const SSE_DECODE_SLICE_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_DIRECT_CREATES: usize = 64;
@@ -107,6 +110,128 @@ struct DirectTurn {
 struct DirectUpstream {
     socket: UpgradedWebSocket,
     credentials: Credentials,
+}
+
+#[derive(Clone, Copy)]
+enum ServingLane {
+    Http,
+    Bridge,
+}
+
+struct HttpReplayContext {
+    previous_response_id: Option<String>,
+    lane: ServingLane,
+}
+
+#[derive(Clone, Copy, Default)]
+struct UploadProgress {
+    sequence: u64,
+    complete: bool,
+}
+
+struct ProgressBody {
+    inner: ProxyBody,
+    progress: watch::Sender<UploadProgress>,
+}
+
+impl Body for ProgressBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let frame = Pin::new(&mut self.inner).poll_frame(cx);
+        match &frame {
+            Poll::Ready(Some(Ok(_))) => self.progress.send_modify(|progress| {
+                progress.sequence = progress.sequence.saturating_add(1);
+            }),
+            Poll::Ready(None) => self.progress.send_modify(|progress| {
+                progress.complete = true;
+            }),
+            Poll::Pending | Poll::Ready(Some(Err(_))) => {}
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn progress_body(body: ProxyBody) -> (ProxyBody, watch::Receiver<UploadProgress>) {
+    let initial = UploadProgress {
+        complete: body.is_end_stream(),
+        ..UploadProgress::default()
+    };
+    let (progress, receiver) = watch::channel(initial);
+    (
+        BodyExt::boxed(ProgressBody {
+            inner: body,
+            progress,
+        }),
+        receiver,
+    )
+}
+
+async fn await_upstream_headers<T, F>(
+    request: F,
+    mut progress: watch::Receiver<UploadProgress>,
+    upload_idle: Duration,
+    headers_timeout: Duration,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::pin!(request);
+    let mut upload_complete = progress.borrow().complete;
+    let mut progress_open = true;
+    let initial_timeout = if upload_complete {
+        headers_timeout
+    } else {
+        upload_idle
+    };
+    let idle = tokio::time::sleep(initial_timeout);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            result = &mut request => return result,
+            changed = progress.changed(), if progress_open && !upload_complete => {
+                if changed.is_err() {
+                    progress_open = false;
+                    continue;
+                }
+                let current = *progress.borrow_and_update();
+                upload_complete = current.complete;
+                let timeout = if upload_complete { headers_timeout } else { upload_idle };
+                idle.as_mut().reset(tokio::time::Instant::now() + timeout);
+            }
+            _ = &mut idle => {
+                if upload_complete {
+                    anyhow::bail!("upstream response headers timed out after request upload")
+                }
+                anyhow::bail!("upstream request upload idle timeout")
+            }
+        }
+    }
+}
+
+async fn next_body_frame_with_idle<B>(
+    body: &mut B,
+    idle: Duration,
+    context: &'static str,
+) -> Result<Option<Result<Frame<B::Data>, B::Error>>>
+where
+    B: Body + Unpin,
+{
+    tokio::time::timeout(idle, body.frame())
+        .await
+        .with_context(|| context)
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +584,7 @@ pub struct App {
     upgrade_client: UpgradeHttpClient,
     stats: Arc<Stats>,
     http_slots: Arc<Semaphore>,
+    bridge_turn_slots: Arc<Semaphore>,
     upgrade_slots: Arc<Semaphore>,
     bridge_sessions: AsyncMutex<HashMap<u64, BridgeSessionEntry>>,
     bridge_sessions_changed: Arc<Notify>,
@@ -503,6 +629,7 @@ impl App {
         )?);
         Ok(Arc::new(Self {
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
+            bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),
             bridge_sessions: AsyncMutex::new(HashMap::new()),
             bridge_sessions_changed: Arc::new(Notify::new()),
@@ -672,11 +799,7 @@ impl App {
         listener: ListenerConfig,
     ) -> Result<Response<ProxyBody>, Infallible> {
         let response = if self.service_health_path(req.uri()) {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/json")
-                .body(json_body(serde_json::json!({"status":"ok"})))
-                .expect("static health response is valid")
+            self.health_response()
         } else {
             match self.authorized_path(req.uri()) {
                 None => error_response(StatusCode::NOT_FOUND, "not_found", "unknown proxy path"),
@@ -701,25 +824,10 @@ impl App {
                         .await
                         .unwrap_or_else(internal_error),
                 },
-                Some(path) => {
-                    let permit = match self.http_slots.clone().try_acquire_owned() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return Ok(error_response(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "at_capacity",
-                                "HTTP request limit reached",
-                            ));
-                        }
-                    };
-                    let _inflight = InflightGuard::new(&self.stats.inflight_http);
-                    let result = self
-                        .handle_http(req, &listener, path)
-                        .await
-                        .unwrap_or_else(internal_error);
-                    drop(permit);
-                    result
-                }
+                Some(path) => self
+                    .handle_http(req, &listener, path)
+                    .await
+                    .unwrap_or_else(internal_error),
             }
         };
         Ok(response)
@@ -731,6 +839,26 @@ impl App {
                 .service_nonce
                 .as_deref()
                 .is_some_and(|nonce| uri.path() == format!("/__comradex_health/{nonce}"))
+    }
+
+    fn health_response(&self) -> Response<ProxyBody> {
+        let http_saturated = self.http_slots.available_permits() == 0;
+        let bridge_saturated = self.bridge_turn_slots.available_permits() == 0;
+        Response::builder()
+            .status(if http_saturated || bridge_saturated {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            })
+            .header(CONTENT_TYPE, "application/json")
+            .body(json_body(serde_json::json!({
+                "status": if http_saturated || bridge_saturated { "saturated" } else { "ok" },
+                "inflight_http": self.stats.inflight_http.load(Ordering::Relaxed),
+                "inflight_bridge_turns": self.stats.inflight_bridge_turns.load(Ordering::Relaxed),
+                "http_saturated": http_saturated,
+                "bridge_saturated": bridge_saturated,
+            })))
+            .expect("static health response is valid")
     }
 
     fn authorized_path(&self, uri: &Uri) -> Option<String> {
@@ -768,8 +896,15 @@ impl App {
             self.stats.clone(),
         )
         .await?;
-        self.handle_http_replay(inbound_headers, method, listener, path, replay)
-            .await
+        self.handle_http_replay(
+            inbound_headers,
+            method,
+            listener,
+            path,
+            replay,
+            ServingLane::Http,
+        )
+        .await
     }
 
     async fn handle_http_replay(
@@ -779,6 +914,7 @@ impl App {
         listener: &ListenerConfig,
         path: String,
         replay: ReplayBody,
+        lane: ServingLane,
     ) -> Result<Response<ProxyBody>> {
         self.handle_http_replay_with_routing_anchor(
             inbound_headers,
@@ -786,7 +922,10 @@ impl App {
             listener,
             path,
             replay,
-            None,
+            HttpReplayContext {
+                previous_response_id: None,
+                lane,
+            },
         )
         .await
     }
@@ -798,8 +937,12 @@ impl App {
         listener: &ListenerConfig,
         mut path: String,
         mut replay: ReplayBody,
-        routing_previous_response_id: Option<String>,
+        context: HttpReplayContext,
     ) -> Result<Response<ProxyBody>> {
+        let HttpReplayContext {
+            previous_response_id: routing_previous_response_id,
+            lane,
+        } = context;
         let legacy_compact = method == Method::POST && is_legacy_compact_path(&path);
         if legacy_compact {
             let bytes = replay.into_bytes().await?;
@@ -930,17 +1073,41 @@ impl App {
                 .auth
                 .resolve(&self.config.accounts[&account], &inbound_headers)
                 .await?;
+            let (slots, counter, capacity_message) = match lane {
+                ServingLane::Http => (
+                    self.http_slots.clone(),
+                    &self.stats.inflight_http,
+                    "HTTP request limit reached",
+                ),
+                ServingLane::Bridge => (
+                    self.bridge_turn_slots.clone(),
+                    &self.stats.inflight_bridge_turns,
+                    "HTTP bridge turn limit reached",
+                ),
+            };
+            let _permit = match slots.try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Ok(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "at_capacity",
+                        capacity_message,
+                    ));
+                }
+            };
+            let _inflight = InflightGuard::new(counter);
             self.router.begin(&account).await;
             let mut request_lease = DirectAccountLease::new(self.router.clone(), account.clone());
-            let result = self
-                .send_http(
-                    &method,
-                    &path,
-                    &inbound_headers,
-                    credentials.clone(),
-                    replay.body(attempt)?,
-                )
-                .await;
+            let (body, upload_progress) = progress_body(replay.body(attempt)?);
+            let result = await_upstream_headers(
+                self.send_http(&method, &path, &inbound_headers, credentials.clone(), body),
+                upload_progress,
+                HTTP_UPSTREAM_UPLOAD_IDLE_TIMEOUT,
+                HTTP_UPSTREAM_HEADERS_TIMEOUT,
+            )
+            .await;
+            // Keep lane admission through response classification and the bounded file/compact
+            // collectors below. Streaming responses release it when this function returns.
             match result {
                 Ok(response) => {
                     if nonportable_payload {
@@ -1123,7 +1290,13 @@ impl App {
     ) -> Result<Response<ProxyBody>> {
         let (mut parts, mut body) = response.into_parts();
         let mut bytes = bytes::BytesMut::new();
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = next_body_frame_with_idle(
+            &mut body,
+            HTTP_RESPONSE_BODY_IDLE_TIMEOUT,
+            "file-create response body idle timeout",
+        )
+        .await?
+        {
             let frame = frame.context("read file-create response")?;
             let Ok(data) = frame.into_data() else {
                 continue;
@@ -1159,7 +1332,13 @@ impl App {
     ) -> Result<Response<ProxyBody>> {
         let (mut parts, mut body) = response.into_parts();
         let mut bytes = bytes::BytesMut::new();
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = next_body_frame_with_idle(
+            &mut body,
+            HTTP_RESPONSE_BODY_IDLE_TIMEOUT,
+            "file-finalization response body idle timeout",
+        )
+        .await?
+        {
             let frame = frame.context("read file-finalization response")?;
             let Ok(data) = frame.into_data() else {
                 continue;
@@ -1531,18 +1710,6 @@ impl App {
                             let _turn_guard = turn_guard;
                             let dispatch_deadline =
                                 tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT;
-                            let _http_permit = match app.http_slots.clone().try_acquire_owned() {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    send_ws_error(
-                                        &outbound,
-                                        "server_busy",
-                                        "HTTP request limit reached",
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            };
                             let replay = match ReplayBody::from_bytes(
                                 body,
                                 app.config.proxy.max_request_bytes,
@@ -1568,7 +1735,10 @@ impl App {
                                     &listener,
                                     path,
                                     replay,
-                                    routing_previous_response_id,
+                                    HttpReplayContext {
+                                        previous_response_id: routing_previous_response_id,
+                                        lane: ServingLane::Bridge,
+                                    },
                                 ),
                             )
                             .await
@@ -3201,7 +3371,13 @@ async fn map_legacy_compact_response(response: Response<Incoming>) -> Result<Res
     let mut completed = None;
     let mut output = Vec::<(usize, serde_json::Value)>::new();
     let mut received = 0usize;
-    while let Some(frame) = body.frame().await {
+    while let Some(frame) = next_body_frame_with_idle(
+        &mut body,
+        HTTP_RESPONSE_BODY_IDLE_TIMEOUT,
+        "compact response body idle timeout",
+    )
+    .await?
+    {
         let frame = frame.context("read compact response")?;
         let Ok(data) = frame.into_data() else {
             continue;
@@ -3375,6 +3551,7 @@ fn map_http_response_leased(
             pending_frame: None,
             pending_binding: None,
             pending_end: false,
+            idle: Box::pin(tokio::time::sleep(HTTP_RESPONSE_BODY_IDLE_TIMEOUT)),
         }),
     )
 }
@@ -3387,6 +3564,7 @@ struct LeasedIncoming {
     pending_frame: Option<Frame<bytes::Bytes>>,
     pending_binding: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
     pending_end: bool,
+    idle: Pin<Box<tokio::time::Sleep>>,
 }
 
 enum HttpResponseObserver {
@@ -3481,6 +3659,12 @@ impl Body for LeasedIncoming {
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         loop {
+            if self.idle.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upstream response body idle timeout",
+                ))));
+            }
             if let Some(binding) = self.pending_binding.as_mut() {
                 if binding.as_mut().poll(cx).is_pending() {
                     return Poll::Pending;
@@ -3501,6 +3685,9 @@ impl Body for LeasedIncoming {
                     return Poll::Ready(Some(Err(std::io::Error::other(error))));
                 }
                 Poll::Ready(Some(Ok(frame))) => {
+                    self.idle
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + HTTP_RESPONSE_BODY_IDLE_TIMEOUT);
                     let ids = frame
                         .data_ref()
                         .map(|data| self.observe_response_data(data))
@@ -4326,7 +4513,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_inflight_counter_clears_when_connection_task_is_aborted() {
+    async fn stalled_bridge_turns_cannot_exhaust_http_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _, _, stats) = direct_test_app(dir.path());
+        let bridge_permits = (0..app.config.proxy.max_inflight)
+            .map(|_| app.bridge_turn_slots.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let _bridge_inflight = (0..bridge_permits.len())
+            .map(|_| InflightGuard::new(&stats.inflight_bridge_turns))
+            .collect::<Vec<_>>();
+
+        assert_eq!(app.bridge_turn_slots.available_permits(), 0);
+        assert!(app.http_slots.clone().try_acquire_owned().is_ok());
+        assert_eq!(stats.inflight_http.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.inflight_bridge_turns.load(Ordering::Relaxed),
+            app.config.proxy.max_inflight
+        );
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_saturated_serving_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _, _, stats) = direct_test_app(dir.path());
+        let permits = (0..app.config.proxy.max_inflight)
+            .map(|_| app.bridge_turn_slots.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let _inflight = (0..permits.len())
+            .map(|_| InflightGuard::new(&stats.inflight_bridge_turns))
+            .collect::<Vec<_>>();
+
+        let response = app.health_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["status"], "saturated");
+        assert_eq!(body["http_saturated"], false);
+        assert_eq!(body["bridge_saturated"], true);
+    }
+
+    #[tokio::test]
+    async fn stalled_request_body_does_not_consume_http_admission() {
         let dir = tempfile::tempdir().unwrap();
         let (app, mut listener, _, stats) = direct_test_app(dir.path());
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4343,19 +4571,75 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while stats.inflight_http.load(Ordering::Relaxed) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("request should acquire an in-flight slot");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(stats.inflight_http.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            app.http_slots.available_permits(),
+            app.config.proxy.max_inflight
+        );
 
         app.shutdown_connections().await;
         assert_eq!(stats.inflight_http.load(Ordering::Relaxed), 0);
 
         drop(stream);
         proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn continuous_upload_progress_is_not_a_total_request_deadline() {
+        let (progress, receiver) = watch::channel(UploadProgress::default());
+        let request = async move {
+            for sequence in 1..=4 {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                progress.send_modify(|state| state.sequence = sequence);
+            }
+            progress.send_modify(|state| state.complete = true);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            Ok::<_, anyhow::Error>("headers")
+        };
+
+        let result = await_upstream_headers(
+            request,
+            receiver,
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "headers");
+    }
+
+    #[tokio::test]
+    async fn header_wait_gets_a_fresh_deadline_after_upload_completion() {
+        let (progress, receiver) = watch::channel(UploadProgress::default());
+        let request = async move {
+            progress.send_modify(|state| state.complete = true);
+            std::future::pending::<Result<()>>().await
+        };
+
+        let error = await_upstream_headers(
+            request,
+            receiver,
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("headers timed out after request upload"));
+    }
+
+    #[tokio::test]
+    async fn buffered_response_reads_have_an_idle_deadline() {
+        let stream = futures_util::stream::pending::<std::io::Result<Frame<Bytes>>>();
+        let mut body = BodyExt::boxed(http_body_util::StreamBody::new(stream));
+        let error = next_body_frame_with_idle(
+            &mut body,
+            Duration::from_millis(25),
+            "buffered body idle timeout",
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("buffered body idle timeout"));
     }
 
     #[test]
@@ -5361,9 +5645,16 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
                 .body(Full::new(payload.clone()))
                 .unwrap();
             let response = client.request(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()["x-codex-turn-state"], "opaque-state");
+            let status = response.status();
+            let turn_state = response.headers().get("x-codex-turn-state").cloned();
             let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "unexpected compact response: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(turn_state.unwrap(), "opaque-state");
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["object"], "response.compact");
             assert_eq!(body["id"], "resp_compact");

@@ -1,6 +1,6 @@
 use std::{
     fs::File as StdFile,
-    io::{Read, Write},
+    io::Read,
     sync::{Arc, atomic::Ordering},
 };
 
@@ -16,6 +16,8 @@ use tempfile::NamedTempFile;
 use tokio_util::io::ReaderStream;
 
 use crate::state::Stats;
+
+const REQUEST_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
@@ -354,14 +356,20 @@ impl ReplayBody {
     ) -> Result<Self> {
         let mut incoming = incoming;
         let mut memory = Vec::new();
-        let mut temp: Option<NamedTempFile> = None;
+        let mut temp: Option<(tokio::fs::File, tempfile::TempPath)> = None;
         let mut len = 0usize;
         let mut reservation = Reservation {
             stats: stats.clone(),
             bytes: 0,
         };
         let mut metadata = MetadataScanner::default();
-        while let Some(frame) = incoming.frame().await {
+        loop {
+            let Some(frame) = tokio::time::timeout(REQUEST_BODY_IDLE_TIMEOUT, incoming.frame())
+                .await
+                .context("request body idle timeout")?
+            else {
+                break;
+            };
             let frame = frame.context("read request body")?;
             let Ok(data) = frame.into_data() else {
                 continue;
@@ -378,19 +386,26 @@ impl ReplayBody {
                 memory.extend_from_slice(&data);
             } else {
                 if temp.is_none() {
-                    let mut file = NamedTempFile::new().context("create replay spool")?;
-                    file.write_all(&memory)?;
+                    let file = tokio::task::spawn_blocking(NamedTempFile::new)
+                        .await
+                        .context("join replay spool creation")?
+                        .context("create replay spool")?;
+                    let (file, path) = file.into_parts();
+                    let mut file = tokio::fs::File::from_std(file);
+                    tokio::io::AsyncWriteExt::write_all(&mut file, &memory).await?;
                     memory.clear();
-                    temp = Some(file);
+                    temp = Some((file, path));
                 }
-                temp.as_mut().expect("created").write_all(&data)?;
+                tokio::io::AsyncWriteExt::write_all(&mut temp.as_mut().expect("created").0, &data)
+                    .await?;
             }
         }
-        let storage = if let Some(file) = temp {
-            file.as_file().sync_data()?;
-            let one = StdFile::open(file.path())?;
-            let two = StdFile::open(file.path())?;
+        let storage = if let Some((file, path)) = temp {
+            file.sync_data().await?;
             drop(file);
+            let one = tokio::fs::File::open(&path).await?.into_std().await;
+            let two = tokio::fs::File::open(&path).await?.into_std().await;
+            drop(path);
             Storage::Files(vec![Some(one), Some(two)])
         } else {
             Storage::Memory(Bytes::from(memory))

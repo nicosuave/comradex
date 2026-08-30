@@ -533,8 +533,8 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
     match snapshot {
         Some(stats) => {
             println!(
-                "  {} request(s) in flight, {} open connection(s)",
-                stats.inflight_http, stats.open_upgrades
+                "  {} HTTP request(s) and {} bridge turn(s) in flight, {} open connection(s)",
+                stats.inflight_http, stats.inflight_bridge_turns, stats.open_upgrades
             );
             println!(
                 "  {} sticky conversation(s) remembered ({})",

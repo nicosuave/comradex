@@ -1017,6 +1017,7 @@ kind = "inbound"
         let router = Arc::new(Router::new(&config, affinity));
         let stats = Arc::new(Stats::default());
         stats.inflight_http.store(4, Ordering::Relaxed);
+        stats.inflight_bridge_turns.store(7, Ordering::Relaxed);
         let server = ControlServer::bind(
             &state_dir,
             config_path.clone(),
@@ -1062,6 +1063,7 @@ kind = "inbound"
         let status = ui_status.status.unwrap();
         assert!(status.daemon_running);
         assert_eq!(status.traffic.inflight_http, 4);
+        assert_eq!(status.traffic.inflight_bridge_turns, 7);
         assert_eq!(status.accounts.len(), 2);
         let encoded = serde_json::to_string(&status).unwrap();
         assert!(!encoded.contains("0123456789abcdef"));
