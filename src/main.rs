@@ -23,6 +23,42 @@ use rand::RngCore;
 use tokio::signal;
 use tracing::{info, warn};
 
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One process-shutdown budget shared by async cleanup and Tokio runtime
+/// destruction. Calling `begin` more than once never extends the deadline.
+struct ShutdownBudget {
+    timeout: Duration,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl ShutdownBudget {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            deadline: None,
+        }
+    }
+
+    fn begin(&mut self) -> tokio::time::Instant {
+        self.begin_at(tokio::time::Instant::now())
+    }
+
+    fn begin_at(&mut self, now: tokio::time::Instant) -> tokio::time::Instant {
+        *self.deadline.get_or_insert(now + self.timeout)
+    }
+
+    fn remaining(&self) -> Duration {
+        self.remaining_at(tokio::time::Instant::now())
+    }
+
+    fn remaining_at(&self, now: tokio::time::Instant) -> Duration {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(self.timeout)
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "comradex", version, about)]
 struct Cli {
@@ -123,8 +159,22 @@ enum ServiceCommand {
     Restart,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build Tokio runtime")?;
+    let mut shutdown_budget = ShutdownBudget::new(SHUTDOWN_TIMEOUT);
+    let result = runtime.block_on(run(&mut shutdown_budget));
+
+    // Dropping a Tokio runtime can otherwise wait indefinitely for
+    // `spawn_blocking` work. Use whatever remains of the same absolute
+    // shutdown budget used by `serve`'s async cleanup.
+    runtime.shutdown_timeout(shutdown_budget.remaining());
+    result
+}
+
+async fn run(shutdown_budget: &mut ShutdownBudget) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -148,7 +198,7 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        CommandName::Serve => serve(&config_path).await,
+        CommandName::Serve => serve(&config_path, shutdown_budget).await,
         CommandName::Install {
             codex_config,
             listener,
@@ -254,7 +304,7 @@ kind = "inbound"
     Ok(())
 }
 
-async fn serve(path: &Path) -> Result<()> {
+async fn serve(path: &Path, shutdown_budget: &mut ShutdownBudget) -> Result<()> {
     let config_path =
         fs::canonicalize(path).with_context(|| format!("resolve config {}", path.display()))?;
     let config = Arc::new(load_config(path)?);
@@ -288,6 +338,7 @@ async fn serve(path: &Path) -> Result<()> {
     let background_app = app.clone();
     let background = tokio::spawn(async move {
         let mut interval = tokio::time::interval(background_config.snapshot_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             if let Err(e) = background_router.affinity.flush().await {
@@ -312,6 +363,7 @@ async fn serve(path: &Path) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(
             comradex::auth::PROACTIVE_REFRESH_INTERVAL_SECONDS,
         ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             let now = SystemTime::now()
@@ -343,22 +395,61 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
     info!("shutting down");
+    let shutdown_deadline = shutdown_budget.begin();
     background.abort();
-    let _ = background.await;
     if !control_task.is_finished() {
         control_task.abort();
-        let _ = control_task.await;
     }
     refresh_background.abort();
-    let _ = refresh_background.await;
     tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    app.shutdown_connections().await;
-    router.clear_inflight().await;
-    router.affinity.flush().await?;
-    app.flush_file_owners().await?;
-    stats.write(state.join("stats.json"), &router).await?;
+    let shutdown_result = tokio::time::timeout_at(shutdown_deadline, async {
+        let _ = background.await;
+        let _ = control_task.await;
+        let _ = refresh_background.await;
+        while tasks.join_next().await.is_some() {}
+
+        app.shutdown_connections().await;
+        router.clear_inflight().await;
+
+        // Attempt every final snapshot even if an earlier one fails so the
+        // remaining shutdown diagnostics are still as fresh as possible.
+        let mut first_error = None;
+        if let Err(error) = router.affinity.flush().await {
+            warn!(error = %error, "final affinity snapshot failed");
+            first_error = Some(error.context("final affinity snapshot failed"));
+        }
+        if let Err(error) = app.flush_file_owners().await {
+            warn!(error = %error, "final file-owner snapshot failed");
+            if first_error.is_none() {
+                first_error = Some(error.context("final file-owner snapshot failed"));
+            }
+        }
+        if let Err(error) = stats.write(state.join("stats.json"), &router).await {
+            warn!(error = %error, "final stats snapshot failed");
+            if first_error.is_none() {
+                first_error = Some(error.context("final stats snapshot failed"));
+            }
+        }
+        first_error
+    })
+    .await;
+    let shutdown_error = match shutdown_result {
+        Ok(error) => error,
+        Err(_) => {
+            warn!(
+                timeout_seconds = SHUTDOWN_TIMEOUT.as_secs(),
+                "shutdown deadline exceeded; exiting without waiting for remaining cleanup"
+            );
+            Some(anyhow::anyhow!(
+                "shutdown did not complete within {} seconds",
+                SHUTDOWN_TIMEOUT.as_secs()
+            ))
+        }
+    };
     if let Some(error) = listener_error {
+        return Err(error);
+    }
+    if let Some(error) = shutdown_error {
         return Err(error);
     }
     Ok(())
@@ -883,6 +974,29 @@ mod tests {
         .unwrap();
 
         assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+    }
+
+    #[test]
+    fn shutdown_budget_uses_one_absolute_deadline() {
+        let start = tokio::time::Instant::now();
+        let mut budget = ShutdownBudget::new(Duration::from_secs(15));
+
+        assert_eq!(budget.remaining_at(start), Duration::from_secs(15));
+        let deadline = budget.begin_at(start);
+        assert_eq!(deadline, start + Duration::from_secs(15));
+        assert_eq!(
+            budget.begin_at(start + Duration::from_secs(10)),
+            deadline,
+            "starting another shutdown phase must not extend the deadline"
+        );
+        assert_eq!(
+            budget.remaining_at(start + Duration::from_secs(4)),
+            Duration::from_secs(11)
+        );
+        assert_eq!(
+            budget.remaining_at(start + Duration::from_secs(20)),
+            Duration::ZERO
+        );
     }
 
     #[test]

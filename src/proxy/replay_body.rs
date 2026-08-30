@@ -2,6 +2,7 @@ use std::{
     fs::File as StdFile,
     io::{Read, Write},
     sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -10,9 +11,10 @@ use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{
     Error as HyperError,
-    body::{Frame, Incoming},
+    body::{Body, Frame, Incoming},
 };
 use tempfile::NamedTempFile;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::io::ReaderStream;
 
 use crate::state::Stats;
@@ -283,17 +285,19 @@ struct Reservation {
 
 impl Reservation {
     fn add(&mut self, amount: usize, limit: usize) -> Result<()> {
-        let previous = self
-            .stats
+        let reserved = self
+            .bytes
+            .checked_add(amount)
+            .context("replay reservation overflow")?;
+        self.stats
             .active_spool_bytes
-            .fetch_add(amount, Ordering::AcqRel);
-        if previous.saturating_add(amount) > limit {
-            self.stats
-                .active_spool_bytes
-                .fetch_sub(amount, Ordering::AcqRel);
-            bail!("global replay spool limit exceeded")
-        }
-        self.bytes += amount;
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(amount)
+                    .filter(|&updated| updated <= limit)
+            })
+            .map_err(|_| anyhow::anyhow!("global replay spool limit exceeded"))?;
+        self.bytes = reserved;
         Ok(())
     }
 }
@@ -311,6 +315,71 @@ enum Storage {
     Files(Vec<Option<StdFile>>),
 }
 
+/// A bounded handoff to a blocking spool writer.
+///
+/// Dropping this value closes the channel. That makes cancellation release the
+/// worker and its `NamedTempFile` without doing filesystem work on a Tokio
+/// executor thread.
+struct SpoolWriter {
+    sender: Option<mpsc::Sender<SpoolCommand>>,
+    task: JoinHandle<Result<Storage>>,
+}
+
+enum SpoolCommand {
+    Write(Bytes),
+    Finish,
+}
+
+impl SpoolWriter {
+    fn start(initial: Vec<u8>) -> Self {
+        // A small queue bounds memory growth while still allowing the reader and
+        // filesystem to make progress independently.
+        let (sender, mut receiver) = mpsc::channel::<SpoolCommand>(2);
+        let task = tokio::task::spawn_blocking(move || {
+            let mut file = NamedTempFile::new().context("create replay spool")?;
+            file.write_all(&initial).context("seed replay spool")?;
+            loop {
+                match receiver.blocking_recv() {
+                    Some(SpoolCommand::Write(chunk)) => {
+                        file.write_all(&chunk).context("write replay spool")?;
+                    }
+                    Some(SpoolCommand::Finish) => break,
+                    None => bail!("replay spool cancelled"),
+                }
+            }
+            file.as_file().sync_data().context("sync replay spool")?;
+            let one = file.reopen().context("open first replay spool reader")?;
+            let two = file.reopen().context("open second replay spool reader")?;
+            drop(file);
+            Ok(Storage::Files(vec![Some(one), Some(two)]))
+        });
+        Self {
+            sender: Some(sender),
+            task,
+        }
+    }
+
+    async fn write(&self, bytes: Bytes) -> Result<()> {
+        self.sender
+            .as_ref()
+            .context("replay spool already finalized")?
+            .send(SpoolCommand::Write(bytes))
+            .await
+            .map_err(|_| anyhow::anyhow!("replay spool writer stopped"))
+    }
+
+    async fn finish(mut self) -> Result<Storage> {
+        self.sender
+            .as_ref()
+            .context("replay spool already finalized")?
+            .send(SpoolCommand::Finish)
+            .await
+            .map_err(|_| anyhow::anyhow!("replay spool writer stopped"))?;
+        self.sender.take();
+        self.task.await.context("join replay spool writer")?
+    }
+}
+
 impl ReplayBody {
     pub fn from_bytes(
         bytes: Bytes,
@@ -321,17 +390,14 @@ impl ReplayBody {
         if bytes.len() > hard_limit {
             bail!("request body exceeds configured limit")
         }
-        let previous = stats
-            .active_spool_bytes
-            .fetch_add(bytes.len(), Ordering::AcqRel);
-        if previous.saturating_add(bytes.len()) > global_limit {
-            stats
-                .active_spool_bytes
-                .fetch_sub(bytes.len(), Ordering::AcqRel);
-            bail!("global replay spool limit exceeded")
-        }
+        let mut reservation = Reservation {
+            stats: stats.clone(),
+            bytes: 0,
+        };
+        reservation.add(bytes.len(), global_limit)?;
         let mut metadata = MetadataScanner::default();
         metadata.feed(&bytes);
+        reservation.bytes = 0;
         Ok(Self {
             len: bytes.len(),
             storage: Storage::Memory(bytes),
@@ -345,23 +411,88 @@ impl ReplayBody {
         })
     }
 
-    pub async fn read(
+    /// Read a replayable request body with both an idle timeout between frames
+    /// and a total ingress deadline.
+    pub async fn read_with_timeouts(
         incoming: Incoming,
         memory_limit: usize,
         hard_limit: usize,
         global_limit: usize,
         stats: Arc<Stats>,
+        idle_timeout: Duration,
+        total_timeout: Duration,
     ) -> Result<Self> {
-        let mut incoming = incoming;
+        Self::read_body_with_timeouts(
+            incoming,
+            memory_limit,
+            hard_limit,
+            global_limit,
+            stats,
+            idle_timeout,
+            total_timeout,
+        )
+        .await
+    }
+
+    async fn read_body_with_timeouts<B>(
+        incoming: B,
+        memory_limit: usize,
+        hard_limit: usize,
+        global_limit: usize,
+        stats: Arc<Stats>,
+        idle_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Result<Self>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        tokio::time::timeout(
+            total_timeout,
+            Self::read_body(
+                incoming,
+                memory_limit,
+                hard_limit,
+                global_limit,
+                stats,
+                Some(idle_timeout),
+            ),
+        )
+        .await
+        .context("request body total ingress timeout")?
+    }
+
+    async fn read_body<B>(
+        mut incoming: B,
+        memory_limit: usize,
+        hard_limit: usize,
+        global_limit: usize,
+        stats: Arc<Stats>,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Self>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let mut memory = Vec::new();
-        let mut temp: Option<NamedTempFile> = None;
+        let mut spool: Option<SpoolWriter> = None;
         let mut len = 0usize;
         let mut reservation = Reservation {
             stats: stats.clone(),
             bytes: 0,
         };
         let mut metadata = MetadataScanner::default();
-        while let Some(frame) = incoming.frame().await {
+        loop {
+            let next = if let Some(idle_timeout) = idle_timeout {
+                tokio::time::timeout(idle_timeout, incoming.frame())
+                    .await
+                    .context("request body idle timeout")?
+            } else {
+                incoming.frame().await
+            };
+            let Some(frame) = next else {
+                break;
+            };
             let frame = frame.context("read request body")?;
             let Ok(data) = frame.into_data() else {
                 continue;
@@ -374,24 +505,17 @@ impl ReplayBody {
             }
             reservation.add(data.len(), global_limit)?;
             metadata.feed(&data);
-            if temp.is_none() && len <= memory_limit {
+            if spool.is_none() && len <= memory_limit {
                 memory.extend_from_slice(&data);
             } else {
-                if temp.is_none() {
-                    let mut file = NamedTempFile::new().context("create replay spool")?;
-                    file.write_all(&memory)?;
-                    memory.clear();
-                    temp = Some(file);
+                if spool.is_none() {
+                    spool = Some(SpoolWriter::start(std::mem::take(&mut memory)));
                 }
-                temp.as_mut().expect("created").write_all(&data)?;
+                spool.as_ref().expect("created").write(data).await?;
             }
         }
-        let storage = if let Some(file) = temp {
-            file.as_file().sync_data()?;
-            let one = StdFile::open(file.path())?;
-            let two = StdFile::open(file.path())?;
-            drop(file);
-            Storage::Files(vec![Some(one), Some(two)])
+        let storage = if let Some(spool) = spool {
+            spool.finish().await?
         } else {
             Storage::Memory(Bytes::from(memory))
         };
@@ -513,7 +637,15 @@ fn never_to_io(never: std::convert::Infallible) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::{io, sync::atomic::Ordering, time::Duration};
+
+    use futures_util::{StreamExt, stream};
+
     use super::*;
+
+    fn data_frame(bytes: &'static [u8]) -> Result<Frame<Bytes>, io::Error> {
+        Ok(Frame::data(Bytes::from_static(bytes)))
+    }
 
     #[test]
     fn finds_body_thread_id_across_chunks_without_retaining_other_strings() {
@@ -562,5 +694,141 @@ mod tests {
             br#"{"input":[{"type":"message","role":"user","content":"hello\nworld"}],"reasoning":{"effort":"high"}}"#,
         );
         assert!(!portable.nonportable_state);
+    }
+
+    #[tokio::test]
+    async fn spills_without_blocking_and_preserves_two_replays() {
+        let stats = Arc::new(Stats::default());
+        let incoming = StreamBody::new(stream::iter([
+            data_frame(br#"{"client_metadata":{"thread_id":"thread-spilled"},"input":""#),
+            data_frame(b"large-body"),
+            data_frame(br#""}"#),
+        ]));
+        let mut replay = ReplayBody::read_body(incoming, 8, 1_024, 1_024, stats.clone(), None)
+            .await
+            .expect("spool request body");
+
+        let expected = Bytes::from_static(
+            br#"{"client_metadata":{"thread_id":"thread-spilled"},"input":"large-body"}"#,
+        );
+        assert!(matches!(&replay.storage, Storage::Files(_)));
+        assert_eq!(replay.thread_id(), Some("thread-spilled"));
+        assert_eq!(
+            stats.active_spool_bytes.load(Ordering::Acquire),
+            expected.len()
+        );
+
+        let first = replay
+            .body(0)
+            .expect("first replay")
+            .collect()
+            .await
+            .expect("read first replay")
+            .to_bytes();
+        let second = replay
+            .body(1)
+            .expect("second replay")
+            .collect()
+            .await
+            .expect("read second replay")
+            .to_bytes();
+        assert_eq!(first, second);
+        assert_eq!(first, expected);
+        assert!(replay.body(0).is_err());
+
+        drop(replay);
+        assert_eq!(stats.active_spool_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_spool_reservation() {
+        let stats = Arc::new(Stats::default());
+        let incoming = StreamBody::new(
+            stream::iter([data_frame(b"spill-me")])
+                .chain(stream::pending::<Result<Frame<Bytes>, io::Error>>()),
+        );
+        let task_stats = stats.clone();
+        let task = tokio::spawn(async move {
+            ReplayBody::read_body(incoming, 1, 1_024, 1_024, task_stats, None).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.active_spool_bytes.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("body reader reserved spool bytes");
+        task.abort();
+        let join_error = match task.await {
+            Err(error) => error,
+            Ok(_) => panic!("reader completed instead of being cancelled"),
+        };
+        assert!(join_error.is_cancelled());
+        assert_eq!(stats.active_spool_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_and_total_timeouts_release_reservations() {
+        let stats = Arc::new(Stats::default());
+        let stalled = StreamBody::new(
+            stream::iter([data_frame(b"started")])
+                .chain(stream::pending::<Result<Frame<Bytes>, io::Error>>()),
+        );
+        let error = ReplayBody::read_body_with_timeouts(
+            stalled,
+            1,
+            1_024,
+            1_024,
+            stats.clone(),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("idle input should time out");
+        assert!(error.to_string().contains("idle timeout"), "{error:#}");
+        assert_eq!(stats.active_spool_bytes.load(Ordering::Acquire), 0);
+
+        let never_started = StreamBody::new(stream::pending::<Result<Frame<Bytes>, io::Error>>());
+        let error = ReplayBody::read_body_with_timeouts(
+            never_started,
+            1,
+            1_024,
+            1_024,
+            stats.clone(),
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .await
+        .err()
+        .expect("total input deadline should expire");
+        assert!(
+            error.to_string().contains("total ingress timeout"),
+            "{error:#}"
+        );
+        assert_eq!(stats.active_spool_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn hard_and_global_limits_do_not_leak_reservations() {
+        let hard_stats = Arc::new(Stats::default());
+        let too_large = StreamBody::new(stream::iter([data_frame(b"12345")]));
+        let error = ReplayBody::read_body(too_large, 1, 4, 100, hard_stats.clone(), None)
+            .await
+            .err()
+            .expect("hard limit should reject body");
+        assert!(error.to_string().contains("configured limit"));
+        assert_eq!(hard_stats.active_spool_bytes.load(Ordering::Acquire), 0);
+
+        let global_stats = Arc::new(Stats::default());
+        let globally_too_large = StreamBody::new(stream::iter([data_frame(b"12345")]));
+        let error =
+            ReplayBody::read_body(globally_too_large, 1, 100, 4, global_stats.clone(), None)
+                .await
+                .err()
+                .expect("global limit should reject body");
+        assert!(error.to_string().contains("global replay spool limit"));
+        assert_eq!(global_stats.active_spool_bytes.load(Ordering::Acquire), 0);
     }
 }

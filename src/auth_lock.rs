@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 
 const LOCK_FILE_NAME: &str = ".comradex-auth.lock";
+const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// A process-wide advisory lock for a managed CODEX_HOME credential file.
 ///
@@ -33,8 +34,26 @@ impl HomeAuthLock {
             if let Some(lock) = Self::try_acquire(home)? {
                 return Ok(lock);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            tokio::time::sleep(LOCK_POLL_INTERVAL).await;
         }
+    }
+
+    /// Wait for the file lock for at most `timeout`. Unlike wrapping the
+    /// blocking lock in `spawn_blocking`, timing this polling loop out cannot
+    /// leave a detached task that later acquires the credential lock.
+    pub async fn acquire_async_with_timeout(
+        home: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        tokio::time::timeout(timeout, Self::acquire_async(home))
+            .await
+            .with_context(|| {
+                format!(
+                    "timed out after {} ms waiting for managed auth lock {}",
+                    timeout.as_millis(),
+                    home.display()
+                )
+            })?
     }
 
     /// Attempt to own this managed home without waiting.
@@ -152,5 +171,25 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_async_acquire_times_out_without_late_lock_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("account");
+        let first = HomeAuthLock::acquire(&home).unwrap();
+
+        let error =
+            HomeAuthLock::acquire_async_with_timeout(&home, std::time::Duration::from_millis(40))
+                .await
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            HomeAuthLock::try_acquire(&home).unwrap().is_some(),
+            "a timed-out waiter must not acquire the lock later"
+        );
     }
 }

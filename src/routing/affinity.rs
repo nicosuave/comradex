@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 const ACCOUNT_EPOCH_STORAGE_BUDGET: usize = 1024 * 1024;
+const MAX_TOUCH_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ThreadKey(pub String);
@@ -36,11 +38,16 @@ struct StoreState {
     binding_bytes: usize,
     generation: u64,
     persisted_generation: u64,
+    touch_generation: u64,
+    persisted_touch_generation: u64,
+    touch_flush_due_at: u64,
 }
 
 pub struct AffinityStore {
-    inner: Mutex<StoreState>,
-    flush_lock: Mutex<()>,
+    inner: Arc<Mutex<StoreState>>,
+    // This lock is deliberately owned by the blocking writer. If an async caller is cancelled,
+    // the detached blocking task still finishes before a newer generation can replace its file.
+    flush_lock: Arc<StdMutex<()>>,
     path: PathBuf,
     key: [u8; 32],
     max_entries: usize,
@@ -79,13 +86,16 @@ impl AffinityStore {
         let mut binding_bytes = binding_storage_bytes(&snapshot);
         dirty |= trim(&mut snapshot, &mut binding_bytes, max_entries, max_bytes);
         Ok(Self {
-            inner: Mutex::new(StoreState {
+            inner: Arc::new(Mutex::new(StoreState {
                 snapshot,
                 binding_bytes,
                 generation: u64::from(dirty),
                 persisted_generation: 0,
-            }),
-            flush_lock: Mutex::new(()),
+                touch_generation: 0,
+                persisted_touch_generation: 0,
+                touch_flush_due_at: 0,
+            })),
+            flush_lock: Arc::new(StdMutex::new(())),
             path,
             key,
             max_entries,
@@ -129,7 +139,7 @@ impl AffinityStore {
                 .binding_bytes
                 .saturating_sub(previous_bytes)
                 .saturating_add(json_len(&binding));
-            mark_dirty(&mut inner);
+            mark_touched(&mut inner, now, touch_checkpoint_interval(self.idle));
         }
         Some(binding)
     }
@@ -200,30 +210,45 @@ impl AffinityStore {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let _flush = self.flush_lock.lock().await;
-        let Some((generation, snapshot)) = ({
-            let mut inner = self.inner.lock().await;
-            let StoreState {
-                snapshot,
-                binding_bytes,
-                ..
-            } = &mut *inner;
-            if trim(snapshot, binding_bytes, self.max_entries, self.max_bytes) {
-                mark_dirty(&mut inner);
-            }
-            if account_epoch_storage_bytes(&inner.snapshot) > ACCOUNT_EPOCH_STORAGE_BUDGET {
-                anyhow::bail!("account epoch snapshot exceeds its hard storage budget")
-            }
-            if inner.persisted_generation >= inner.generation {
-                None
-            } else {
-                Some((inner.generation, inner.snapshot.clone()))
-            }
-        }) else {
-            return Ok(());
-        };
+        let inner = self.inner.clone();
+        let flush_lock = self.flush_lock.clone();
         let path = self.path.clone();
+        let max_entries = self.max_entries;
+        let max_bytes = self.max_bytes;
+        let touch_checkpoint_interval = touch_checkpoint_interval(self.idle);
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let _flush = flush_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("affinity snapshot writer lock poisoned"))?;
+            let current_now = now();
+            let (generation, touch_generation, snapshot) = {
+                let mut state = inner.blocking_lock();
+                let StoreState {
+                    snapshot,
+                    binding_bytes,
+                    ..
+                } = &mut *state;
+                if trim(snapshot, binding_bytes, max_entries, max_bytes) {
+                    mark_dirty(&mut state);
+                }
+                if account_epoch_storage_bytes(&state.snapshot) > ACCOUNT_EPOCH_STORAGE_BUDGET {
+                    anyhow::bail!("account epoch snapshot exceeds its hard storage budget")
+                }
+                let structural_dirty = state.persisted_generation < state.generation;
+                let touches_due = state.persisted_touch_generation < state.touch_generation
+                    && current_now >= state.touch_flush_due_at;
+                if !structural_dirty && !touches_due {
+                    return Ok(());
+                }
+                if touches_due && !structural_dirty {
+                    mark_dirty(&mut state);
+                }
+                (
+                    state.generation,
+                    state.touch_generation,
+                    state.snapshot.clone(),
+                )
+            };
             let bytes = serde_json::to_vec(&snapshot)?;
             let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
             fs::create_dir_all(parent)?;
@@ -231,18 +256,53 @@ impl AffinityStore {
             temp.write_all(&bytes)?;
             temp.as_file().sync_all()?;
             temp.persist(&path).map_err(|error| error.error)?;
+            sync_parent_directory(parent)?;
+
+            let mut state = inner.blocking_lock();
+            state.persisted_generation = state.persisted_generation.max(generation);
+            state.persisted_touch_generation =
+                state.persisted_touch_generation.max(touch_generation);
+            if state.persisted_touch_generation == state.touch_generation {
+                state.touch_flush_due_at = 0;
+            } else {
+                state.touch_flush_due_at =
+                    current_now.saturating_add(touch_checkpoint_interval.as_secs());
+            }
             Ok(())
         })
         .await
         .context("join affinity snapshot writer")??;
-        let mut inner = self.inner.lock().await;
-        inner.persisted_generation = inner.persisted_generation.max(generation);
         Ok(())
     }
 }
 
 fn mark_dirty(state: &mut StoreState) {
     state.generation = state.generation.saturating_add(1);
+}
+
+fn mark_touched(state: &mut StoreState, now: u64, checkpoint_interval: Duration) {
+    let was_clean = state.touch_generation == state.persisted_touch_generation;
+    state.touch_generation = state.touch_generation.saturating_add(1);
+    if was_clean {
+        state.touch_flush_due_at = now.saturating_add(checkpoint_interval.as_secs());
+    }
+}
+
+fn touch_checkpoint_interval(idle: Duration) -> Duration {
+    let quarter_idle = Duration::from_secs(idle.as_secs().saturating_div(4).max(1));
+    quarter_idle.min(MAX_TOUCH_CHECKPOINT_INTERVAL)
+}
+
+fn sync_parent_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn trim(
@@ -455,6 +515,102 @@ mod tests {
         store.flush().await.unwrap();
         let inner = store.inner.lock().await;
         assert_eq!(inner.persisted_generation, inner.generation);
+    }
+
+    #[tokio::test]
+    async fn last_seen_churn_is_coalesced_until_the_touch_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("affinity.json");
+        let store = AffinityStore::load(
+            path.clone(),
+            "0123456789abcdef0123456789abcdef",
+            10,
+            100_000,
+            Duration::from_secs(60 * 60),
+        )
+        .unwrap();
+        let key = store.key("hot-thread");
+        store.put(key.clone(), "a".into(), 0).await;
+        store.flush().await.unwrap();
+        let persisted = fs::read(&path).unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(store.get(&key).await.is_some());
+        {
+            let state = store.inner.lock().await;
+            assert_eq!(state.persisted_generation, state.generation);
+            assert!(state.touch_generation > state.persisted_touch_generation);
+            assert!(state.touch_flush_due_at > now());
+        }
+
+        store.flush().await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), persisted);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // The test intentionally pins the blocking writer lock across cancellation.
+    async fn cancelled_flush_cannot_overwrite_a_newer_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("affinity.json");
+        let store = Arc::new(
+            AffinityStore::load(
+                path.clone(),
+                "0123456789abcdef0123456789abcdef",
+                10,
+                100_000,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        store.put(store.key("first"), "a".into(), 0).await;
+
+        let writer_lock = store.flush_lock.clone();
+        let guard = writer_lock.lock().unwrap();
+        let cancelled_store = store.clone();
+        let cancelled = tokio::spawn(async move { cancelled_store.flush().await });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        store.put(store.key("second"), "b".into(), 0).await;
+        drop(guard);
+
+        store.flush().await.unwrap();
+        let restored = AffinityStore::load(
+            path,
+            "0123456789abcdef0123456789abcdef",
+            10,
+            100_000,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(restored.len_and_bytes().await.0, 2);
+    }
+
+    #[tokio::test]
+    async fn atomic_flush_leaves_only_the_complete_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("affinity.json");
+        fs::write(&path, b"old contents").unwrap();
+        let store = AffinityStore::load(
+            dir.path().join("new-affinity.json"),
+            "0123456789abcdef0123456789abcdef",
+            10,
+            100_000,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        store.put(store.key("thread"), "account".into(), 0).await;
+        store.flush().await.unwrap();
+
+        let entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(entries.contains(&"new-affinity.json".into()));
+        assert_eq!(entries.len(), 2);
+        let snapshot: Snapshot =
+            serde_json::from_slice(&fs::read(dir.path().join("new-affinity.json")).unwrap())
+                .unwrap();
+        assert_eq!(snapshot.bindings.len(), 1);
     }
 
     #[tokio::test]

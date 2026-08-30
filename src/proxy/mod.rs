@@ -39,7 +39,7 @@ use hyper_util::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::{AbortHandle, JoinSet},
 };
 use tokio_tungstenite::{
@@ -70,6 +70,11 @@ use websocket_protocol::{
 const FILE_CREATE_RESPONSE_LIMIT: usize = 1024 * 1024;
 const RESPONSES_JSON_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 const BRIDGE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const HTTP_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const UNKNOWN_CONTENT_SNIFF_BYTES: usize = 4 * 1024;
 const SSE_DECODE_SLICE_BYTES: usize = 64 * 1024;
 const MAX_QUEUED_DIRECT_CREATES: usize = 64;
@@ -330,12 +335,106 @@ impl Drop for OpenUpgradeGuard {
     }
 }
 
+struct OpenBridgeSessionGuard(Arc<Stats>);
+
+impl Drop for OpenBridgeSessionGuard {
+    fn drop(&mut self) {
+        self.0.open_bridge_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct InflightGuard<'a>(&'a AtomicUsize);
 
 impl<'a> InflightGuard<'a> {
     fn new(counter: &'a AtomicUsize) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         Self(counter)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CapacityKind {
+    Http,
+    BridgeTurn,
+    UpgradeHandshake,
+}
+
+/// Couples admission to accounting. Dropping a request future, response body, bridge turn, or
+/// handshake releases the permit and every counter exactly once.
+struct CapacityLease {
+    permit: Option<OwnedSemaphorePermit>,
+    stats: Arc<Stats>,
+    kind: CapacityKind,
+    stage_id: u64,
+}
+
+impl CapacityLease {
+    fn new(permit: OwnedSemaphorePermit, stats: Arc<Stats>, kind: CapacityKind) -> Self {
+        stats.inflight_http.fetch_add(1, Ordering::AcqRel);
+        match kind {
+            CapacityKind::Http => {
+                stats.inflight_regular_http.fetch_add(1, Ordering::AcqRel);
+            }
+            CapacityKind::BridgeTurn => {
+                stats.active_bridge_turns.fetch_add(1, Ordering::AcqRel);
+            }
+            CapacityKind::UpgradeHandshake => {
+                stats.upgrade_handshakes.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let stage_id = stats.capacity_stage_started(kind.stage());
+        Self {
+            permit: Some(permit),
+            stats,
+            kind,
+            stage_id,
+        }
+    }
+
+    fn into_permit(mut self) -> OwnedSemaphorePermit {
+        self.release_accounting();
+        self.permit.take().expect("capacity permit")
+    }
+
+    fn release_accounting(&mut self) {
+        if self.stage_id == 0 {
+            return;
+        }
+        self.stats.inflight_http.fetch_sub(1, Ordering::AcqRel);
+        match self.kind {
+            CapacityKind::Http => {
+                self.stats
+                    .inflight_regular_http
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+            CapacityKind::BridgeTurn => {
+                self.stats
+                    .active_bridge_turns
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+            CapacityKind::UpgradeHandshake => {
+                self.stats.upgrade_handshakes.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.stats
+            .capacity_stage_finished(self.kind.stage(), self.stage_id);
+        self.stage_id = 0;
+    }
+}
+
+impl CapacityKind {
+    fn stage(self) -> crate::state::CapacityStage {
+        match self {
+            Self::Http => crate::state::CapacityStage::Http,
+            Self::BridgeTurn => crate::state::CapacityStage::BridgeTurn,
+            Self::UpgradeHandshake => crate::state::CapacityStage::UpgradeHandshake,
+        }
+    }
+}
+
+impl Drop for CapacityLease {
+    fn drop(&mut self) {
+        self.release_accounting();
     }
 }
 
@@ -459,6 +558,7 @@ pub struct App {
     upgrade_client: UpgradeHttpClient,
     stats: Arc<Stats>,
     http_slots: Arc<Semaphore>,
+    bridge_turn_slots: Arc<Semaphore>,
     upgrade_slots: Arc<Semaphore>,
     bridge_sessions: AsyncMutex<HashMap<u64, BridgeSessionEntry>>,
     bridge_sessions_changed: Arc<Notify>,
@@ -501,8 +601,17 @@ impl App {
             config.proxy.max_affinity_bytes,
             Duration::from_secs(config.proxy.affinity_idle_days * 86_400),
         )?);
+        stats.configure_capacity(
+            config.proxy.max_inflight,
+            config.proxy.max_inflight,
+            config.proxy.max_upgrades,
+        );
+        stats.configure_bridge_session_capacity(config.proxy.max_bridge_sessions);
         Ok(Arc::new(Self {
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
+            // Bridge turns use an independent bulkhead. A stalled bridge can no longer consume
+            // the ordinary HTTP serving pool, while the combined counters remain truthful.
+            bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),
             bridge_sessions: AsyncMutex::new(HashMap::new()),
             bridge_sessions_changed: Arc::new(Notify::new()),
@@ -672,10 +781,18 @@ impl App {
         listener: ListenerConfig,
     ) -> Result<Response<ProxyBody>, Infallible> {
         let response = if self.service_health_path(req.uri()) {
+            let capacity = self.stats.capacity_snapshot();
+            let (status, state) = if capacity.saturated {
+                (StatusCode::SERVICE_UNAVAILABLE, "degraded")
+            } else {
+                (StatusCode::OK, "ok")
+            };
             Response::builder()
-                .status(StatusCode::OK)
+                .status(status)
                 .header(CONTENT_TYPE, "application/json")
-                .body(json_body(serde_json::json!({"status":"ok"})))
+                .body(json_body(
+                    serde_json::json!({"status":state,"capacity":capacity}),
+                ))
                 .expect("static health response is valid")
         } else {
             match self.authorized_path(req.uri()) {
@@ -705,6 +822,9 @@ impl App {
                     let permit = match self.http_slots.clone().try_acquire_owned() {
                         Ok(v) => v,
                         Err(_) => {
+                            self.stats
+                                .http_admission_rejected
+                                .fetch_add(1, Ordering::Relaxed);
                             return Ok(error_response(
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 "at_capacity",
@@ -712,13 +832,31 @@ impl App {
                             ));
                         }
                     };
-                    let _inflight = InflightGuard::new(&self.stats.inflight_http);
-                    let result = self
-                        .handle_http(req, &listener, path)
-                        .await
-                        .unwrap_or_else(internal_error);
-                    drop(permit);
-                    result
+                    let lease = CapacityLease::new(permit, self.stats.clone(), CapacityKind::Http);
+                    let deadline = tokio::time::Instant::now() + HTTP_REQUEST_TIMEOUT;
+                    let (result, response_deadline) = match tokio::time::timeout_at(
+                        deadline,
+                        self.handle_http(req, &listener, path, deadline),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => (response, Some(deadline)),
+                        Ok(Err(error)) => (internal_error(error), Some(deadline)),
+                        Err(_) => {
+                            self.stats
+                                .admission_timed_out
+                                .fetch_add(1, Ordering::Relaxed);
+                            (
+                                error_response(
+                                    StatusCode::GATEWAY_TIMEOUT,
+                                    "upstream_request_timeout",
+                                    "upstream request deadline exceeded",
+                                ),
+                                None,
+                            )
+                        }
+                    };
+                    bound_http_response(result, lease, response_deadline)
                 }
             }
         };
@@ -756,19 +894,22 @@ impl App {
         req: Request<Incoming>,
         listener: &ListenerConfig,
         path: String,
+        deadline: tokio::time::Instant,
     ) -> Result<Response<ProxyBody>> {
         let (parts, body) = req.into_parts();
         let inbound_headers = parts.headers;
         let method = parts.method;
-        let replay = ReplayBody::read(
+        let replay = ReplayBody::read_with_timeouts(
             body,
             self.config.proxy.replay_memory_bytes,
             self.config.proxy.max_request_bytes,
             self.config.proxy.max_spool_bytes,
             self.stats.clone(),
+            HTTP_REQUEST_BODY_IDLE_TIMEOUT,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await?;
-        self.handle_http_replay(inbound_headers, method, listener, path, replay)
+        self.handle_http_replay(inbound_headers, method, listener, path, replay, deadline)
             .await
     }
 
@@ -779,6 +920,7 @@ impl App {
         listener: &ListenerConfig,
         path: String,
         replay: ReplayBody,
+        deadline: tokio::time::Instant,
     ) -> Result<Response<ProxyBody>> {
         self.handle_http_replay_with_routing_anchor(
             inbound_headers,
@@ -787,10 +929,12 @@ impl App {
             path,
             replay,
             None,
+            deadline,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_http_replay_with_routing_anchor(
         &self,
         mut inbound_headers: hyper::HeaderMap,
@@ -799,6 +943,7 @@ impl App {
         mut path: String,
         mut replay: ReplayBody,
         routing_previous_response_id: Option<String>,
+        request_deadline: tokio::time::Instant,
     ) -> Result<Response<ProxyBody>> {
         let legacy_compact = method == Method::POST && is_legacy_compact_path(&path);
         if legacy_compact {
@@ -939,6 +1084,7 @@ impl App {
                     &inbound_headers,
                     credentials.clone(),
                     replay.body(attempt)?,
+                    request_deadline,
                 )
                 .await;
             match result {
@@ -1104,6 +1250,7 @@ impl App {
         inbound: &hyper::HeaderMap,
         credentials: auth::Credentials,
         body: ProxyBody,
+        request_deadline: tokio::time::Instant,
     ) -> Result<Response<Incoming>> {
         let uri = self.upstream_uri(path, false)?;
         let mut builder = Request::builder().method(method).uri(uri);
@@ -1113,7 +1260,14 @@ impl App {
         headers.remove(CONTENT_LENGTH);
         let _ = inbound;
         apply_credentials(headers, credentials)?;
-        Ok(self.client.request(builder.body(body)?).await?)
+        let header_deadline =
+            request_deadline.min(tokio::time::Instant::now() + HTTP_RESPONSE_HEADER_TIMEOUT);
+        match tokio::time::timeout_at(header_deadline, self.client.request(builder.body(body)?))
+            .await
+        {
+            Ok(result) => Ok(result?),
+            Err(_) => anyhow::bail!("upstream response header timeout"),
+        }
     }
 
     async fn map_file_create_response(
@@ -1265,6 +1419,9 @@ impl App {
             ));
         }
         let Some(admission) = self.admit_bridge_session().await else {
+            self.stats
+                .bridge_turn_admission_rejected
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(bridge_capacity_response());
         };
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key);
@@ -1276,13 +1433,15 @@ impl App {
         let session_id = admission.id;
         let activity = admission.activity;
         let evicted = admission.evicted;
-        self.stats.open_upgrades.fetch_add(1, Ordering::Relaxed);
-        let upgrade_guard = OpenUpgradeGuard(self.stats.clone());
+        self.stats
+            .open_bridge_sessions
+            .fetch_add(1, Ordering::Relaxed);
+        let bridge_guard = OpenBridgeSessionGuard(self.stats.clone());
         let spawned = self
             .spawn_tracked(async move {
-                let _upgrade_guard = upgrade_guard;
-                match client_upgrade.await {
-                    Ok(client) => {
+                let _bridge_guard = bridge_guard;
+                match tokio::time::timeout(WEBSOCKET_HANDSHAKE_TIMEOUT, client_upgrade).await {
+                    Ok(Ok(client)) => {
                         let websocket = WebSocketStream::from_raw_socket(
                             TokioIo::new(client),
                             Role::Server,
@@ -1298,7 +1457,13 @@ impl App {
                             warn!(%error, "Responses HTTP bridge ended");
                         }
                     }
-                    Err(error) => warn!(%error, "Responses HTTP bridge upgrade failed"),
+                    Ok(Err(error)) => warn!(%error, "Responses HTTP bridge upgrade failed"),
+                    Err(_) => {
+                        app.stats
+                            .admission_timed_out
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!("Responses HTTP bridge downstream upgrade timed out");
+                    }
                 }
                 cleanup_app.finish_bridge_session(session_id).await;
             })
@@ -1531,9 +1696,12 @@ impl App {
                             let _turn_guard = turn_guard;
                             let dispatch_deadline =
                                 tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT;
-                            let _http_permit = match app.http_slots.clone().try_acquire_owned() {
+                            let permit = match app.bridge_turn_slots.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
+                                    app.stats
+                                        .bridge_turn_admission_rejected
+                                        .fetch_add(1, Ordering::Relaxed);
                                     send_ws_error(
                                         &outbound,
                                         "server_busy",
@@ -1543,6 +1711,11 @@ impl App {
                                     return;
                                 }
                             };
+                            let _capacity = CapacityLease::new(
+                                permit,
+                                app.stats.clone(),
+                                CapacityKind::BridgeTurn,
+                            );
                             let replay = match ReplayBody::from_bytes(
                                 body,
                                 app.config.proxy.max_request_bytes,
@@ -1569,6 +1742,7 @@ impl App {
                                     path,
                                     replay,
                                     routing_previous_response_id,
+                                    dispatch_deadline,
                                 ),
                             )
                             .await
@@ -1814,6 +1988,7 @@ impl App {
         clear_session_state: bool,
         connect_timeout: Duration,
     ) -> Result<DirectUpstream> {
+        let connect_deadline = tokio::time::Instant::now() + connect_timeout;
         for attempt in 0..2 {
             let uri = self.upstream_uri(path, false)?;
             let mut upstream_req = Request::builder()
@@ -1832,7 +2007,6 @@ impl App {
                 .await?;
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(account).await;
-            let connect_deadline = tokio::time::Instant::now() + connect_timeout;
             let mut response = match tokio::time::timeout_at(
                 connect_deadline,
                 self.upgrade_client.request(upstream_req),
@@ -2092,7 +2266,7 @@ impl App {
                                     continue;
                                 }
                             };
-                            upstream.send(client_message.clone()).await?;
+                            send_upgraded_bounded(&mut upstream, client_message.clone()).await?;
                             if analysis.has_nonportable_state {
                                 route.hard_owner = true;
                                 route.non_previous_hard_owner = true;
@@ -2110,7 +2284,7 @@ impl App {
                         }
                     }
                     let closes = matches!(client_message, Message::Close(_));
-                    upstream.send(client_message).await?;
+                    send_upgraded_bounded(&mut upstream, client_message).await?;
                     if closes { break; }
                 }
                 upstream_message = upstream.next() => {
@@ -2140,14 +2314,6 @@ impl App {
                                 {
                                     awaiting_response_created = None;
                                     missing_created_deadline = None;
-                                } else if awaiting_response_created.is_some() {
-                                    // A recoverable pre-acceptance close may replace the upstream
-                                    // and replay the one safe turn. Its acknowledgement gets a new
-                                    // full deadline on the replacement generation.
-                                    missing_created_deadline = Some(
-                                        tokio::time::Instant::now()
-                                            + RESPONSES_MISSING_CREATED_TIMEOUT,
-                                    );
                                 }
                                 upstream_idle_deadlines.clear();
                                 if close_downstream {
@@ -2160,7 +2326,7 @@ impl App {
                                 _ => None,
                             };
                             let Some(event) = parsed else {
-                                client.send(message).await?;
+                                send_upgraded_bounded(&mut client, message).await?;
                                 continue;
                             };
                             let failure = classify_failure(&event);
@@ -2207,10 +2373,6 @@ impl App {
                                     lease.replace(account.clone()).await;
                                     upstream = replacement.socket;
                                     upstream_credentials = replacement.credentials;
-                                    missing_created_deadline = Some(
-                                        tokio::time::Instant::now()
-                                            + RESPONSES_MISSING_CREATED_TIMEOUT,
-                                    );
                                     upstream_idle_deadlines.clear();
                                     continue;
                                 }
@@ -2245,13 +2407,15 @@ impl App {
                                         .turn(turn_id)
                                         .and_then(|turn| turn.response_id())
                                         .unwrap_or("");
-                                    client
-                                        .send(Message::Text(
+                                    send_upgraded_bounded(
+                                        &mut client,
+                                        Message::Text(
                                             previous_response_not_found_event(response_id)
                                                 .to_string()
                                                 .into(),
-                                        ))
-                                        .await?;
+                                        ),
+                                    )
+                                    .await?;
                                     let _ = protocol.settle(turn_id, Settlement::Failed);
                                     turns.remove(&turn_id);
                                     upstream_idle_deadlines.remove(&turn_id);
@@ -2262,11 +2426,13 @@ impl App {
                                 // Never expose account-scoped continuity identifiers from an
                                 // unassociated upstream miss. It may belong to another in-flight
                                 // request, so keep our pending turns alive.
-                                client
-                                    .send(Message::Text(
+                                send_upgraded_bounded(
+                                    &mut client,
+                                    Message::Text(
                                         previous_response_not_found_error().to_string().into(),
-                                    ))
-                                    .await?;
+                                    ),
+                                )
+                                .await?;
                                 continue;
                             }
                             if association.event_type.as_deref() == Some("response.created") {
@@ -2305,7 +2471,7 @@ impl App {
                                 &association.turn_ids,
                                 RESPONSES_UPSTREAM_IDLE_TIMEOUT,
                             );
-                            client.send(message).await?;
+                            send_upgraded_bounded(&mut client, message).await?;
                             for turn_id in &association.turn_ids {
                                 protocol
                                     .mark_downstream_delivered(*turn_id, &event)
@@ -2540,7 +2706,9 @@ impl App {
         if committed != plan {
             anyhow::bail!("direct replay plan changed before commit")
         }
-        if let Err(error) = replacement.socket.send(replay_message.clone()).await {
+        if let Err(error) =
+            send_upgraded_bounded(&mut replacement.socket, replay_message.clone()).await
+        {
             warn!(%error, account = replacement_account, "safe direct replay send failed");
             return Ok(None);
         }
@@ -2651,8 +2819,7 @@ impl App {
                             "error":{"type":"server_error","code":code,"message":message,"retryable":false}
                         }
                     });
-                    client
-                        .send(Message::Text(payload.to_string().into()))
+                    send_upgraded_bounded(client, Message::Text(payload.to_string().into()))
                         .await?;
                     let _ = protocol.settle(action.turn_id, Settlement::Incomplete);
                 }
@@ -2704,8 +2871,16 @@ impl App {
     ) -> Result<Response<ProxyBody>> {
         let permit = match self.upgrade_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return Ok(upgrade_capacity_response()),
+            Err(_) => {
+                self.stats
+                    .upgrade_admission_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(upgrade_capacity_response());
+            }
         };
+        let capacity =
+            CapacityLease::new(permit, self.stats.clone(), CapacityKind::UpgradeHandshake);
+        let handshake_deadline = tokio::time::Instant::now() + WEBSOCKET_HANDSHAKE_TIMEOUT;
         let inbound_headers = req.headers().clone();
         let pool = self.pool(listener)?;
         let forced_live = live_call_id.is_some();
@@ -2820,11 +2995,27 @@ impl App {
                 .await?;
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(&selection.account_id).await;
-            let mut response = match self.upgrade_client.request(upstream_req).await {
-                Ok(response) => response,
-                Err(error) => {
+            let mut response = match tokio::time::timeout_at(
+                handshake_deadline,
+                self.upgrade_client.request(upstream_req),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
                     self.router.end(&selection.account_id).await;
                     return Err(error.into());
+                }
+                Err(_) => {
+                    self.router.end(&selection.account_id).await;
+                    self.stats
+                        .admission_timed_out
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "upstream_websocket_handshake_timeout",
+                        "upstream WebSocket handshake timed out",
+                    ));
                 }
             };
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -2865,12 +3056,17 @@ impl App {
                     && self.config.proxy.responses_websocket_mode == ResponsesWebsocketMode::Direct;
                 stats.open_upgrades.fetch_add(1, Ordering::Relaxed);
                 let upgrade_guard = OpenUpgradeGuard(stats.clone());
+                let permit = capacity.into_permit();
                 let spawned = self
                     .spawn_tracked(async move {
                         let _upgrade_guard = upgrade_guard;
                         let _permit = permit;
-                        match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                            Ok((client, upstream)) => {
+                        match tokio::time::timeout_at(handshake_deadline, async {
+                            tokio::try_join!(client_upgrade, upstream_upgrade)
+                        })
+                        .await
+                        {
+                            Ok(Ok((client, upstream))) => {
                                 if direct {
                                     let client = WebSocketStream::from_raw_socket(
                                         TokioIo::new(client),
@@ -2909,8 +3105,12 @@ impl App {
                                     router.end(&account).await;
                                 }
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(error = %e, "upgrade failed");
+                                router.end(&account).await;
+                            }
+                            Err(_) => {
+                                warn!("downstream or upstream WebSocket upgrade timed out");
                                 router.end(&account).await;
                             }
                         }
@@ -3354,6 +3554,110 @@ fn map_http_response(response: Response<Incoming>) -> Response<ProxyBody> {
     Response::from_parts(parts, incoming_body(body))
 }
 
+fn bound_http_response(
+    response: Response<ProxyBody>,
+    lease: CapacityLease,
+    total_deadline: Option<tokio::time::Instant>,
+) -> Response<ProxyBody> {
+    bound_http_response_with_timeouts(
+        response,
+        lease,
+        total_deadline,
+        HTTP_RESPONSE_BODY_IDLE_TIMEOUT,
+    )
+}
+
+fn bound_http_response_with_timeouts(
+    response: Response<ProxyBody>,
+    lease: CapacityLease,
+    total_deadline: Option<tokio::time::Instant>,
+    idle_timeout: Duration,
+) -> Response<ProxyBody> {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        BodyExt::boxed(BoundedHttpBody {
+            inner: body,
+            lease: Some(lease),
+            total: total_deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
+            idle_timeout,
+            idle: Box::pin(tokio::time::sleep(idle_timeout)),
+            finished: false,
+        }),
+    )
+}
+
+struct BoundedHttpBody {
+    inner: ProxyBody,
+    lease: Option<CapacityLease>,
+    total: Option<Pin<Box<tokio::time::Sleep>>>,
+    idle_timeout: Duration,
+    idle: Pin<Box<tokio::time::Sleep>>,
+    finished: bool,
+}
+
+impl Body for BoundedHttpBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if self
+            .total
+            .as_mut()
+            .is_some_and(|deadline| deadline.as_mut().poll(cx).is_ready())
+        {
+            self.finished = true;
+            if let Some(lease) = self.lease.take() {
+                lease
+                    .stats
+                    .admission_timed_out
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream response total deadline exceeded",
+            ))));
+        }
+        if self.idle.as_mut().poll(cx).is_ready() {
+            self.finished = true;
+            self.lease.take();
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream response body idle timeout",
+            ))));
+        }
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(frame)) => {
+                let idle_timeout = self.idle_timeout;
+                self.idle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + idle_timeout);
+                Poll::Ready(Some(frame))
+            }
+            Poll::Ready(None) => {
+                self.finished = true;
+                self.lease.take();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.finished || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 fn map_http_response_leased(
     response: Response<Incoming>,
     router: Arc<Router>,
@@ -3472,6 +3776,16 @@ fn response_ids_from_sse_finish(decoder: &mut SseDecoder) -> Vec<String> {
         .collect()
 }
 
+fn response_id_from_protocol_event(event: ProtocolEvent) -> Option<String> {
+    event
+        .value
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 impl Body for LeasedIncoming {
     type Data = bytes::Bytes;
     type Error = std::io::Error;
@@ -3562,16 +3876,6 @@ impl LeasedIncoming {
             }
         }))
     }
-}
-
-fn response_id_from_protocol_event(event: ProtocolEvent) -> Option<String> {
-    event
-        .value
-        .get("response")
-        .and_then(|response| response.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
 }
 
 fn response_ids_from_json(bytes: &[u8]) -> Vec<String> {
@@ -3751,17 +4055,25 @@ async fn send_direct_error(
     kind: &str,
     message: &str,
 ) -> Result<()> {
-    websocket
-        .send(Message::Text(
+    send_upgraded_bounded(
+        websocket,
+        Message::Text(
             serde_json::json!({
                 "type": "error",
                 "error": {"type": kind, "message": message}
             })
             .to_string()
             .into(),
-        ))
-        .await?;
-    Ok(())
+        ),
+    )
+    .await
+}
+
+async fn send_upgraded_bounded(websocket: &mut UpgradedWebSocket, message: Message) -> Result<()> {
+    match tokio::time::timeout(BRIDGE_SEND_TIMEOUT, websocket.send(message)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => anyhow::bail!("WebSocket send timed out under downstream backpressure"),
+    }
 }
 
 fn previous_response_not_found_event(response_id: &str) -> serde_json::Value {
@@ -3893,7 +4205,6 @@ async fn pump_http_response_to_websocket(
         progress_events: 0,
     };
     let mut liveness = None;
-    let result: Result<()> = async {
     let status = response.status();
     let response_headers = response.headers().clone();
     let content_type = response
@@ -3907,6 +4218,7 @@ async fn pump_http_response_to_websocket(
         .extensions
         .get::<SelectedAccount>()
         .map(|selected| selected.0.clone());
+    let result: Result<()> = async {
     if !status.is_success() {
         let bytes = match tokio::time::timeout_at(
             response_created_deadline,
@@ -4130,6 +4442,7 @@ async fn send_protocol_events(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_sse_data(
     decoder: &mut SseDecoder,
     data: &[u8],
@@ -4328,7 +4641,7 @@ mod tests {
     #[tokio::test]
     async fn http_inflight_counter_clears_when_connection_task_is_aborted() {
         let dir = tempfile::tempdir().unwrap();
-        let (app, mut listener, _, stats) = direct_test_app(dir.path());
+        let (app, mut listener, _, stats) = direct_test_app(dir.path()).await;
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.address = tcp.local_addr().unwrap();
         let proxy = tokio::spawn(
@@ -4356,6 +4669,51 @@ mod tests {
 
         drop(stream);
         proxy.abort();
+    }
+
+    #[tokio::test]
+    async fn response_progress_cannot_extend_the_absolute_http_deadline() {
+        let stats = Arc::new(Stats::default());
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let lease = CapacityLease::new(permit, stats.clone(), CapacityKind::Http);
+        let (sender, receiver) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(4);
+        let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|item| (item, receiver))
+        });
+        let response = Response::new(BodyExt::boxed(http_body_util::StreamBody::new(stream)));
+        let response = bound_http_response_with_timeouts(
+            response,
+            lease,
+            Some(tokio::time::Instant::now() + Duration::from_millis(40)),
+            Duration::from_secs(1),
+        );
+        let producer = tokio::spawn(async move {
+            loop {
+                if sender
+                    .send(Ok(Frame::data(Bytes::from_static(b"progress"))))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let error =
+            tokio::time::timeout(Duration::from_millis(500), response.into_body().collect())
+                .await
+                .expect("absolute response deadline should fire")
+                .expect_err("periodic response frames must not extend the total deadline");
+        assert!(
+            error.to_string().contains("total deadline exceeded"),
+            "{error}"
+        );
+        assert_eq!(stats.inflight_http.load(Ordering::Acquire), 0);
+        assert_eq!(stats.inflight_regular_http.load(Ordering::Acquire), 0);
+        assert_eq!(slots.available_permits(), 1);
+        producer.await.unwrap();
     }
 
     #[test]
@@ -4427,8 +4785,8 @@ mod tests {
         assert!(unrelated.finish().is_empty());
     }
 
-    #[test]
-    fn public_constructor_rejects_noncanonical_credential_destinations() {
+    #[tokio::test]
+    async fn public_constructor_rejects_noncanonical_credential_destinations() {
         for upstream in [
             "https://example.invalid/backend-api/codex",
             "http://127.0.0.1:12345/backend-api/codex",
@@ -4491,13 +4849,13 @@ mod tests {
         assert_eq!(payload["error"]["type"], "at_capacity");
     }
 
-    fn direct_test_app(
+    async fn direct_test_app(
         dir: &std::path::Path,
     ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
-        direct_test_app_with_upstream(dir, ProxyConfig::default().upstream)
+        direct_test_app_with_upstream(dir, ProxyConfig::default().upstream).await
     }
 
-    fn direct_test_app_with_upstream(
+    async fn direct_test_app_with_upstream(
         dir: &std::path::Path,
         upstream: String,
     ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
@@ -4543,7 +4901,7 @@ mod tests {
         (app, listener, router, stats)
     }
 
-    fn bridge_admission_test_app(
+    async fn bridge_admission_test_app(
         dir: &std::path::Path,
         max_bridge_sessions: usize,
         bridge_admission_timeout_millis: u64,
@@ -4638,7 +4996,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_capacity_evicts_lru_idle_session_without_using_upgrade_slots() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let upstream_upgrade_slots = app.upgrade_slots.available_permits();
         let first = app.admit_bridge_session().await.unwrap();
         assert_eq!(
@@ -4661,7 +5019,7 @@ mod tests {
     #[tokio::test]
     async fn http_bridge_comments_do_not_disarm_missing_created_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let (response, _body_sender) = pending_sse_response(b": keepalive\n\n");
 
         let (failure, receiver) = pump_with_test_watchdogs(
@@ -4683,7 +5041,7 @@ mod tests {
     #[tokio::test]
     async fn http_bridge_prelude_does_not_disarm_missing_created_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let (response, _body_sender) =
             pending_sse_response(b"data: {\"type\":\"response.queued\",\"sequence_number\":0}\n\n");
 
@@ -4707,7 +5065,7 @@ mod tests {
     #[tokio::test]
     async fn http_bridge_response_metadata_is_visible_but_does_not_disarm_created_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let (response, _body_sender) = pending_sse_response(
             b"data: {\"type\":\"response.metadata\",\"sequence_number\":7,\"response\":{\"metadata\":{\"trace\":\"opaque\"}}}\n\n",
         );
@@ -4736,7 +5094,7 @@ mod tests {
     #[tokio::test]
     async fn http_bridge_created_starts_semantic_progress_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let (response, _body_sender) = pending_sse_response(
             b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_watchdog\"}}\n\n",
         );
@@ -4761,7 +5119,7 @@ mod tests {
     #[tokio::test]
     async fn http_bridge_heartbeats_do_not_refresh_idle_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let (response, body_sender) = pending_sse_response(
             b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_watchdog\"}}\n\n",
         );
@@ -4828,7 +5186,8 @@ mod tests {
         let (app, _, _, _) = direct_test_app_with_upstream(
             dir.path(),
             format!("http://{upstream_addr}/backend-api/codex"),
-        );
+        )
+        .await;
         let mut headers = hyper::HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer caller-token".parse().unwrap());
 
@@ -4853,7 +5212,7 @@ mod tests {
     #[tokio::test]
     async fn http_bridge_partial_json_cannot_bypass_missing_created_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let (mut response, _body_sender) = pending_sse_response(b"{\"response\":");
         response
             .headers_mut()
@@ -4878,7 +5237,7 @@ mod tests {
     #[tokio::test]
     async fn http_bridge_error_body_cannot_bypass_missing_created_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 500);
+        let app = bridge_admission_test_app(dir.path(), 1, 500).await;
         let (mut response, _body_sender) = pending_sse_response(b"{\"error\":");
         *response.status_mut() = StatusCode::BAD_GATEWAY;
         response
@@ -4922,7 +5281,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_capacity_never_evicts_active_turn_and_returns_retryable_response() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 20);
+        let app = bridge_admission_test_app(dir.path(), 1, 20).await;
         let first = app.admit_bridge_session().await.unwrap();
         let turn =
             BridgeTurnGuard::new(first.activity.clone(), app.bridge_sessions_changed.clone());
@@ -4939,7 +5298,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_lru_eviction_closes_idle_socket_before_replacement() {
         let dir = tempfile::tempdir().unwrap();
-        let app = bridge_admission_test_app(dir.path(), 1, 1_000);
+        let app = bridge_admission_test_app(dir.path(), 1, 1_000).await;
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = tcp.local_addr().unwrap();
         let listener = ListenerConfig {
@@ -5122,7 +5481,7 @@ mod tests {
     #[tokio::test]
     async fn direct_fresh_frame_rotates_off_exhausted_socket_account() {
         let dir = tempfile::tempdir().unwrap();
-        let (app, listener, router, stats) = direct_test_app(dir.path());
+        let (app, listener, router, stats) = direct_test_app(dir.path()).await;
         let pool = &app.config.pools["default"];
         assert_eq!(
             router
@@ -5161,7 +5520,7 @@ mod tests {
     #[tokio::test]
     async fn direct_hard_owner_quota_marks_account_without_cross_account_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let (app, listener, router, stats) = direct_test_app(dir.path());
+        let (app, listener, router, stats) = direct_test_app(dir.path()).await;
         let pool = &app.config.pools["default"];
         assert_eq!(
             router
