@@ -69,7 +69,8 @@ use websocket_protocol::{
 
 const FILE_CREATE_RESPONSE_LIMIT: usize = 1024 * 1024;
 const RESPONSES_JSON_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
-const BRIDGE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const BRIDGE_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+const BRIDGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_UPSTREAM_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -144,9 +145,13 @@ impl Body for ProgressBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let frame = Pin::new(&mut self.inner).poll_frame(cx);
         match &frame {
-            Poll::Ready(Some(Ok(_))) => self.progress.send_modify(|progress| {
-                progress.sequence = progress.sequence.saturating_add(1);
-            }),
+            Poll::Ready(Some(Ok(_))) => {
+                let complete = self.inner.is_end_stream();
+                self.progress.send_modify(|progress| {
+                    progress.sequence = progress.sequence.saturating_add(1);
+                    progress.complete = complete;
+                });
+            }
             Poll::Ready(None) => self.progress.send_modify(|progress| {
                 progress.complete = true;
             }),
@@ -189,7 +194,9 @@ where
     F: Future<Output = Result<T>>,
 {
     tokio::pin!(request);
-    let mut upload_complete = progress.borrow().complete;
+    let initial_progress = *progress.borrow();
+    let mut upload_complete = initial_progress.complete;
+    let mut upload_started = initial_progress.sequence != 0;
     let mut progress_open = true;
     let initial_timeout = if upload_complete {
         headers_timeout
@@ -208,6 +215,7 @@ where
                 }
                 let current = *progress.borrow_and_update();
                 upload_complete = current.complete;
+                upload_started = current.sequence != 0;
                 let timeout = if upload_complete { headers_timeout } else { upload_idle };
                 idle.as_mut().reset(tokio::time::Instant::now() + timeout);
             }
@@ -215,7 +223,10 @@ where
                 if upload_complete {
                     anyhow::bail!("upstream response headers timed out after request upload")
                 }
-                anyhow::bail!("upstream request upload idle timeout")
+                if upload_started {
+                    anyhow::bail!("upstream request upload idle timeout")
+                }
+                anyhow::bail!("upstream connection or request upload timed out before body progress")
             }
         }
     }
@@ -328,6 +339,7 @@ struct HttpBridgeCapture {
     delivered_event: bool,
     response_created: bool,
     progress_events: u64,
+    delivery_failed: bool,
 }
 
 #[derive(Debug)]
@@ -335,6 +347,7 @@ struct HttpBridgePumpFailure {
     error: anyhow::Error,
     delivered_event: bool,
     liveness: Option<HttpBridgeLivenessFailure>,
+    delivery_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,12 +550,7 @@ struct BridgeSender {
 
 impl BridgeSender {
     async fn send(&self, message: Message) -> bool {
-        tokio::time::timeout(
-            BRIDGE_SEND_TIMEOUT,
-            self.sender.send((self.generation, message)),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok())
+        self.sender.send((self.generation, message)).await.is_ok()
     }
 }
 
@@ -1523,15 +1531,24 @@ impl App {
                     if generation != 0 && generation != writer_generation.load(Ordering::Acquire) {
                         continue;
                     }
-                    if !matches!(
-                        tokio::time::timeout(BRIDGE_SEND_TIMEOUT, sink.send(message)).await,
-                        Ok(Ok(()))
-                    ) {
-                        let _ = writer_fatal.send("downstream WebSocket writer failed".into());
-                        break;
+                    match tokio::time::timeout(BRIDGE_WRITE_STALL_TIMEOUT, sink.send(message)).await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            let _ = writer_fatal
+                                .send(format!("downstream WebSocket write failed: {error}"));
+                            break;
+                        }
+                        Err(_) => {
+                            let _ = writer_fatal.send(format!(
+                                "downstream WebSocket write stalled for {} seconds",
+                                BRIDGE_WRITE_STALL_TIMEOUT.as_secs()
+                            ));
+                            break;
+                        }
                     }
                 }
-                let _ = tokio::time::timeout(BRIDGE_SEND_TIMEOUT, sink.close()).await;
+                let _ = tokio::time::timeout(BRIDGE_CLOSE_TIMEOUT, sink.close()).await;
             })
             .await
             .context("proxy is shutting down")?,
@@ -1783,11 +1800,7 @@ impl App {
                                             .await;
                                             return;
                                         }
-                                        if failure
-                                            .error
-                                            .to_string()
-                                            .contains("backpressure prevented event delivery")
-                                        {
+                                        if failure.delivery_failed {
                                             let _ = fatal.send(failure.error.to_string());
                                             return;
                                         }
@@ -4072,6 +4085,7 @@ async fn pump_http_response_to_websocket(
         delivered_event: false,
         response_created: false,
         progress_events: 0,
+        delivery_failed: false,
     };
     let mut liveness = None;
     let result: Result<()> = async {
@@ -4274,6 +4288,7 @@ async fn pump_http_response_to_websocket(
         error,
         delivered_event: capture.delivered_event,
         liveness,
+        delivery_failed: capture.delivery_failed,
     })
 }
 
@@ -4301,7 +4316,8 @@ async fn send_protocol_events(
             });
         }
         if !outbound.send(Message::Text(event.payload.into())).await {
-            anyhow::bail!("downstream WebSocket backpressure prevented event delivery")
+            capture.delivery_failed = true;
+            anyhow::bail!("downstream WebSocket writer stopped before event delivery")
         }
         capture.delivered_event = true;
         if terminal {
@@ -4504,6 +4520,93 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn progress_body_marks_the_final_data_frame_complete() {
+        let (mut body, progress) = progress_body(bytes_body(Bytes::from_static(b"request")));
+
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"request"));
+        assert!(body.is_end_stream());
+
+        let progress = *progress.borrow();
+        assert_eq!(progress.sequence, 1);
+        assert!(progress.complete);
+    }
+
+    #[tokio::test]
+    async fn final_request_frame_transitions_to_the_headers_deadline() {
+        let (mut body, progress) = progress_body(bytes_body(Bytes::from_static(b"request")));
+        body.frame().await.unwrap().unwrap();
+
+        let error = await_upstream_headers(
+            std::future::pending::<Result<()>>(),
+            progress,
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("headers timed out after request upload"));
+    }
+
+    #[tokio::test]
+    async fn pre_body_timeout_is_not_mislabeled_as_upload_idle() {
+        let (_body, progress) = progress_body(bytes_body(Bytes::from_static(b"request")));
+
+        let error = await_upstream_headers(
+            std::future::pending::<Result<()>>(),
+            progress,
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("connection or request upload timed out before body progress")
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_sender_backpressures_until_bounded_queue_has_room() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send((7, Message::Text("first".into())))
+            .await
+            .unwrap();
+        let outbound = BridgeSender {
+            sender,
+            generation: 7,
+        };
+
+        let blocked =
+            tokio::spawn(async move { outbound.send(Message::Text("second".into())).await });
+        tokio::time::sleep(Duration::from_millis(5_250)).await;
+        assert!(!blocked.is_finished());
+
+        assert_eq!(receiver.recv().await.unwrap().0, 7);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), blocked)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let (_, message) = receiver.recv().await.unwrap();
+        assert_eq!(message.into_text().unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn bridge_sender_stops_promptly_when_writer_is_gone() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let outbound = BridgeSender {
+            sender,
+            generation: 9,
+        };
+
+        assert!(!outbound.send(Message::Text("event".into())).await);
     }
 
     #[tokio::test]
