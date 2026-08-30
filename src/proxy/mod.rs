@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context as TaskContext, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -51,6 +51,7 @@ use tracing::{error, info, warn};
 use crate::{
     auth::{self, Credentials},
     config::{Config, ListenerConfig, PoolConfig, ResponsesWebsocketMode},
+    operation::{AsyncOperationHandle, AsyncOperationLedger, LedgerLimits},
     routing::{
         AffinityStore, Router,
         live::{self, LiveCallStore},
@@ -83,6 +84,90 @@ pub(super) const RESPONSES_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs
 const RESPONSES_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS: usize = 4_096;
 
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn response_operation_is_terminal(operation: &AsyncOperationHandle) -> bool {
+    operation
+        .snapshot()
+        .is_some_and(|record| record.state.is_terminal())
+}
+
+async fn acknowledge_response_operation(
+    operation: &AsyncOperationHandle,
+    response_id: &str,
+) -> Result<()> {
+    let Some(record) = operation.snapshot() else {
+        anyhow::bail!("response operation was not durably dispatched")
+    };
+    if record.state.is_terminal() || record.upstream_response_id.is_some() {
+        return Ok(());
+    }
+    let now = unix_now_ms();
+    operation
+        .acknowledge(
+            response_id,
+            now,
+            now.saturating_add(RESPONSES_UPSTREAM_IDLE_TIMEOUT.as_millis() as u64),
+        )
+        .await
+        .context("durably acknowledge response operation")?;
+    Ok(())
+}
+
+async fn complete_response_operation(
+    operation: &AsyncOperationHandle,
+    terminal_response_id: Option<&str>,
+) -> Result<()> {
+    let Some(record) = operation.snapshot() else {
+        anyhow::bail!("response operation was not durably dispatched")
+    };
+    if record.state.is_terminal() {
+        return Ok(());
+    }
+    if record.upstream_response_id.is_some() {
+        operation.complete(unix_now_ms()).await
+    } else {
+        operation
+            .complete_from_terminal(
+                terminal_response_id
+                    .context("terminal-before-created response has no response id")?,
+                unix_now_ms(),
+            )
+            .await
+    }
+    .context("durably complete response operation")?;
+    Ok(())
+}
+
+async fn fail_response_operation(operation: &AsyncOperationHandle, reason: &str) -> Result<()> {
+    if response_operation_is_terminal(operation) {
+        return Ok(());
+    }
+    operation
+        .fail(unix_now_ms(), reason)
+        .await
+        .context("durably fail response operation")?;
+    Ok(())
+}
+
+async fn abandon_response_operation(operation: &AsyncOperationHandle, reason: &str) -> Result<()> {
+    if response_operation_is_terminal(operation) {
+        return Ok(());
+    }
+    operation
+        .abandon(unix_now_ms(), reason)
+        .await
+        .context("durably abandon response operation")?;
+    Ok(())
+}
+
 fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
     matches!(
         kind,
@@ -107,6 +192,7 @@ struct DirectTurn {
     route: WebSocketFrameRoute,
     request: Message,
     value: serde_json::Value,
+    operation: AsyncOperationHandle,
 }
 
 struct DirectUpstream {
@@ -563,6 +649,9 @@ pub struct App {
     bridge_sessions: AsyncMutex<HashMap<u64, BridgeSessionEntry>>,
     bridge_sessions_changed: Arc<Notify>,
     next_bridge_session_id: AtomicU64,
+    next_operation_id: AtomicU64,
+    operation_prefix: String,
+    operations: AsyncOperationLedger,
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     file_owners: Arc<AffinityStore>,
@@ -572,28 +661,43 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Arc<Config>, router: Arc<Router>, stats: Arc<Stats>) -> Result<Arc<Self>> {
+    pub async fn new(
+        config: Arc<Config>,
+        router: Arc<Router>,
+        stats: Arc<Stats>,
+    ) -> Result<Arc<Self>> {
         config.validate()?;
-        Self::build(config, router, stats)
+        Self::build(config, router, stats).await
     }
 
     /// Tests use loopback HTTP upstreams to exercise proxy behavior. Keep that capability outside
     /// the production constructor so manually assembled runtime configs cannot bypass validation.
     #[cfg(test)]
-    fn new_unvalidated(
+    async fn new_unvalidated(
         config: Arc<Config>,
         router: Arc<Router>,
         stats: Arc<Stats>,
     ) -> Result<Arc<Self>> {
-        Self::build(config, router, stats)
+        Self::build(config, router, stats).await
     }
 
-    fn build(config: Arc<Config>, router: Arc<Router>, stats: Arc<Stats>) -> Result<Arc<Self>> {
+    async fn build(
+        config: Arc<Config>,
+        router: Arc<Router>,
+        stats: Arc<Stats>,
+    ) -> Result<Arc<Self>> {
         let https = codex_http_connector()?;
         let upgrade_https = codex_websocket_connector()?;
         let client = Client::builder(TokioExecutor::new()).build(https);
         let upgrade_client = Client::builder(TokioExecutor::new()).build(upgrade_https);
         let state_dir = config.proxy.state_dir.clone().unwrap_or_else(|| ".".into());
+        let operations = AsyncOperationLedger::open_fail_closed(
+            state_dir.join("operations.json"),
+            LedgerLimits::default(),
+            unix_now_ms(),
+        )
+        .await
+        .context("open durable response-operation ledger")?;
         let file_owners = Arc::new(AffinityStore::load(
             state_dir.join("file-owners.json"),
             &config.proxy.affinity_key,
@@ -616,6 +720,9 @@ impl App {
             bridge_sessions: AsyncMutex::new(HashMap::new()),
             bridge_sessions_changed: Arc::new(Notify::new()),
             next_bridge_session_id: AtomicU64::new(1),
+            next_operation_id: AtomicU64::new(1),
+            operation_prefix: format!("{:016x}", rand::random::<u64>()),
+            operations,
             live_calls: LiveCallStore::load(
                 &format!(
                     "{}:{}",
@@ -641,6 +748,21 @@ impl App {
             shutting_down: AtomicBool::new(false),
             service_nonce: std::env::var("COMRADEX_SERVICE_NONCE").ok(),
         }))
+    }
+
+    async fn begin_response_operation(&self, account_id: &str) -> Result<AsyncOperationHandle> {
+        let sequence = self.next_operation_id.fetch_add(1, Ordering::Relaxed);
+        let operation_id = format!("{}-{sequence:016x}", self.operation_prefix);
+        let now = unix_now_ms();
+        let operation = self.operations.track(operation_id, account_id.to_owned());
+        operation
+            .begin(
+                now,
+                now.saturating_add(RESPONSES_MISSING_CREATED_TIMEOUT.as_millis() as u64),
+            )
+            .await
+            .context("durably record response dispatch")?;
+        Ok(operation)
     }
 
     pub async fn flush_file_owners(&self) -> Result<()> {
@@ -1075,6 +1197,11 @@ impl App {
                 .auth
                 .resolve(&self.config.accounts[&account], &inbound_headers)
                 .await?;
+            let mut operation = if method == Method::POST && is_native_responses(&path) {
+                Some(self.begin_response_operation(&account).await?)
+            } else {
+                None
+            };
             self.router.begin(&account).await;
             let mut request_lease = DirectAccountLease::new(self.router.clone(), account.clone());
             let result = self
@@ -1088,7 +1215,7 @@ impl App {
                 )
                 .await;
             match result {
-                Ok(response) => {
+                Ok(mut response) => {
                     if nonportable_payload {
                         payload_dispatch_owner.get_or_insert_with(|| account.clone());
                     }
@@ -1096,6 +1223,16 @@ impl App {
                         .observe_headers(&account, response.headers())
                         .await;
                     let status = response.status();
+                    if !status.is_success() {
+                        if let Some(operation) = operation.as_ref() {
+                            operation
+                                .fail(unix_now_ms(), format!("upstream returned HTTP {status}"))
+                                .await
+                                .context("durably fail rejected response operation")?;
+                        }
+                    } else if let Some(operation) = operation.take() {
+                        response.extensions_mut().insert(operation);
+                    }
                     if status.is_success()
                         && let Some(turn_state) = response
                             .headers()
@@ -1216,6 +1353,25 @@ impl App {
                     ));
                 }
                 Err(e) => {
+                    if let Some(operation) = operation.as_ref() {
+                        if is_connect_failure(&e) {
+                            operation
+                                .fail(
+                                    unix_now_ms(),
+                                    "upstream connection failed before response dispatch",
+                                )
+                                .await
+                                .context("durably fail unconnected response operation")?;
+                        } else {
+                            operation
+                                .abandon(
+                                    unix_now_ms(),
+                                    "upstream request failed with an ambiguous dispatch outcome",
+                                )
+                                .await
+                                .context("durably abandon ambiguous response operation")?;
+                        }
+                    }
                     if is_account_neutral_connect_failure(&e) {
                         warn!(account, error = %e, "shared upstream network failure");
                         return Err(e);
@@ -2266,7 +2422,19 @@ impl App {
                                     continue;
                                 }
                             };
-                            send_upgraded_bounded(&mut upstream, client_message.clone()).await?;
+                            let operation = self.begin_response_operation(&account).await?;
+                            if let Err(error) =
+                                send_upgraded_bounded(&mut upstream, client_message.clone()).await
+                            {
+                                operation
+                                    .abandon(
+                                        unix_now_ms(),
+                                        "direct WebSocket send failed with an ambiguous dispatch outcome",
+                                    )
+                                    .await
+                                    .context("durably abandon ambiguous direct response operation")?;
+                                return Err(error);
+                            }
                             if analysis.has_nonportable_state {
                                 route.hard_owner = true;
                                 route.non_previous_hard_owner = true;
@@ -2279,6 +2447,7 @@ impl App {
                                 route,
                                 request: client_message,
                                 value,
+                                operation,
                             });
                             continue;
                         }
@@ -2407,6 +2576,13 @@ impl App {
                                         .turn(turn_id)
                                         .and_then(|turn| turn.response_id())
                                         .unwrap_or("");
+                                    if let Some(turn) = turns.get_mut(&turn_id) {
+                                        fail_response_operation(
+                                            &turn.operation,
+                                            "upstream rejected the previous response anchor",
+                                        )
+                                        .await?;
+                                    }
                                     send_upgraded_bounded(
                                         &mut client,
                                         Message::Text(
@@ -2437,6 +2613,15 @@ impl App {
                             }
                             if association.event_type.as_deref() == Some("response.created") {
                                 for turn_id in &association.turn_ids {
+                                    if let Some(response_id) = association.response_id.as_deref()
+                                        && let Some(turn) = turns.get_mut(turn_id)
+                                    {
+                                        acknowledge_response_operation(
+                                            &turn.operation,
+                                            response_id,
+                                        )
+                                        .await?;
+                                    }
                                     if awaiting_response_created == Some(*turn_id) {
                                         awaiting_response_created = None;
                                         missing_created_deadline = None;
@@ -2471,6 +2656,30 @@ impl App {
                                 &association.turn_ids,
                                 RESPONSES_UPSTREAM_IDLE_TIMEOUT,
                             );
+                            if let Some(terminal) = association.terminal {
+                                for turn_id in &association.turn_ids {
+                                    if let Some(turn) = turns.get_mut(turn_id) {
+                                        match terminal {
+                                            TerminalKind::Completed => {
+                                                complete_response_operation(
+                                                    &turn.operation,
+                                                    association.response_id.as_deref(),
+                                                )
+                                                .await?
+                                            }
+                                            TerminalKind::Failed
+                                            | TerminalKind::Cancelled
+                                            | TerminalKind::Incomplete => {
+                                                fail_response_operation(
+                                                    &turn.operation,
+                                                    "upstream emitted a terminal failure event",
+                                                )
+                                                .await?
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             send_upgraded_bounded(&mut client, message).await?;
                             for turn_id in &association.turn_ids {
                                 protocol
@@ -2560,6 +2769,13 @@ impl App {
                 }
             }
         }
+        for turn in turns.values() {
+            abandon_response_operation(
+                &turn.operation,
+                "downstream direct WebSocket ended before a terminal response event",
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -2589,6 +2805,29 @@ impl App {
         let Some(turn) = turns.get(&turn_id) else {
             return Ok(None);
         };
+        if !response_operation_is_terminal(&turn.operation) {
+            let definitive_reason = match failure {
+                FailureKind::Quota => {
+                    Some("upstream definitively rejected response.create for quota")
+                }
+                FailureKind::Authentication { .. } => {
+                    Some("upstream definitively rejected response.create authentication")
+                }
+                FailureKind::PreviousResponseNotFound => {
+                    Some("upstream definitively rejected the previous response anchor")
+                }
+                _ => None,
+            };
+            let Some(reason) = definitive_reason else {
+                // An ambiguous transport end may mean the request is still running upstream.
+                // Without an idempotency key, replaying it could duplicate work.
+                return Ok(None);
+            };
+            fail_response_operation(&turn.operation, reason).await?;
+        }
+        if !response_operation_is_terminal(&turn.operation) {
+            return Ok(None);
+        }
         let mut plan = match protocol.replay_plan(turn_id, failure, context) {
             Ok(plan) => plan,
             Err(_) => {
@@ -2706,16 +2945,29 @@ impl App {
         if committed != plan {
             anyhow::bail!("direct replay plan changed before commit")
         }
+        let replacement_operation = self
+            .begin_response_operation(&replacement_account)
+            .await
+            .context("durably record replacement direct response dispatch")?;
         if let Err(error) =
             send_upgraded_bounded(&mut replacement.socket, replay_message.clone()).await
         {
             warn!(%error, account = replacement_account, "safe direct replay send failed");
+            abandon_response_operation(
+                &replacement_operation,
+                "replacement direct WebSocket send failed with an ambiguous dispatch outcome",
+            )
+            .await?;
+            if let Some(turn) = turns.get_mut(&turn_id) {
+                turn.operation = replacement_operation;
+            }
             return Ok(None);
         }
         if let Some(turn) = turns.get_mut(&turn_id) {
             turn.request = replay_message;
             turn.value = replay_value;
             turn.route.account_id = replacement_account.clone();
+            turn.operation = replacement_operation;
             if mode == ReplayMode::FreshRequestWithoutPreviousResponse {
                 turn.route.hard_owner = turn.route.non_previous_hard_owner;
             }
@@ -2786,6 +3038,25 @@ impl App {
                 .and_then(|turn| turn.response_id())
                 .unwrap_or("")
                 .to_owned();
+            if let Some(turn) = turns.get_mut(&action.turn_id) {
+                match action.disposition {
+                    TurnEndDisposition::RejectedInput => {
+                        fail_response_operation(
+                            &turn.operation,
+                            "upstream definitively rejected response.create",
+                        )
+                        .await?;
+                    }
+                    TurnEndDisposition::StreamIncomplete
+                    | TurnEndDisposition::StreamIncompleteNoSynthetic => {
+                        abandon_response_operation(
+                            &turn.operation,
+                            "direct upstream ended without a definitive terminal event",
+                        )
+                        .await?;
+                    }
+                }
+            }
             match action.disposition {
                 TurnEndDisposition::RejectedInput => {
                     send_direct_error(
@@ -3667,6 +3938,7 @@ fn map_http_response_leased(
     let (mut parts, body) = response.into_parts();
     headers::strip_hop_by_hop(&mut parts.headers);
     parts.extensions.insert(SelectedAccount(account.clone()));
+    let operation = parts.extensions.remove::<AsyncOperationHandle>();
     let observer = observe_response_ids
         .then(|| response_observer_for_content_type(parts.headers.get(CONTENT_TYPE)));
     Response::from_parts(
@@ -3675,10 +3947,13 @@ fn map_http_response_leased(
             inner: body,
             router,
             account: Some(account),
+            operation,
             observer,
             pending_frame: None,
-            pending_binding: None,
+            pending_work: None,
+            pending_error: None,
             pending_end: false,
+            finished: false,
         }),
     )
 }
@@ -3687,10 +3962,20 @@ struct LeasedIncoming {
     inner: Incoming,
     router: Arc<Router>,
     account: Option<String>,
+    operation: Option<AsyncOperationHandle>,
     observer: Option<HttpResponseObserver>,
     pending_frame: Option<Frame<bytes::Bytes>>,
-    pending_binding: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
+    pending_work: Option<Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + Sync>>>,
+    pending_error: Option<std::io::Error>,
     pending_end: bool,
+    finished: bool,
+}
+
+#[derive(Clone)]
+struct ObservedResponseEvent {
+    response_id: Option<String>,
+    created: bool,
+    terminal: Option<sse::TerminalStatus>,
 }
 
 enum HttpResponseObserver {
@@ -3709,7 +3994,7 @@ fn response_observer_for_content_type(
 }
 
 impl HttpResponseObserver {
-    fn observe(&mut self, data: &[u8]) -> Vec<String> {
+    fn observe(&mut self, data: &[u8]) -> Vec<ObservedResponseEvent> {
         match self {
             Self::Sse(decoder) => observe_sse_response_ids(decoder, data),
             Self::Json(json) => {
@@ -3745,7 +4030,7 @@ impl HttpResponseObserver {
         }
     }
 
-    fn finish(self) -> Vec<String> {
+    fn finish(self) -> Vec<ObservedResponseEvent> {
         match self {
             Self::Sse(mut decoder) => response_ids_from_sse_finish(&mut decoder),
             Self::Json(Some(bytes)) => response_ids_from_json(&bytes),
@@ -3755,35 +4040,38 @@ impl HttpResponseObserver {
     }
 }
 
-fn observe_sse_response_ids(decoder: &mut SseDecoder, data: &[u8]) -> Vec<String> {
-    let mut response_id = None;
+fn observe_sse_response_ids(decoder: &mut SseDecoder, data: &[u8]) -> Vec<ObservedResponseEvent> {
+    let mut observed = Vec::new();
     for slice in data.chunks(SSE_DECODE_SLICE_BYTES) {
-        if let Ok(events) = decoder.push(slice)
-            && response_id.is_none()
-        {
-            response_id = events.into_iter().find_map(response_id_from_protocol_event);
+        if let Ok(events) = decoder.push(slice) {
+            observed.extend(events.into_iter().map(observed_response_event));
         }
     }
-    response_id.into_iter().collect()
+    observed
 }
 
-fn response_ids_from_sse_finish(decoder: &mut SseDecoder) -> Vec<String> {
+fn response_ids_from_sse_finish(decoder: &mut SseDecoder) -> Vec<ObservedResponseEvent> {
     decoder
         .finish()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(response_id_from_protocol_event)
+        .map(observed_response_event)
         .collect()
 }
 
-fn response_id_from_protocol_event(event: ProtocolEvent) -> Option<String> {
-    event
+fn observed_response_event(event: ProtocolEvent) -> ObservedResponseEvent {
+    let response_id = event
         .value
         .get("response")
         .and_then(|response| response.get("id"))
         .and_then(serde_json::Value::as_str)
         .filter(|id| !id.is_empty())
-        .map(str::to_owned)
+        .map(str::to_owned);
+    ObservedResponseEvent {
+        response_id,
+        created: event.event_type == "response.created",
+        terminal: event.terminal,
+    }
 }
 
 impl Body for LeasedIncoming {
@@ -3795,16 +4083,25 @@ impl Body for LeasedIncoming {
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         loop {
-            if let Some(binding) = self.pending_binding.as_mut() {
-                if binding.as_mut().poll(cx).is_pending() {
-                    return Poll::Pending;
+            if let Some(work) = self.pending_work.as_mut() {
+                match work.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(error)) => {
+                        self.pending_work = None;
+                        return Poll::Ready(Some(Err(error)));
+                    }
                 }
-                self.pending_binding = None;
+                self.pending_work = None;
                 if let Some(frame) = self.pending_frame.take() {
                     return Poll::Ready(Some(Ok(frame)));
                 }
+                if let Some(error) = self.pending_error.take() {
+                    return Poll::Ready(Some(Err(error)));
+                }
                 if self.pending_end {
                     self.pending_end = false;
+                    self.finished = true;
                     return Poll::Ready(None);
                 }
             }
@@ -3812,33 +4109,37 @@ impl Body for LeasedIncoming {
             match Pin::new(&mut self.inner).poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Err(error))) => {
-                    return Poll::Ready(Some(Err(std::io::Error::other(error))));
+                    self.pending_error = Some(std::io::Error::other(error));
+                    self.pending_work = self.response_work(
+                        Vec::new(),
+                        Some("upstream response body ended with a transport error"),
+                    );
                 }
                 Poll::Ready(Some(Ok(frame))) => {
-                    let ids = frame
+                    let observations = frame
                         .data_ref()
                         .map(|data| self.observe_response_data(data))
                         .unwrap_or_default();
-                    if ids.is_empty() {
+                    if observations.is_empty() {
                         return Poll::Ready(Some(Ok(frame)));
                     }
                     self.pending_frame = Some(frame);
-                    self.pending_binding = self.response_binding(ids);
+                    self.pending_work = self.response_work(observations, None);
                 }
                 Poll::Ready(None) => {
-                    let ids = self.finish_response_observer();
-                    if ids.is_empty() {
-                        return Poll::Ready(None);
-                    }
+                    let observations = self.finish_response_observer();
                     self.pending_end = true;
-                    self.pending_binding = self.response_binding(ids);
+                    self.pending_work = self.response_work(
+                        observations,
+                        Some("upstream response body ended without a definitive terminal event"),
+                    );
                 }
             }
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.finished
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -3847,49 +4148,95 @@ impl Body for LeasedIncoming {
 }
 
 impl LeasedIncoming {
-    fn observe_response_data(&mut self, data: &[u8]) -> Vec<String> {
+    fn observe_response_data(&mut self, data: &[u8]) -> Vec<ObservedResponseEvent> {
         self.observer
             .as_mut()
             .map(|observer| observer.observe(data))
             .unwrap_or_default()
     }
 
-    fn finish_response_observer(&mut self) -> Vec<String> {
+    fn finish_response_observer(&mut self) -> Vec<ObservedResponseEvent> {
         self.observer
             .take()
             .map(HttpResponseObserver::finish)
             .unwrap_or_default()
     }
 
-    fn response_binding(
+    fn response_work(
         &self,
-        ids: Vec<String>,
-    ) -> Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>> {
+        observations: Vec<ObservedResponseEvent>,
+        abandon_if_active: Option<&'static str>,
+    ) -> Option<Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + Sync>>> {
         let account = self.account.clone()?;
         let router = self.router.clone();
+        let operation = self.operation.clone();
         Some(Box::pin(async move {
-            for response_id in ids {
-                let key = router
-                    .affinity
-                    .key(&format!("previous-response:{response_id}"));
-                router.bind(key, &account).await;
+            for observed in observations {
+                if let Some(operation) = operation.as_ref() {
+                    if observed.created
+                        && let Some(response_id) = observed.response_id.as_deref()
+                    {
+                        acknowledge_response_operation(operation, response_id)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                    }
+                    if let Some(terminal) = observed.terminal {
+                        match terminal {
+                            sse::TerminalStatus::Completed => {
+                                complete_response_operation(
+                                    operation,
+                                    observed.response_id.as_deref(),
+                                )
+                                .await
+                                .map_err(std::io::Error::other)?;
+                            }
+                            sse::TerminalStatus::Failed | sse::TerminalStatus::Incomplete => {
+                                fail_response_operation(operation, terminal.event_type())
+                                    .await
+                                    .map_err(std::io::Error::other)?;
+                            }
+                        }
+                    }
+                }
+                if let Some(response_id) = observed.response_id {
+                    let key = router
+                        .affinity
+                        .key(&format!("previous-response:{response_id}"));
+                    router.bind(key, &account).await;
+                }
             }
+            if let (Some(reason), Some(operation)) = (abandon_if_active, operation.as_ref()) {
+                abandon_response_operation(operation, reason)
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
         }))
     }
 }
 
-fn response_ids_from_json(bytes: &[u8]) -> Vec<String> {
+fn response_ids_from_json(bytes: &[u8]) -> Vec<ObservedResponseEvent> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return Vec::new();
     };
-    value
-        .get("response")
-        .unwrap_or(&value)
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(|id| vec![id.to_owned()])
+    let events = if value.get("type").is_some() {
+        ProtocolEvent::from_value(value).map(|event| vec![event])
+    } else {
+        let response = value.get("response").cloned().unwrap_or(value);
+        if !response
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            return Vec::new();
+        }
+        responses_json_events(response)
+    };
+    events
         .unwrap_or_default()
+        .into_iter()
+        .map(observed_response_event)
+        .collect()
 }
 
 impl Drop for LeasedIncoming {
@@ -4213,11 +4560,12 @@ async fn pump_http_response_to_websocket(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let (parts, mut body) = response.into_parts();
+    let (mut parts, mut body) = response.into_parts();
     let selected_account = parts
         .extensions
         .get::<SelectedAccount>()
         .map(|selected| selected.0.clone());
+    let mut operation = parts.extensions.remove::<AsyncOperationHandle>();
     let result: Result<()> = async {
     if !status.is_success() {
         let bytes = match tokio::time::timeout_at(
@@ -4287,6 +4635,7 @@ async fn pump_http_response_to_websocket(
                 outbound,
                 app,
                 selected_account.as_deref(),
+                &mut operation,
                 &mut capture,
                 continuation,
             )
@@ -4331,6 +4680,7 @@ async fn pump_http_response_to_websocket(
                 outbound,
                 app,
                 selected_account.as_deref(),
+                &mut operation,
                 &mut capture,
                 continuation,
             )
@@ -4348,6 +4698,7 @@ async fn pump_http_response_to_websocket(
             outbound,
             app,
             selected_account.as_deref(),
+            &mut operation,
             &mut capture,
             continuation,
         )
@@ -4391,6 +4742,7 @@ async fn pump_http_response_to_websocket(
         outbound,
         app,
         selected_account.as_deref(),
+        &mut operation,
         &mut capture,
         continuation,
     )
@@ -4401,6 +4753,21 @@ async fn pump_http_response_to_websocket(
     Ok(())
     }
     .await;
+    if result.is_err()
+        && let Some(operation) = operation.as_ref()
+        && !response_operation_is_terminal(operation)
+        && let Err(error) = abandon_response_operation(
+            operation,
+            "HTTP bridge ended without a definitive terminal response event",
+        )
+        .await
+    {
+        return Err(HttpBridgePumpFailure {
+            error,
+            delivered_event: capture.delivered_event,
+            liveness,
+        });
+    }
     result.map_err(|error| HttpBridgePumpFailure {
         error,
         delivered_event: capture.delivered_event,
@@ -4413,10 +4780,35 @@ async fn send_protocol_events(
     outbound: &BridgeSender,
     app: &Arc<App>,
     account: Option<&str>,
+    operation: &mut Option<AsyncOperationHandle>,
     capture: &mut HttpBridgeCapture,
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
 ) -> Result<bool> {
     for event in events {
+        let response_id = event
+            .value
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty());
+        if event.event_type == "response.created"
+            && let Some(response_id) = response_id
+            && let Some(operation) = operation.as_ref()
+        {
+            acknowledge_response_operation(operation, response_id).await?;
+        }
+        if let Some(terminal) = event.terminal
+            && let Some(operation) = operation.as_ref()
+        {
+            match terminal {
+                sse::TerminalStatus::Completed => {
+                    complete_response_operation(operation, response_id).await?
+                }
+                sse::TerminalStatus::Failed | sse::TerminalStatus::Incomplete => {
+                    fail_response_operation(operation, terminal.event_type()).await?
+                }
+            }
+        }
         capture.observe(&event.value);
         if let Some(account) = account {
             bind_response_id_from_event(app, &event.payload, account).await;
@@ -4449,6 +4841,7 @@ async fn send_sse_data(
     outbound: &BridgeSender,
     app: &Arc<App>,
     account: Option<&str>,
+    operation: &mut Option<AsyncOperationHandle>,
     capture: &mut HttpBridgeCapture,
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
 ) -> Result<bool> {
@@ -4458,6 +4851,7 @@ async fn send_sse_data(
             outbound,
             app,
             account,
+            operation,
             capture,
             continuation,
         )
@@ -4622,6 +5016,16 @@ mod tests {
         body: Bytes,
     }
 
+    fn observed_response_ids(events: Vec<ObservedResponseEvent>) -> Vec<String> {
+        let mut ids = Vec::new();
+        for id in events.into_iter().filter_map(|event| event.response_id) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
     #[tokio::test]
     async fn inflight_guard_clears_counter_when_task_is_aborted() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -4725,7 +5129,10 @@ mod tests {
                 .observe(br#"{"id":"resp_missing_type","object":"response"}"#)
                 .is_empty()
         );
-        assert_eq!(observer.finish(), ["resp_missing_type"]);
+        assert_eq!(
+            observed_response_ids(observer.finish()),
+            ["resp_missing_type"]
+        );
     }
 
     #[test]
@@ -4738,7 +5145,10 @@ mod tests {
                 .observe(br#"{"response":{"id":"resp_generic_type"}}"#)
                 .is_empty()
         );
-        assert_eq!(observer.finish(), ["resp_generic_type"]);
+        assert_eq!(
+            observed_response_ids(observer.finish()),
+            ["resp_generic_type"]
+        );
     }
 
     #[test]
@@ -4749,7 +5159,7 @@ mod tests {
         let event = br#"data: {"type":"response.created","response":{"id":"resp_stream"}}
 
 "#;
-        let ids = observer.observe(event);
+        let ids = observed_response_ids(observer.observe(event));
         assert_eq!(ids, ["resp_stream"]);
         assert!(matches!(observer, HttpResponseObserver::Sse(_)));
         assert!(observer.finish().is_empty());
@@ -4758,7 +5168,7 @@ mod tests {
         // from the current frame instead of waiting for EOF/JSON parsing.
         let generic = hyper::header::HeaderValue::from_static("application/octet-stream");
         let mut observer = response_observer_for_content_type(Some(&generic));
-        let ids = observer.observe(event);
+        let ids = observed_response_ids(observer.observe(event));
         assert_eq!(ids, ["resp_stream"]);
         assert!(observer.finish().is_empty());
 
@@ -4770,7 +5180,10 @@ mod tests {
                 .observe(b"  {\"id\":\"resp_mislabeled_json\",\"object\":\"response\"}")
                 .is_empty()
         );
-        assert_eq!(observer.finish(), ["resp_mislabeled_json"]);
+        assert_eq!(
+            observed_response_ids(observer.finish()),
+            ["resp_mislabeled_json"]
+        );
     }
 
     #[test]
@@ -4831,7 +5244,7 @@ mod tests {
             );
             let router = Arc::new(Router::new(&config, affinity));
 
-            let error = match App::new(config, router, Arc::new(Stats::default())) {
+            let error = match App::new(config, router, Arc::new(Stats::default())).await {
                 Ok(_) => panic!("public constructor accepted credential destination {upstream}"),
                 Err(error) => error,
             };
@@ -4897,7 +5310,9 @@ mod tests {
         );
         let router = Arc::new(Router::new(&config, affinity));
         let stats = Arc::new(Stats::default());
-        let app = App::new_unvalidated(config, router.clone(), stats.clone()).unwrap();
+        let app = App::new_unvalidated(config, router.clone(), stats.clone())
+            .await
+            .unwrap();
         (app, listener, router, stats)
     }
 
@@ -4940,7 +5355,9 @@ mod tests {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        App::new(config, router, Arc::new(Stats::default())).unwrap()
+        App::new(config, router, Arc::new(Stats::default()))
+            .await
+            .unwrap()
     }
 
     fn pending_sse_response(
@@ -5550,12 +5967,14 @@ mod tests {
 
         let mut protocol = ProtocolState::new(ProtocolLimits::default()).unwrap();
         let turn_id = protocol.admit_response_create(&value).unwrap();
+        let operation = app.begin_response_operation("a").await.unwrap();
         let mut turns = HashMap::from([(
             turn_id,
             DirectTurn {
                 route,
                 request: Message::Text(value.to_string().into()),
                 value,
+                operation,
             },
         )]);
         let replayed = app
@@ -5702,7 +6121,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new_unvalidated(config, router, Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router, Arc::new(Stats::default()))
+            .await
+            .unwrap();
         let proxy_task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
 
         let client: TestClient<HttpConnector, Full<Bytes>> =
@@ -5964,7 +6385,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new_unvalidated(config, router, Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router, Arc::new(Stats::default()))
+            .await
+            .unwrap();
         let proxy_task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
         let client: TestClient<HttpConnector, Full<Bytes>> =
             TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
@@ -6057,7 +6480,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default()))
+            .await
+            .unwrap();
         let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
         (proxy_addr, task, router)
     }
@@ -6124,7 +6549,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default()))
+            .await
+            .unwrap();
         let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
         (proxy_addr, task, router)
     }
@@ -6180,7 +6607,9 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        let app = App::new_unvalidated(config, router, Arc::new(Stats::default())).unwrap();
+        let app = App::new_unvalidated(config, router, Arc::new(Stats::default()))
+            .await
+            .unwrap();
         let task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
         (proxy_addr, task)
     }

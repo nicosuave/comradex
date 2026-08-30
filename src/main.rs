@@ -327,7 +327,7 @@ async fn serve(path: &Path, shutdown_budget: &mut ShutdownBudget) -> Result<()> 
         stats.clone(),
     )?;
     let mut control_task = tokio::spawn(control_server.run());
-    let app = App::new(config.clone(), router.clone(), stats.clone())?;
+    let app = App::new(config.clone(), router.clone(), stats.clone()).await?;
     let mut tasks = tokio::task::JoinSet::new();
     for (name, listener) in config.listeners.clone() {
         tasks.spawn(app.clone().run_listener(name, listener));
