@@ -255,6 +255,10 @@ kind = "inbound"
 }
 
 async fn serve(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some((soft, hard)) = open_file_limits() {
+        info!(soft, hard, "open file limits");
+    }
     let config_path =
         fs::canonicalize(path).with_context(|| format!("resolve config {}", path.display()))?;
     let config = Arc::new(load_config(path)?);
@@ -351,6 +355,17 @@ async fn serve(path: &Path) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_file_limits() -> Option<(u64, u64)> {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limits` points to initialized writable storage for getrlimit.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) };
+    (result == 0).then_some((limits.rlim_cur, limits.rlim_max))
 }
 
 async fn shutdown_signal() -> Result<()> {

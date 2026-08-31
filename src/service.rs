@@ -14,6 +14,9 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 
 const LABEL: &str = "com.nicosuave.comradex";
+// Replay spooling plus the configured bridge/session ceilings can legitimately
+// consume about 6,800 descriptors before ordinary HTTP keep-alives.
+const SERVICE_NOFILE_SOFT_LIMIT: u64 = 8192;
 // launchd can take several seconds to uncork a freshly installed or upgraded
 // executable. Keep this comfortably above the 8-9 second starts observed on
 // otherwise healthy Apple Silicon hosts.
@@ -124,6 +127,8 @@ fn render_plist(
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
+  <key>SoftResourceLimits</key>
+  <dict><key>NumberOfFiles</key><integer>{nofile_soft_limit}</integer></dict>
   <key>EnvironmentVariables</key>
   <dict><key>COMRADEX_SERVICE_NONCE</key><string>{service_nonce}</string></dict>
   <key>StandardOutPath</key><string>{stdout}</string>
@@ -138,6 +143,7 @@ fn render_plist(
         stdout = xml(stdout),
         stderr = xml(stderr),
         service_nonce = service_nonce,
+        nofile_soft_limit = SERVICE_NOFILE_SOFT_LIMIT,
     )
 }
 
@@ -1200,5 +1206,14 @@ mod tests {
         file.write_all(plist.as_bytes()).unwrap();
         file.as_file().sync_all().unwrap();
         validate_plist(file.path()).unwrap();
+
+        let output = Command::new("plutil")
+            .args(["-extract", "SoftResourceLimits.NumberOfFiles", "raw", "--"])
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "8192");
+        assert!(!plist.contains("HardResourceLimits"));
     }
 }
