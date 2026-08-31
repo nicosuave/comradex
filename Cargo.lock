@@ -278,7 +278,6 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rustls",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
@@ -290,6 +289,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
 ]
 
 [[package]]
