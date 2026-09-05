@@ -19,7 +19,7 @@ pub fn installed_record(record_path: &Path) -> Option<InstallRecord> {
     read_install_record(record_path).ok().flatten()
 }
 
-pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<()> {
+pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<String> {
     let destination = resolve_destination(codex_config)?;
     let original = match fs::read_to_string(&destination) {
         Ok(v) => v,
@@ -29,6 +29,14 @@ pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<()>
     let mut doc = original
         .parse::<DocumentMut>()
         .context("parse Codex config.toml")?;
+    let installed_url = if context_management_experimental_mode(&doc) {
+        let base = url
+            .strip_suffix("/v1")
+            .context("Comradex install URL must end in /v1")?;
+        format!("{base}/backend-api/codex")
+    } else {
+        url.to_owned()
+    };
     let current_url = doc
         .get("openai_base_url")
         .and_then(Item::as_str)
@@ -51,11 +59,11 @@ pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<()>
         }
         None => current_url,
     };
-    doc["openai_base_url"] = value(url);
+    doc["openai_base_url"] = value(&installed_url);
     atomic_write(&destination, doc.to_string().as_bytes())?;
     let record = InstallRecord {
         codex_config: destination.clone(),
-        installed_url: url.to_owned(),
+        installed_url: installed_url.clone(),
         previous_url,
     };
     if let Err(error) = atomic_write(record_path, &serde_json::to_vec_pretty(&record)?) {
@@ -63,7 +71,17 @@ pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<()>
             .context("roll back Codex config after install-record failure")?;
         return Err(error).context("write install record");
     }
-    Ok(())
+    Ok(installed_url)
+}
+
+fn context_management_experimental_mode(doc: &DocumentMut) -> bool {
+    doc.get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|features| features.get("context_management"))
+        .and_then(Item::as_table_like)
+        .and_then(|context_management| context_management.get("experimental_mode"))
+        .and_then(Item::as_bool)
+        == Some(true)
 }
 
 fn read_install_record(path: &Path) -> Result<Option<InstallRecord>> {
@@ -192,20 +210,60 @@ mod tests {
     }
 
     #[test]
+    fn install_uses_backend_api_codex_when_context_management_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let record = dir.path().join("install.json");
+        fs::write(
+            &config,
+            "[features.context_management]\nexperimental_mode = true\n",
+        )
+        .unwrap();
+
+        let installed = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+
+        assert_eq!(installed, "http://127.0.0.1:10100/secret/backend-api/codex");
+        assert!(
+            fs::read_to_string(&config)
+                .unwrap()
+                .contains("http://127.0.0.1:10100/secret/backend-api/codex")
+        );
+    }
+
+    #[test]
+    fn install_uses_v1_when_context_management_is_disabled_or_absent() {
+        for config_text in [
+            "[features.context_management]\nexperimental_mode = false\n",
+            "model = \"gpt-test\"\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.toml");
+            let record = dir.path().join("install.json");
+            fs::write(&config, config_text).unwrap();
+
+            let installed = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+
+            assert_eq!(installed, "http://127.0.0.1:10100/secret/v1");
+        }
+    }
+
+    #[test]
     fn repeated_install_preserves_original_pre_comradex_url() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         let record = dir.path().join("install.json");
         fs::write(
             &config,
-            "model = \"gpt-test\"\nopenai_base_url = \"http://127.0.0.1:10100/v1\"\n",
+            "model = \"gpt-test\"\nopenai_base_url = \"http://127.0.0.1:10100/v1\"\n[features.context_management]\nexperimental_mode = true\n",
         )
         .unwrap();
 
-        install(&config, &record, "http://127.0.0.1:10100/secret-a/v1").unwrap();
-        install(&config, &record, "http://127.0.0.1:10100/secret-b/v1").unwrap();
+        let first = install(&config, &record, "http://127.0.0.1:10100/secret-a/v1").unwrap();
+        let second = install(&config, &record, "http://127.0.0.1:10100/secret-b/v1").unwrap();
         uninstall(&record).unwrap();
 
+        assert!(first.ends_with("/secret-a/backend-api/codex"));
+        assert!(second.ends_with("/secret-b/backend-api/codex"));
         let restored = fs::read_to_string(&config).unwrap();
         assert!(restored.contains("http://127.0.0.1:10100/v1"));
         assert!(!restored.contains("secret-a"));

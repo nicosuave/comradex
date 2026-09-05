@@ -54,6 +54,33 @@ pub struct Credentials {
     pub account_id: Option<String>,
 }
 
+impl Credentials {
+    /// Context belongs to a user within a workspace, not to a token or a config alias.
+    /// These claims identify the credential; upstream still authenticates the bearer itself.
+    pub fn context_identity(&self) -> Result<String> {
+        let token = self
+            .authorization
+            .strip_prefix("Bearer ")
+            .context("context identity unavailable")?;
+        let payload = jwt_payload(token).context("context identity unavailable")?;
+        let claims = &payload["https://api.openai.com/auth"];
+        let user = claims["chatgpt_user_id"]
+            .as_str()
+            .or_else(|| payload["sub"].as_str())
+            .filter(|s| !s.is_empty())
+            .context("context identity unavailable")?;
+        let workspace = claims["chatgpt_account_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("context identity unavailable")?;
+        anyhow::ensure!(
+            self.account_id.as_deref().is_none_or(|id| id == workspace),
+            "context identity mismatch"
+        );
+        Ok(serde_json::to_string(&(workspace, user))?)
+    }
+}
+
 #[derive(Clone)]
 pub struct Resolver {
     client: AuthClient,

@@ -435,8 +435,9 @@ fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) 
         "http://{}/{}/v1",
         listener.address, config.proxy.installation_secret
     );
-    install::install(codex_config, &state_dir(&config).join("install.json"), &url)?;
-    println!("installed openai_base_url = {url}");
+    let installed_url =
+        install::install(codex_config, &state_dir(&config).join("install.json"), &url)?;
+    println!("installed openai_base_url = {installed_url}");
     Ok(())
 }
 

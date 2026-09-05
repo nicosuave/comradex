@@ -319,6 +319,17 @@ impl Router {
             .collect()
     }
 
+    /// Native context tools use account-local storage independently of inference quota.
+    pub async fn context_account_available(&self, pool: &PoolConfig, account: &str) -> bool {
+        pool.members.iter().any(|member| member == account)
+            && self
+                .accounts
+                .lock()
+                .await
+                .get(account)
+                .is_some_and(|runtime| !runtime.needs_login && !runtime.login_in_progress)
+    }
+
     pub async fn begin(&self, account: &str) {
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             a.inflight += 1;

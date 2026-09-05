@@ -173,6 +173,41 @@ The service manages only `com.nicosuave.comradex`; it does not inspect, stop, or
 
 ## How routing works
 
+### Experimental Codex history and notes
+
+Codex 0.153.4's native context management is opt-in. If your Codex configuration already contains
+`[features.context_management]` with `experimental_mode = true`, `comradex install` uses
+`/<installation_secret>/backend-api/codex` instead of `/v1`. Comradex does not enable the feature.
+Both authenticated URL forms remain supported. Start a new task after enabling it so Comradex can
+track its history from the first inference request.
+
+The first context operation or qualifying inference dispatch establishes a durable notes owner for
+the root session. After inference switches from account A to B, notes reads and writes still use A's
+credentials, and their results are delivered to inference on B. No notes are copied between accounts.
+Inference quota exhaustion does not prevent accessing notes, but missing credentials, an account
+being logged into, removal from the pool, or a different user signing into the same account alias
+make that owner's context unavailable. Notes writes never fail over to another account.
+
+History remains on every account that participated in inference. Comradex queries those accounts
+with at most four concurrent requests and a 30-second overall deadline. Every participant must
+succeed; one failure fails the history query rather than returning an incomplete record. History
+results stay encrypted and are supplied as separate partitions for the model to combine. Global
+ordering, deduplication, and pagination are not guaranteed by the proxy. A failed context query
+does not change inference quota state or globally stop inference.
+
+The relay preserves native encrypted arguments and protocol headers. It authenticates and encrypts
+the combined tool result, then restores the native results before the next inference request. Only
+verified context outputs receive portable routing treatment; unrelated encrypted reasoning and
+other account-owned state retain their existing continuity restrictions. HTTP, the HTTP WebSocket
+bridge, and direct Responses WebSockets support this path. Backend-alias Responses WebSockets use
+frame inspection even when the legacy `/v1` transport is configured as raw.
+
+Preserve `context.sqlite3` in the state directory and the existing `proxy.affinity_key` across
+restarts. Ownership is scoped to the pool and root session, distinguishes users within a shared
+workspace, and survives quota failures and authentication changes. Up to 32 physical participants
+are recorded per session; a dispatch that would exceed that limit fails before reaching upstream.
+Changing or losing the state/key requires starting a new context task.
+
 Each listener maps to an account pool. Comradex uses Codex's continuity signals to keep related work on the same healthy account, while quota thresholds affect only the admission of new threads.
 
 ### Affinity and ownership
