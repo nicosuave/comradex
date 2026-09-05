@@ -442,6 +442,88 @@ async fn notes_stay_with_owner_and_history_fans_out_to_all_inference_participant
 }
 
 #[tokio::test]
+async fn context_wrappers_revalidate_source_credentials_before_inference() {
+    for history in [false, true] {
+        for state in [
+            "login",
+            "different-user",
+            "different-workspace",
+            "same-owner",
+        ] {
+            let upstream = start_upstream(Arc::new(|_| {
+                (
+                    StatusCode::OK,
+                    json!({"encrypted_output": "source-ciphertext"}),
+                )
+            }))
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let test = context_test_app(dir.path(), upstream.address);
+            let mut wrapper = establish_owner_and_fetch_note_wrapper(&test).await;
+            let source_home = if history {
+                // Validate the second participant too, not just the notes owner.
+                test.app
+                    .context_store
+                    .record_dispatch(
+                        "default",
+                        SESSION,
+                        "b",
+                        &context_identity("workspace-b", "user-b"),
+                    )
+                    .await
+                    .unwrap();
+                let (status, body) = post(
+                    &test.app,
+                    &test.listener,
+                    "/alpha/history/v2/list_items",
+                    hyper::HeaderMap::new(),
+                    Bytes::from_static(
+                        br#"{"context":{"session_id":"123e4567-e89b-12d3-a456-426614174000","current_agent_name":"/root"}}"#,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                wrapper = serde_json::from_slice(&body).unwrap();
+                dir.path().join("b")
+            } else {
+                test.account_a.clone()
+            };
+            let (alias, workspace, user) = if history {
+                ("b", "workspace-b", "user-b")
+            } else {
+                ("a", "workspace-a", "user-a")
+            };
+            match state {
+                "login" => assert!(test.app.router.begin_login(alias).await),
+                "different-user" => write_auth(&source_home, workspace, "replacement-user"),
+                "different-workspace" => write_auth(&source_home, "replacement-workspace", user),
+                "same-owner" => write_auth(&source_home, workspace, user),
+                _ => unreachable!(),
+            }
+            upstream.seen.lock().unwrap().clear();
+
+            let (status, body) = post(
+                &test.app,
+                &test.listener,
+                "/responses",
+                hyper::HeaderMap::new(),
+                response_with_context_wrapper(&wrapper, false),
+            )
+            .await;
+            if state == "same-owner" {
+                assert_eq!(status, StatusCode::OK);
+                assert!(!upstream.seen.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{history}: {state}");
+                let error: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(error["error"]["type"], "context_result_invalid");
+                assert!(upstream.seen.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn signed_context_wrapper_can_rotate_inference_without_moving_notes_owner() {
     let upstream = start_upstream(Arc::new(|request| {
         if request.path.contains("/alpha/notes/") {

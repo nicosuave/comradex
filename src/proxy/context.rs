@@ -41,7 +41,13 @@ pub(super) fn inference_session(body: &Value) -> Option<&str> {
 }
 
 impl App {
-    pub(super) async fn context_routing_view(&self, body: &Value, scope: &str) -> Result<Value> {
+    pub(super) async fn context_routing_view(
+        &self,
+        body: &Value,
+        listener: &ListenerConfig,
+        headers: &hyper::HeaderMap,
+    ) -> Result<Value> {
+        let scope = &listener.pool;
         let session = inference_session(body).unwrap_or("");
         let sources = self.context_codec.source_partitions(body, scope, session)?;
         if !sources.is_empty() {
@@ -50,20 +56,13 @@ impl App {
                 .lookup(scope, session)
                 .await?
                 .context("context source unavailable")?;
-            let pool = self
-                .config
-                .pools
-                .get(scope)
-                .context("context source unavailable")?;
             for source in sources {
                 let account = stored
                     .participants
                     .get(source - 1)
                     .context("context source unavailable")?;
-                anyhow::ensure!(
-                    pool.members.contains(&account.alias),
-                    "context source unavailable"
-                );
+                // A retained alias is insufficient after login or a physical identity change.
+                self.context_credentials(account, listener, headers).await?;
             }
         }
         self.context_codec.routing_view(body, scope, session)

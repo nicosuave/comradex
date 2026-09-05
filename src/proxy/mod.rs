@@ -975,7 +975,10 @@ impl App {
         {
             let bytes = replay.into_bytes().await?;
             let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
-            let routing_value = match self.context_routing_view(&value, &listener.pool).await {
+            let routing_value = match self
+                .context_routing_view(&value, listener, &inbound_headers)
+                .await
+            {
                 Ok(value) => value,
                 Err(_) => {
                     return Ok(error_response(
@@ -2276,7 +2279,7 @@ impl App {
                                 continue;
                             }
                             let mut value = parsed.expect("response.create was checked");
-                            let routing_value = match self.context_routing_view(&value, &listener.pool).await {
+                            let routing_value = match self.context_routing_view(&value, &listener, &headers).await {
                                 Ok(value) => value,
                                 Err(_) => {
                                     send_direct_error(&mut client, "context_result_invalid", "invalid context result").await?;
