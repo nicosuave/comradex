@@ -26,6 +26,8 @@ pub struct ReplayBody {
     len: usize,
     stats: Arc<Stats>,
     thread_id: Option<String>,
+    context_session_id: Option<String>,
+    context_envelope: bool,
     previous_response_id: Option<String>,
     prompt_cache_key: Option<String>,
     file_ids: Vec<String>,
@@ -37,6 +39,7 @@ pub struct ReplayBody {
 enum KeyKind {
     ClientMetadata,
     ThreadId,
+    SessionId,
     PreviousResponseId,
     PromptCacheKey,
     FileId,
@@ -64,6 +67,8 @@ struct MetadataScanner {
     key: Option<KeyKind>,
     pending_value: Option<KeyKind>,
     thread_id: Option<String>,
+    context_session_id: Option<String>,
+    context_envelope: bool,
     previous_response_id: Option<String>,
     prompt_cache_key: Option<String>,
     file_ids: Vec<String>,
@@ -117,6 +122,7 @@ impl MetadataScanner {
                         matches!(
                             kind,
                             KeyKind::ThreadId
+                                | KeyKind::SessionId
                                 | KeyKind::PreviousResponseId
                                 | KeyKind::PromptCacheKey
                                 | KeyKind::FileId
@@ -134,6 +140,7 @@ impl MetadataScanner {
                 }
                 b'{' => {
                     if self.containers.len() >= 128 {
+                        self.nonportable_state = true;
                         self.disabled = true;
                         continue;
                     }
@@ -151,6 +158,7 @@ impl MetadataScanner {
                 }
                 b'[' => {
                     if self.containers.len() >= 128 {
+                        self.nonportable_state = true;
                         self.disabled = true;
                         continue;
                     }
@@ -201,11 +209,16 @@ impl MetadataScanner {
 
     fn finish_string(&mut self) {
         self.in_string = false;
+        self.context_envelope |=
+            !self.string_is_key && self.token.starts_with(b"comradex-context-v1:");
+        // Also inspect an all-turns request without session metadata so it fails closed.
+        self.context_envelope |= !self.string_is_key && self.token == b"all_turns";
         if let Some(kind) = self.capture_value {
             if !self.token_overflow && !self.token.is_empty() {
                 let value = String::from_utf8(self.token.clone()).ok();
                 match kind {
                     KeyKind::ThreadId => self.thread_id = value,
+                    KeyKind::SessionId => self.context_session_id = value,
                     KeyKind::PreviousResponseId => self.previous_response_id = value,
                     KeyKind::PromptCacheKey => self.prompt_cache_key = value,
                     KeyKind::FileId => {
@@ -258,6 +271,8 @@ impl MetadataScanner {
                 Some(KeyKind::ClientMetadata)
             } else if in_client && !self.token_overflow && self.token == b"thread_id" {
                 Some(KeyKind::ThreadId)
+            } else if in_client && !self.token_overflow && self.token == b"session_id" {
+                Some(KeyKind::SessionId)
             } else if at_root && !self.token_overflow && self.token == b"previous_response_id" {
                 Some(KeyKind::PreviousResponseId)
             } else if at_root && !self.token_overflow && self.token == b"prompt_cache_key" {
@@ -339,6 +354,8 @@ impl ReplayBody {
             storage: Storage::Memory(bytes),
             stats,
             thread_id: metadata.thread_id,
+            context_session_id: metadata.context_session_id,
+            context_envelope: metadata.context_envelope,
             previous_response_id: metadata.previous_response_id,
             prompt_cache_key: metadata.prompt_cache_key,
             file_ids: metadata.file_ids,
@@ -416,6 +433,8 @@ impl ReplayBody {
             len,
             stats,
             thread_id: metadata.thread_id,
+            context_session_id: metadata.context_session_id,
+            context_envelope: metadata.context_envelope,
             previous_response_id: metadata.previous_response_id,
             prompt_cache_key: metadata.prompt_cache_key,
             file_ids: metadata.file_ids,
@@ -426,6 +445,18 @@ impl ReplayBody {
 
     pub fn thread_id(&self) -> Option<&str> {
         self.thread_id.as_deref()
+    }
+
+    pub fn context_session_id(&self) -> Option<&str> {
+        self.context_session_id.as_deref()
+    }
+
+    pub fn has_context_envelope(&self) -> bool {
+        self.context_envelope
+    }
+
+    pub fn use_context_routing_metadata(&mut self, view: &Self) {
+        self.nonportable_state = view.nonportable_state;
     }
 
     pub fn previous_response_id(&self) -> Option<&str> {
@@ -529,6 +560,26 @@ fn never_to_io(never: std::convert::Infallible) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nesting_limit_does_not_hide_later_account_owned_state() {
+        for opening in *b"[{" {
+            let mut scanner = MetadataScanner::default();
+            let mut nested = "null".to_owned();
+            for _ in 0..129 {
+                nested = if opening == b'[' {
+                    format!("[{nested}]")
+                } else {
+                    format!("{{\"padding\":{nested}}}")
+                };
+            }
+            let request = format!(
+                "{{\"padding\":{nested},\"input\":[{{\"encrypted_content\":\"opaque\"}}]}}"
+            );
+            scanner.feed(request.as_bytes());
+            assert!(scanner.nonportable_state);
+        }
+    }
 
     #[test]
     fn finds_body_thread_id_across_chunks_without_retaining_other_strings() {

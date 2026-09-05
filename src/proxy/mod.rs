@@ -1,3 +1,10 @@
+mod context;
+mod context_codec;
+mod context_store;
+#[cfg(test)]
+mod context_tests;
+#[cfg(test)]
+mod context_ws_tests;
 mod headers;
 mod replay_body;
 #[allow(dead_code)]
@@ -106,6 +113,7 @@ struct DirectTurn {
     route: WebSocketFrameRoute,
     request: Message,
     value: serde_json::Value,
+    routing_value: serde_json::Value,
 }
 
 struct DirectUpstream {
@@ -600,6 +608,8 @@ pub struct App {
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     file_owners: Arc<AffinityStore>,
+    context_store: context_store::ContextStore,
+    context_codec: context_codec::ContextCodec,
     tasks: AsyncMutex<JoinSet<()>>,
     shutting_down: AtomicBool,
     service_nonce: Option<String>,
@@ -656,6 +666,11 @@ impl App {
             ),
             auth: auth::Resolver::new(&config),
             file_owners,
+            context_store: context_store::ContextStore::open(
+                &state_dir.join("context.sqlite3"),
+                &config.proxy.affinity_key,
+            )?,
+            context_codec: context_codec::ContextCodec::new(&config.proxy.affinity_key),
             config,
             router,
             client,
@@ -864,8 +879,11 @@ impl App {
     }
 
     fn authorized_path(&self, uri: &Uri) -> Option<String> {
-        let prefix = format!("/{}/v1", self.config.proxy.installation_secret);
-        let suffix = uri.path().strip_prefix(&prefix)?;
+        let root = format!("/{}/", self.config.proxy.installation_secret);
+        let authenticated = uri.path().strip_prefix(&root)?;
+        let suffix = authenticated
+            .strip_prefix("backend-api/codex")
+            .or_else(|| authenticated.strip_prefix("v1"))?;
         if !suffix.is_empty() && !suffix.starts_with('/') {
             return None;
         }
@@ -945,6 +963,64 @@ impl App {
             previous_response_id: routing_previous_response_id,
             lane,
         } = context;
+        if path.starts_with("/alpha/history/") || path.starts_with("/alpha/notes/") {
+            return self
+                .handle_context(method, &path, &inbound_headers, listener, replay)
+                .await;
+        }
+        let context_body = if is_native_responses(&path)
+            && (replay.context_session_id().is_some()
+                || replay.has_nonportable_state()
+                || replay.has_context_envelope())
+        {
+            let bytes = replay.into_bytes().await?;
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let routing_value = match self
+                .context_routing_view(&value, listener, &inbound_headers)
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "context_result_invalid",
+                        "invalid context result",
+                    ));
+                }
+            };
+            let changed = match self.expand_context(&mut value, &listener.pool) {
+                Ok(changed) => changed,
+                Err(_) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "context_result_invalid",
+                        "invalid context result",
+                    ));
+                }
+            };
+            replay = ReplayBody::from_bytes(
+                if changed {
+                    serde_json::to_vec(&value)?.into()
+                } else {
+                    bytes
+                },
+                self.config.proxy.max_request_bytes,
+                self.config.proxy.max_spool_bytes,
+                self.stats.clone(),
+            )?;
+            if changed {
+                let routing_replay = ReplayBody::from_bytes(
+                    serde_json::to_vec(&routing_value)?.into(),
+                    self.config.proxy.max_request_bytes,
+                    self.config.proxy.max_spool_bytes,
+                    self.stats.clone(),
+                )?;
+                replay.use_context_routing_metadata(&routing_replay);
+            }
+            Some(value)
+        } else {
+            None
+        };
         let legacy_compact = method == Method::POST && is_legacy_compact_path(&path);
         if legacy_compact {
             let bytes = replay.into_bytes().await?;
@@ -1098,6 +1174,18 @@ impl App {
                 }
             };
             let _inflight = InflightGuard::new(counter);
+            if let Some(body) = &context_body
+                && self
+                    .record_context_dispatch(body, &listener.pool, &account, &credentials)
+                    .await
+                    .is_err()
+            {
+                return Ok(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "context_backend_unavailable",
+                    "context ownership could not be recorded",
+                ));
+            }
             self.router.begin(&account).await;
             let mut request_lease = DirectAccountLease::new(self.router.clone(), account.clone());
             let (body, upload_progress) = progress_body(replay.body(attempt)?);
@@ -2190,8 +2278,21 @@ impl App {
                                 send_direct_error(&mut client, "invalid_request_error", "response.create exceeds configured request limit").await?;
                                 continue;
                             }
+                            let mut value = parsed.expect("response.create was checked");
+                            let routing_value = match self.context_routing_view(&value, &listener, &headers).await {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    send_direct_error(&mut client, "context_result_invalid", "invalid context result").await?;
+                                    continue;
+                                }
+                            };
+                            if self.expand_context(&mut value, &listener.pool).is_err() {
+                                send_direct_error(&mut client, "context_result_invalid", "invalid context result").await?;
+                                continue;
+                            }
+                            let client_message = Message::Text(serde_json::to_string(&value)?.into());
                             let replay = ReplayBody::from_bytes(
-                                bytes::Bytes::copy_from_slice(text.as_bytes()),
+                                serde_json::to_vec(&routing_value)?.into(),
                                 self.config.proxy.max_request_bytes,
                                 self.config.proxy.max_spool_bytes,
                                 self.stats.clone(),
@@ -2241,9 +2342,8 @@ impl App {
                                 upstream = replacement.socket;
                                 upstream_credentials = replacement.credentials;
                             }
-                            let value = parsed.expect("response.create was checked");
                             let analysis = match analyze_response_create(
-                                &value,
+                                &routing_value,
                                 ProtocolLimits::default(),
                             ) {
                                 Ok(analysis) => analysis,
@@ -2257,7 +2357,7 @@ impl App {
                                     continue;
                                 }
                             };
-                            let turn_id = match protocol.admit_response_create(&value) {
+                            let turn_id = match protocol.admit_response_create(&routing_value) {
                                 Ok(turn_id) => turn_id,
                                 Err(error) => {
                                     send_direct_error(
@@ -2269,6 +2369,7 @@ impl App {
                                     continue;
                                 }
                             };
+                            self.record_context_dispatch(&value, &listener.pool, &account, &upstream_credentials).await?;
                             upstream.send(client_message.clone()).await?;
                             if analysis.has_nonportable_state {
                                 route.hard_owner = true;
@@ -2282,6 +2383,7 @@ impl App {
                                 route,
                                 request: client_message,
                                 value,
+                                routing_value,
                             });
                             continue;
                         }
@@ -2701,8 +2803,17 @@ impl App {
         let replay_value = match mode {
             ReplayMode::OriginalRequest => turn.value.clone(),
             ReplayMode::FreshRequestWithoutPreviousResponse => {
-                fresh_replay_without_previous_response(&turn.value, ProtocolLimits::default())
-                    .map_err(|error| anyhow::anyhow!("prepare fresh direct replay: {error:?}"))?
+                fresh_replay_without_previous_response(
+                    &turn.routing_value,
+                    ProtocolLimits::default(),
+                )
+                .map_err(|error| anyhow::anyhow!("prepare fresh direct replay: {error:?}"))?;
+                let mut value = turn.value.clone();
+                value
+                    .as_object_mut()
+                    .context("invalid direct replay")?
+                    .remove("previous_response_id");
+                value
             }
         };
         let replay_message = match mode {
@@ -2717,6 +2828,13 @@ impl App {
         if committed != plan {
             anyhow::bail!("direct replay plan changed before commit")
         }
+        self.record_context_dispatch(
+            &replay_value,
+            &listener.pool,
+            &replacement_account,
+            &replacement.credentials,
+        )
+        .await?;
         if let Err(error) = replacement.socket.send(replay_message.clone()).await {
             warn!(%error, account = replacement_account, "safe direct replay send failed");
             return Ok(None);
@@ -2726,6 +2844,10 @@ impl App {
             turn.value = replay_value;
             turn.route.account_id = replacement_account.clone();
             if mode == ReplayMode::FreshRequestWithoutPreviousResponse {
+                turn.routing_value
+                    .as_object_mut()
+                    .expect("validated response.create")
+                    .remove("previous_response_id");
                 turn.route.hard_owner = turn.route.non_previous_hard_owner;
             }
         }
@@ -3039,7 +3161,9 @@ impl App {
                 let headers = inbound_headers.clone();
                 let direct = !forced_live
                     && is_native_responses(&path)
-                    && self.config.proxy.responses_websocket_mode == ResponsesWebsocketMode::Direct;
+                    && (self.config.proxy.responses_websocket_mode
+                        == ResponsesWebsocketMode::Direct
+                        || req.uri().path().contains("/backend-api/codex/"));
                 stats.open_upgrades.fetch_add(1, Ordering::Relaxed);
                 let upgrade_guard = OpenUpgradeGuard(stats.clone());
                 let spawned = self
@@ -5571,6 +5695,7 @@ mod tests {
             DirectTurn {
                 route,
                 request: Message::Text(value.to_string().into()),
+                routing_value: value.clone(),
                 value,
             },
         )]);
