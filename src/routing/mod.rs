@@ -4,4 +4,7 @@ pub mod metadata;
 pub mod router;
 
 pub use affinity::{AffinityStore, ThreadKey};
-pub use router::{AccountRoutingStatus, QuotaWindowStatus, Router, RoutingSnapshot, Selection};
+pub use router::{
+    AccountRoutingStatus, QuotaWindowStatus, Router, RoutingSnapshot,
+    SLOW_CREDENTIAL_RESOLVE_THRESHOLD, Selection, SelectionStaleReason,
+};

@@ -59,7 +59,7 @@ use crate::{
     auth::{self, Credentials},
     config::{Config, ListenerConfig, PoolConfig, ResponsesWebsocketMode},
     routing::{
-        AffinityStore, Router,
+        AffinityStore, Router, SLOW_CREDENTIAL_RESOLVE_THRESHOLD, Selection, SelectionStaleReason,
         live::{self, LiveCallStore},
         metadata,
     },
@@ -98,12 +98,52 @@ fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
     )
 }
 
+/// Emit the `selected vs wired + epoch` line used for post-hoc stale-dispatch detection.
+/// Called on every revalidation failure. Slow resolves are observability-only (see
+/// `log_slow_resolve`) and never force a re-select.
+fn log_stale_selection(
+    context: &'static str,
+    selection: &Selection,
+    reason: SelectionStaleReason,
+    resolve_elapsed: Duration,
+    wired: Option<&str>,
+) {
+    warn!(
+        context,
+        selected = selection.account_id,
+        selected_epoch = selection.account_generation,
+        selection_seq = selection.seq,
+        bound = selection.bound,
+        reason = reason.to_string(),
+        resolve_elapsed_ms = resolve_elapsed.as_millis() as u64,
+        wired = wired.unwrap_or("none"),
+        "selected vs wired mismatch: aborting stale wire"
+    );
+}
+
+fn log_slow_resolve(context: &'static str, selection: &Selection, resolve_elapsed: Duration) {
+    warn!(
+        context,
+        selected = selection.account_id,
+        selected_epoch = selection.account_generation,
+        selection_seq = selection.seq,
+        bound = selection.bound,
+        resolve_elapsed_ms = resolve_elapsed.as_millis() as u64,
+        slow_threshold_ms = SLOW_CREDENTIAL_RESOLVE_THRESHOLD.as_millis() as u64,
+        "selected vs wired: credential resolve exceeded dispatch gap budget"
+    );
+}
+
 type HttpClient = Client<NativeHttpsConnector<HttpConnector>, ProxyBody>;
 type UpgradeHttpClient = Client<RustlsHttpsConnector<HttpConnector>, ProxyBody>;
 type UpgradedWebSocket = WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
 struct WebSocketFrameRoute {
     account_id: String,
+    /// Epoch + seq stamped at selection time; re-checked after every await before wire.
+    account_generation: u64,
+    selection_seq: u64,
+    selection_bound: bool,
     hard_owner: bool,
     non_previous_hard_owner: bool,
     soft_keys: Vec<crate::routing::ThreadKey>,
@@ -253,6 +293,11 @@ where
         .with_context(|| context)
 }
 
+/// NOTE (fix1): [`HttpBridgeContinuation`] intentionally carries no account identity. Each
+/// bridge turn re-enters `handle_http_replay_with_routing_anchor`, which performs a fresh
+/// stamped selection plus post-await revalidation; the wired account for observation comes from
+/// the [`SelectedAccount`] response extension instead. Storing an account here would recreate
+/// the select-then-send-stale race this fix removes.
 #[derive(Debug, Clone)]
 struct HttpBridgeContinuation {
     response_id: String,
@@ -409,6 +454,8 @@ impl HttpBridgeCapture {
 struct DirectAccountLease {
     router: Arc<Router>,
     account: Option<String>,
+    account_generation: Option<u64>,
+    selection_seq: Option<u64>,
 }
 
 struct TrackedTask {
@@ -466,7 +513,11 @@ impl Drop for TrackedTask {
 }
 
 #[derive(Clone)]
-struct SelectedAccount(String);
+struct SelectedAccount {
+    account: String,
+    generation: u64,
+    seq: u64,
+}
 
 struct OpenUpgradeGuard(Arc<Stats>);
 
@@ -567,6 +618,19 @@ impl DirectAccountLease {
         Self {
             router,
             account: Some(account),
+            account_generation: None,
+            selection_seq: None,
+        }
+    }
+
+    /// Lease stamped with the validated [`Selection`] that is about to be wired, so
+    /// `selected vs wired` log correlation carries epoch + seq end to end.
+    fn new_for_selection(router: Arc<Router>, selection: &Selection) -> Self {
+        Self {
+            router,
+            account: Some(selection.account_id.clone()),
+            account_generation: Some(selection.account_generation),
+            selection_seq: Some(selection.seq),
         }
     }
 
@@ -574,10 +638,25 @@ impl DirectAccountLease {
         if let Some(previous) = self.account.replace(account) {
             self.router.end(&previous).await;
         }
+        self.account_generation = None;
+        self.selection_seq = None;
+    }
+
+    /// Same-account-set semantics as [`Self::replace`], but keeps the stamped route
+    /// generation + seq so `selected vs wired` correlation survives account switches on a
+    /// long-lived direct socket.
+    async fn replace_with_route(&mut self, route: &WebSocketFrameRoute) {
+        if let Some(previous) = self.account.replace(route.account_id.clone()) {
+            self.router.end(&previous).await;
+        }
+        self.account_generation = Some(route.account_generation);
+        self.selection_seq = Some(route.selection_seq);
     }
 
     fn disarm(&mut self) {
         self.account = None;
+        self.account_generation = None;
+        self.selection_seq = None;
     }
 }
 
@@ -586,6 +665,13 @@ impl Drop for DirectAccountLease {
         let Some(account) = self.account.take() else {
             return;
         };
+        // Read the dispatch stamp for `selected vs wired` drop correlation.
+        tracing::debug!(
+            wired = account,
+            wired_epoch = self.account_generation.unwrap_or(u64::MAX),
+            selection_seq = self.selection_seq.unwrap_or(0),
+            "releasing account lease for stamped selection"
+        );
         let router = self.router.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move { router.end(&account).await });
@@ -1147,10 +1233,66 @@ impl App {
         let mut payload_dispatch_owner: Option<String> = None;
         for attempt in 0..2 {
             let account = selected.account_id.clone();
+            // Dispatch-boundary fence (fix1): `select` above ran before this await. Credential
+            // resolution holds a file lock + HomeAuthLock + OAuth I/O for up to 15s, during
+            // which quota/auth/preferred/epoch state may flip. Nothing below may wire the
+            // pre-await pick without revalidation; `send_http` rebuilds its Request per
+            // attempt only after the checks below pass.
+            let resolve_started = Instant::now();
             let credentials = self
                 .auth
                 .resolve(&self.config.accounts[&account], &inbound_headers)
                 .await?;
+            let resolve_elapsed = resolve_started.elapsed();
+            if let Err(reason) = self
+                .router
+                .validate_selection(&selected, &listener.pool, pool)
+                .await
+            {
+                let wired = self.router.wired_account(&listener.pool).await;
+                log_stale_selection("http", &selected, reason, resolve_elapsed, wired.as_deref());
+                if hard_owner || selected.bound {
+                    // Hard continuity stays fail-closed: never replay bound threads/files/
+                    // previous_response across accounts.
+                    return Ok(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "continuity_owner_unavailable",
+                        "selected continuity account changed during credential resolution",
+                    ));
+                }
+                // One bounded re-select: the retry loop makes at most two upstream sends,
+                // so only the first attempt may consume an iteration without sending.
+                // A stale pick on the final attempt fails closed instead of hitting the
+                // loop's `unreachable!()`.
+                if attempt == 0
+                    && let Some(alternate) = self
+                        .router
+                        .select(&listener.pool, pool, None, Some(&account))
+                        .await
+                {
+                    selected = alternate;
+                    continue;
+                }
+                return Ok(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "continuity_owner_unavailable",
+                    "selected account changed during credential resolution",
+                ));
+            }
+            if resolve_elapsed > SLOW_CREDENTIAL_RESOLVE_THRESHOLD && !hard_owner && !selected.bound
+            {
+                // Slow-resolve observability only: the fenced revalidation above already
+                // checked epoch/quota/auth/preferred after the resolve await, so a
+                // still-healthy preferred account must not be forcibly excluded.
+                // Excluding it re-selects a non-preferred account that the next
+                // iteration rejects as PreferredSuperseded, burning the 2-attempt
+                // budget into a 503. Genuine staleness still rotates via the fence.
+                log_slow_resolve("http", &selected, resolve_elapsed);
+            }
+            // Rebuild-or-bail (fix1): the Request is built inside `send_http` below, strictly
+            // after this revalidation. No token is ever substituted into an already-built
+            // Request, and the 401-continue path re-enters this fence before rebuilding.
+            self.router.note_wired(&listener.pool, &account).await;
             let (slots, counter, capacity_message) = match lane {
                 ServingLane::Http => (
                     self.http_slots.clone(),
@@ -1187,7 +1329,8 @@ impl App {
                 ));
             }
             self.router.begin(&account).await;
-            let mut request_lease = DirectAccountLease::new(self.router.clone(), account.clone());
+            let mut request_lease =
+                DirectAccountLease::new_for_selection(self.router.clone(), &selected);
             let (body, upload_progress) = progress_body(replay.body(attempt)?);
             let result = await_upstream_headers(
                 self.send_http(&method, &path, &inbound_headers, credentials.clone(), body),
@@ -1228,7 +1371,35 @@ impl App {
                                 .await
                             {
                                 Ok(Some(_)) => {
-                                    continue;
+                                    // 401-continue fence (fix1): the refresh await is another
+                                    // dispatch gap. Re-check needs_login/quota/epoch before
+                                    // reusing the stale account; never blindly `continue`.
+                                    if let Err(reason) = self
+                                        .router
+                                        .validate_selection(&selected, &listener.pool, pool)
+                                        .await
+                                    {
+                                        let wired = self.router.wired_account(&listener.pool).await;
+                                        log_stale_selection(
+                                            "http-401-continue",
+                                            &selected,
+                                            reason,
+                                            Duration::ZERO,
+                                            wired.as_deref(),
+                                        );
+                                        if !hard_owner
+                                            && !selected.bound
+                                            && let Some(alternate) = self
+                                                .router
+                                                .select(&listener.pool, pool, None, Some(&account))
+                                                .await
+                                        {
+                                            selected = alternate;
+                                            continue;
+                                        }
+                                    } else {
+                                        continue;
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(error) => warn!(account, %error, "credential refresh failed"),
@@ -1244,7 +1415,7 @@ impl App {
                         return Ok(map_http_response_leased(
                             response,
                             self.router.clone(),
-                            account,
+                            &selected,
                             false,
                         ));
                     }
@@ -1253,7 +1424,7 @@ impl App {
                         return Ok(map_http_response_leased(
                             response,
                             self.router.clone(),
-                            account,
+                            &selected,
                             false,
                         ));
                     }
@@ -1322,7 +1493,7 @@ impl App {
                     return Ok(map_http_response_leased(
                         response,
                         self.router.clone(),
-                        account,
+                        &selected,
                         status.is_success() && is_native_responses(&path),
                     ));
                 }
@@ -1362,6 +1533,9 @@ impl App {
         credentials: auth::Credentials,
         body: ProxyBody,
     ) -> Result<Response<Incoming>> {
+        // Rebuild-or-bail (fix1): this Request is constructed fresh on every attempt, strictly
+        // after the caller's post-resolve revalidation. Callers must never clone inbound
+        // headers or substitute a token into an already-built Request before that fence.
         let uri = self.upstream_uri(path, false)?;
         let mut builder = Request::builder().method(method).uri(uri);
         *builder.headers_mut().expect("builder") = inbound.clone();
@@ -1850,7 +2024,7 @@ impl App {
                                             .get::<SelectedAccount>()
                                             .is_some_and(|selected| {
                                                 matches!(
-                                                    app.config.accounts.get(&selected.0),
+                                                    app.config.accounts.get(&selected.account),
                                                     Some(crate::config::AccountConfig::Inbound)
                                                 )
                                             });
@@ -2047,22 +2221,38 @@ impl App {
             }
         }
         Ok(WebSocketFrameRoute {
-            account_id: selection.account_id,
+            account_id: selection.account_id.clone(),
+            account_generation: selection.account_generation,
+            selection_seq: selection.seq,
+            selection_bound: selection.bound,
             hard_owner,
             non_previous_hard_owner,
             soft_keys,
         })
     }
 
-    async fn connect_direct_upstream(
+    /// Direct-connect variant carrying the stamped selection generation. Use this whenever a
+    /// [`WebSocketFrameRoute`] or [`Selection`] is available so epoch drift aborts the wire
+    /// instead of sending stale. The `expected_generation = None` form of
+    /// [`Self::connect_direct_upstream_with_timeout`] is reserved for tests and same-account
+    /// reconnects that stamp the pre-resolve epoch explicitly at the call site.
+    async fn connect_direct_upstream_with_selection(
         &self,
-        account: &str,
+        route: &WebSocketFrameRoute,
         path: &str,
         inbound_headers: &hyper::HeaderMap,
         clear_session_state: bool,
     ) -> Result<DirectUpstream> {
+        tracing::debug!(
+            selected = route.account_id,
+            selected_epoch = route.account_generation,
+            selection_seq = route.selection_seq,
+            selection_bound = route.selection_bound,
+            "direct connect using stamped selection"
+        );
         self.connect_direct_upstream_with_timeout(
-            account,
+            &route.account_id,
+            Some(route.account_generation),
             path,
             inbound_headers,
             clear_session_state,
@@ -2074,12 +2264,50 @@ impl App {
     async fn connect_direct_upstream_with_timeout(
         &self,
         account: &str,
+        expected_generation: Option<u64>,
         path: &str,
         inbound_headers: &hyper::HeaderMap,
         clear_session_state: bool,
         connect_timeout: Duration,
     ) -> Result<DirectUpstream> {
         for attempt in 0..2 {
+            // Rebuild-or-bail (fix1): resolve + revalidate FIRST; the upstream Request is
+            // built fresh below only after the fence passes. The old shape cloned
+            // inbound headers into the Request before `resolve`, letting a stale pick's
+            // headers reach the wire after a mid-resolve flip.
+            let resolve_started = Instant::now();
+            let credentials = self
+                .auth
+                .resolve(&self.config.accounts[account], inbound_headers)
+                .await?;
+            let resolve_elapsed = resolve_started.elapsed();
+            if let Err(reason) = self
+                .router
+                .validate_account_wirable(account, expected_generation)
+                .await
+            {
+                let wired_generation = self.router.current_generation(account).await;
+                warn!(
+                    selected = account,
+                    selected_epoch = expected_generation.unwrap_or(u64::MAX),
+                    current_epoch = wired_generation,
+                    reason = reason.to_string(),
+                    resolve_elapsed_ms = resolve_elapsed.as_millis() as u64,
+                    "selected vs wired mismatch: aborting stale direct connect"
+                );
+                anyhow::bail!("selected direct account changed during credential resolution");
+            }
+            if resolve_elapsed > SLOW_CREDENTIAL_RESOLVE_THRESHOLD {
+                let wired_generation = self.router.current_generation(account).await;
+                warn!(
+                    selected = account,
+                    selected_epoch = expected_generation.unwrap_or(u64::MAX),
+                    current_epoch = wired_generation,
+                    resolve_elapsed_ms = resolve_elapsed.as_millis() as u64,
+                    slow_threshold_ms = SLOW_CREDENTIAL_RESOLVE_THRESHOLD.as_millis() as u64,
+                    "selected vs wired: slow direct credential resolve before wire"
+                );
+            }
             let uri = self.upstream_uri(path, false)?;
             let mut upstream_req = Request::builder()
                 .method(Method::GET)
@@ -2091,10 +2319,6 @@ impl App {
                 strip_direct_session_headers(upstream_req.headers_mut());
             }
             normalize_websocket_beta(upstream_req.headers_mut(), path);
-            let credentials = self
-                .auth
-                .resolve(&self.config.accounts[account], inbound_headers)
-                .await?;
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(account).await;
             let connect_deadline = tokio::time::Instant::now() + connect_timeout;
@@ -2152,7 +2376,25 @@ impl App {
                     .force_refresh(&self.config.accounts[account], &credentials)
                     .await
                 {
-                    Ok(Some(_)) => continue,
+                    Ok(Some(_)) => {
+                        // 401-continue fence (fix1): the refresh await is a dispatch gap.
+                        // Re-check before rebuilding; never reuse a stale direct account.
+                        if let Err(reason) = self
+                            .router
+                            .validate_account_wirable(account, expected_generation)
+                            .await
+                        {
+                            warn!(
+                                selected = account,
+                                reason = reason.to_string(),
+                                "selected vs wired mismatch: aborting stale direct 401 retry"
+                            );
+                            anyhow::bail!(
+                                "selected direct account changed during credential refresh"
+                            );
+                        }
+                        continue;
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         warn!(account, %error, "direct WebSocket credential refresh failed")
@@ -2317,12 +2559,13 @@ impl App {
                                 continue;
                             }
                             if protocol.pending_len() == 0 && route.account_id != account {
+                                let clear_session = route.account_id != account;
                                 let replacement = match self
-                                    .connect_direct_upstream(
-                                        &route.account_id,
+                                    .connect_direct_upstream_with_selection(
+                                        &route,
                                         &path,
                                         &headers,
-                                        route.account_id != account,
+                                        clear_session,
                                     )
                                     .await
                                 {
@@ -2338,7 +2581,8 @@ impl App {
                                 )
                                 .await;
                                 account = route.account_id.clone();
-                                lease.replace(account.clone()).await;
+                                self.router.note_wired(&listener.pool, &account).await;
+                                lease.replace_with_route(&route).await;
                                 upstream = replacement.socket;
                                 upstream_credentials = replacement.credentials;
                             }
@@ -2702,6 +2946,11 @@ impl App {
         let Some(turn) = turns.get(&turn_id) else {
             return Ok(None);
         };
+        // Stamp the pre-await generation: any `invalidate_account` during the refresh/resolve
+        // awaits below must abort the wire instead of replaying onto a stale account.
+        let turn_generation = turn.route.account_generation;
+        let turn_hard_owner = turn.route.hard_owner;
+        let turn_non_previous_hard_owner = turn.route.non_previous_hard_owner;
         let mut plan = match protocol.replay_plan(turn_id, failure, context) {
             Ok(plan) => plan,
             Err(_) => {
@@ -2741,17 +2990,26 @@ impl App {
                 }
                 ReplayTarget::Unspecified => String::new(),
             };
-        if turn.route.non_previous_hard_owner {
+        // `None` = same-account path (fenced by the turn's stamped generation);
+        // `Some` = fresh alternate selection carrying its own stamp.
+        let mut replacement_selection: Option<Selection> = None;
+        let mut replacement_generation: Option<u64> = (plan.target
+            == ReplayTarget::SameAccountAfterRefresh
+            || (plan.target == ReplayTarget::Unspecified
+                && failure == FailureKind::PreviousResponseNotFound))
+            .then_some(turn_generation);
+        if turn_non_previous_hard_owner {
             if plan.target == ReplayTarget::AlternateAccount {
                 return Ok(None);
             }
             replacement_account = account.to_owned();
+            replacement_generation = Some(turn_generation);
         }
         if plan.target == ReplayTarget::AlternateAccount || replacement_account.is_empty() {
             if matches!(failure, FailureKind::Authentication { .. }) {
                 self.router.auth_failure(account).await;
             }
-            if turn.route.hard_owner && plan.mode == ReplayMode::OriginalRequest {
+            if turn_hard_owner && plan.mode == ReplayMode::OriginalRequest {
                 return Ok(None);
             }
             let Some(selection) = self
@@ -2761,16 +3019,21 @@ impl App {
             else {
                 return Ok(None);
             };
-            replacement_account = selection.account_id;
+            replacement_generation = Some(selection.account_generation);
+            replacement_account = selection.account_id.clone();
+            // Keep the stamp so the replay lease carries epoch + seq end to end.
+            replacement_selection = Some(selection);
         }
         let mode = plan.mode;
         let mut replacement = match self
-            .connect_direct_upstream(
+            .connect_direct_upstream_with_timeout(
                 &replacement_account,
+                replacement_generation,
                 path,
                 headers,
                 replacement_account != account
                     || mode == ReplayMode::FreshRequestWithoutPreviousResponse,
+                RESPONSES_DIRECT_CONNECT_TIMEOUT,
             )
             .await
         {
@@ -2798,8 +3061,12 @@ impl App {
                 return Ok(None);
             }
         };
-        let mut replacement_lease =
-            DirectAccountLease::new(self.router.clone(), replacement_account.clone());
+        let mut replacement_lease = match &replacement_selection {
+            Some(selection) => {
+                DirectAccountLease::new_for_selection(self.router.clone(), selection)
+            }
+            None => DirectAccountLease::new(self.router.clone(), replacement_account.clone()),
+        };
         let replay_value = match mode {
             ReplayMode::OriginalRequest => turn.value.clone(),
             ReplayMode::FreshRequestWithoutPreviousResponse => {
@@ -2843,6 +3110,9 @@ impl App {
             turn.request = replay_message;
             turn.value = replay_value;
             turn.route.account_id = replacement_account.clone();
+            if let Some(generation) = replacement_generation {
+                turn.route.account_generation = generation;
+            }
             if mode == ReplayMode::FreshRequestWithoutPreviousResponse {
                 turn.routing_value
                     .as_object_mut()
@@ -2970,8 +3240,18 @@ impl App {
                 .await;
             return Ok(true);
         }
+        // Same-account reconnect fence (fix1): stamp the pre-resolve epoch so a mid-resolve
+        // invalidation aborts instead of rewiring a stale account.
+        let expected_generation = self.router.current_generation(account).await;
         match self
-            .connect_direct_upstream(account, path, headers, true)
+            .connect_direct_upstream_with_timeout(
+                account,
+                Some(expected_generation),
+                path,
+                headers,
+                true,
+                RESPONSES_DIRECT_CONNECT_TIMEOUT,
+            )
             .await
         {
             Ok(replacement) => {
@@ -3102,6 +3382,79 @@ impl App {
         };
         let attempts = 2;
         for attempt in 0..attempts {
+            // Dispatch-boundary fence (fix1): `select` above ran before the credential await
+            // (file lock + HomeAuthLock + OAuth, up to 15s). Resolve first, revalidate the
+            // stamped selection, and only then build the upstream Request. The old shape
+            // cloned inbound headers into the Request *before* `resolve`, letting a stale
+            // pick's headers reach the wire after a mid-resolve flip.
+            let resolve_started = Instant::now();
+            let credentials = self
+                .auth
+                .resolve(
+                    &self.config.accounts[&selection.account_id],
+                    &inbound_headers,
+                )
+                .await?;
+            let resolve_elapsed = resolve_started.elapsed();
+            // Fail-closed set: bound threads, hard-continuity owners, and pinned realtime
+            // calls must never silently cross-account replay.
+            let fail_closed = forced_live || hard_owner || selection.bound;
+            if let Err(reason) = self
+                .router
+                .validate_selection(&selection, &listener.pool, pool)
+                .await
+            {
+                let wired = self.router.wired_account(&listener.pool).await;
+                log_stale_selection(
+                    "ws-handshake",
+                    &selection,
+                    reason,
+                    resolve_elapsed,
+                    wired.as_deref(),
+                );
+                if fail_closed {
+                    if forced_live {
+                        return Ok(error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "realtime_call_binding_failed",
+                            "bound realtime account changed during credential resolution",
+                        ));
+                    }
+                    return Ok(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "continuity_owner_unavailable",
+                        "selected websocket account changed during credential resolution",
+                    ));
+                }
+                // One bounded re-select (see the HTTP dispatch fence): only the first of the
+                // two attempts may consume an iteration without wiring.
+                if attempt == 0 {
+                    let stale = selection.account_id.clone();
+                    selection = self
+                        .router
+                        .select(&listener.pool, pool, key.clone(), Some(&stale))
+                        .await
+                        .context("no alternate account")?;
+                    continue;
+                }
+                return Ok(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "continuity_owner_unavailable",
+                    "selected websocket account changed during credential resolution",
+                ));
+            }
+            if resolve_elapsed > SLOW_CREDENTIAL_RESOLVE_THRESHOLD && !fail_closed {
+                // Slow-resolve observability only (see the HTTP fence): the stamped
+                // selection already passed post-resolve revalidation, so a
+                // still-healthy preferred account must not be forcibly excluded. The
+                // excluded re-select would come back as PreferredSuperseded on the
+                // final attempt and surface as a 503 with no budget left.
+                log_slow_resolve("ws-handshake", &selection, resolve_elapsed);
+            }
+            // Rebuild-or-bail (fix1): fresh Request per attempt, strictly after revalidation.
+            self.router
+                .note_wired(&listener.pool, &selection.account_id)
+                .await;
             let uri = self.upstream_uri(&path, live::uses_v1_origin(&path))?;
             let mut upstream_req = Request::builder()
                 .method(req.method())
@@ -3110,13 +3463,6 @@ impl App {
             *upstream_req.headers_mut() = inbound_headers.clone();
             upstream_req.headers_mut().remove(HOST);
             normalize_websocket_beta(upstream_req.headers_mut(), &path);
-            let credentials = self
-                .auth
-                .resolve(
-                    &self.config.accounts[&selection.account_id],
-                    &inbound_headers,
-                )
-                .await?;
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(&selection.account_id).await;
             let mut response = match self.upgrade_client.request(upstream_req).await {
@@ -3230,7 +3576,29 @@ impl App {
                     .force_refresh(&self.config.accounts[&selection.account_id], &credentials)
                     .await
                 {
-                    Ok(Some(_)) => continue,
+                    Ok(Some(_)) => {
+                        // 401-continue fence (fix1): the refresh await is another dispatch
+                        // gap. Re-check before rebuilding; never blindly reuse the stale
+                        // account. Bound/live work falls through to the fail-closed 401
+                        // mapping below instead of retrying.
+                        if self
+                            .router
+                            .validate_selection(&selection, &listener.pool, pool)
+                            .await
+                            .is_err()
+                        {
+                            let wired = self.router.wired_account(&listener.pool).await;
+                            warn!(
+                                selected = selection.account_id,
+                                selected_epoch = selection.account_generation,
+                                selection_seq = selection.seq,
+                                wired = wired.as_deref().unwrap_or("none"),
+                                "selected vs wired mismatch: aborting stale websocket 401 retry"
+                            );
+                        } else {
+                            continue;
+                        }
+                    }
                     Ok(None) => {
                         self.router.auth_failure(&selection.account_id).await;
                     }
@@ -3664,12 +4032,17 @@ fn map_http_response(response: Response<Incoming>) -> Response<ProxyBody> {
 fn map_http_response_leased(
     response: Response<Incoming>,
     router: Arc<Router>,
-    account: String,
+    selection: &Selection,
     observe_response_ids: bool,
 ) -> Response<ProxyBody> {
     let (mut parts, body) = response.into_parts();
     headers::strip_hop_by_hop(&mut parts.headers);
-    parts.extensions.insert(SelectedAccount(account.clone()));
+    parts.extensions.insert(SelectedAccount {
+        account: selection.account_id.clone(),
+        generation: selection.account_generation,
+        seq: selection.seq,
+    });
+    let account = selection.account_id.clone();
     let observer = observe_response_ids
         .then(|| response_observer_for_content_type(parts.headers.get(CONTENT_TYPE)));
     Response::from_parts(
@@ -4222,10 +4595,18 @@ async fn pump_http_response_to_websocket(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let (parts, mut body) = response.into_parts();
-    let selected_account = parts
-        .extensions
-        .get::<SelectedAccount>()
-        .map(|selected| selected.0.clone());
+    let wired_selection = parts.extensions.get::<SelectedAccount>().cloned();
+    if let Some(wired) = &wired_selection {
+        // `selected vs wired` correlation for post-hoc detection: the bridge observes the
+        // account that actually carried the wire, with its dispatch stamp.
+        tracing::debug!(
+            wired = wired.account,
+            wired_epoch = wired.generation,
+            selection_seq = wired.seq,
+            "bridge pumping response wired by stamped selection"
+        );
+    }
+    let selected_account = wired_selection.map(|selected| selected.account);
     if !status.is_success() {
         let bytes = match tokio::time::timeout_at(
             response_created_deadline,
@@ -5334,6 +5715,7 @@ mod tests {
         let error = match app
             .connect_direct_upstream_with_timeout(
                 "a",
+                None,
                 "/v1/responses",
                 &headers,
                 true,
@@ -5726,6 +6108,131 @@ mod tests {
                 .unwrap()
                 .account_id,
             "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn stamped_direct_route_aborts_after_affinity_invalidate_mid_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, listener, router, stats) = direct_test_app(dir.path());
+        let turn_state = router.affinity.key("turn-state:opaque");
+        assert!(router.bind(turn_state, "a").await);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-codex-turn-state", "opaque".parse().unwrap());
+        headers.insert(AUTHORIZATION, "Bearer caller-token".parse().unwrap());
+        let value = serde_json::json!({"type":"response.create","input":[]});
+        let replay = ReplayBody::from_bytes(
+            Bytes::copy_from_slice(value.to_string().as_bytes()),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            stats,
+        )
+        .unwrap();
+        let route = app
+            .route_websocket_frame(&listener, &headers, &replay, None)
+            .await
+            .unwrap();
+        assert_eq!(route.account_id, "a");
+        assert!(route.hard_owner);
+        let stamped_generation = route.account_generation;
+
+        // Mid-resolve race: an auth failure invalidates the account epoch and marks the
+        // account needing login while credential resolution is in flight.
+        router.auth_failure("a").await;
+
+        // The stamped connect must abort before touching the wire, not send stale.
+        let error = match app
+            .connect_direct_upstream_with_selection(&route, "/v1/responses", &headers, false)
+            .await
+        {
+            Ok(_) => panic!("stale stamped route unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("changed during credential resolution"),
+            "unexpected error: {error:#}"
+        );
+        assert_ne!(router.current_generation("a").await, stamped_generation);
+    }
+
+    #[tokio::test]
+    async fn slow_resolve_must_not_exclude_healthy_preferred_account() {
+        // P2 regression: preferred A resolves slowly but stays healthy. The old slow
+        // path excluded A and re-selected B; the next fence then rejected B as
+        // PreferredSuperseded (A still healthy+preferred), burning the 2-attempt
+        // budget into a 503 on both the HTTP and WS handshake loops.
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _, router, _) = direct_test_app(dir.path());
+        let pool = &app.config.pools["default"];
+        router.set_preferred("default", Some("a".to_owned())).await;
+
+        // Attempt 0: fresh pick lands on healthy preferred A and validates clean.
+        let selected = router.select("default", pool, None, None).await.unwrap();
+        assert_eq!(selected.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&selected, "default", pool)
+                .await
+                .is_ok()
+        );
+
+        // Old slow-path product: re-select excluding slow-but-healthy A.
+        let reselected = router
+            .select("default", pool, None, Some(&selected.account_id))
+            .await
+            .unwrap();
+        assert_eq!(reselected.account_id, "b");
+
+        // Attempt 1 fence: B is unwirable while A remains healthy+preferred, so the
+        // final attempt would end in `continuity_owner_unavailable` (503) with no
+        // budget left. The fixed slow path keeps A instead of excluding it.
+        assert_eq!(
+            router
+                .validate_selection(&reselected, "default", pool)
+                .await,
+            Err(SelectionStaleReason::PreferredSuperseded)
+        );
+        assert!(
+            router
+                .validate_selection(&selected, "default", pool)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_resolve_with_changed_eligibility_still_rotates() {
+        // Anti-stale companion: a slow resolve that ALSO changed eligibility must
+        // still rotate via the fence (no fail-closed regression from the P2 fix).
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _, router, _) = direct_test_app(dir.path());
+        let pool = &app.config.pools["default"];
+        router.set_preferred("default", Some("a".to_owned())).await;
+
+        let selected = router.select("default", pool, None, None).await.unwrap();
+        assert_eq!(selected.account_id, "a");
+
+        // Mid-resolve auth change: A now needs login and is genuinely ineligible.
+        // (Uses reauth state rather than quota/avoid cooldowns to stay clear of the
+        // separately-tracked cooldown-polarity finding.)
+        router.reauth_required(&selected.account_id).await;
+        assert_eq!(
+            router.validate_selection(&selected, "default", pool).await,
+            Err(SelectionStaleReason::NeedsLogin)
+        );
+
+        // The fence's re-select excluding A lands on B, which validates clean
+        // because the login-blocked preferred account no longer supersedes it.
+        let reselected = router
+            .select("default", pool, None, Some(&selected.account_id))
+            .await
+            .unwrap();
+        assert_eq!(reselected.account_id, "b");
+        assert!(
+            router
+                .validate_selection(&reselected, "default", pool)
+                .await
+                .is_ok()
         );
     }
 

@@ -136,6 +136,11 @@ pub struct UiPoolStatus {
     pub members: Vec<String>,
     pub preferred: Option<String>,
     pub active: Option<String>,
+    /// Last account actually wired to upstream for this pool. `active` is only the last fresh
+    /// pick and never reflects bound/select_exact traffic; `wired` is recorded after
+    /// revalidation immediately before send, so UI readers must not conflate the two.
+    #[serde(default)]
+    pub wired: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,7 +851,10 @@ async fn build_ui_status(
                 .get(name)
                 .cloned()
                 .or_else(|| pool.preferred.clone()),
+            // Display honesty (fix1): `active` = last fresh pick only; `wired` = last
+            // actually-sent account (bound traffic included). Never derive one from other.
             active: routing.active_accounts.get(name).cloned(),
+            wired: routing.wired_accounts.get(name).cloned(),
         })
         .collect();
     UiStatus {
