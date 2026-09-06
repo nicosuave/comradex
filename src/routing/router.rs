@@ -22,14 +22,61 @@ pub struct Selection {
     pub account_id: String,
     pub bound: bool,
     pub thread: Option<ThreadKey>,
+    /// Affinity epoch captured at selection time. Dispatch must re-check this after every
+    /// await (credential resolve, refresh, connect) and refuse to wire a stale generation.
+    pub account_generation: u64,
+    /// Monotonic selection id for `selected vs wired` post-hoc log correlation.
+    pub seq: u64,
+}
+
+/// How long credential resolution may take before a fresh (unbound) selection is treated as
+/// too old to wire without a re-select. Bound threads stay fail-closed instead of switching.
+pub const SLOW_CREDENTIAL_RESOLVE_THRESHOLD: Duration = Duration::from_millis(500);
+
+/// Why a stamped [`Selection`] must not be wired after an await boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionStaleReason {
+    UnknownAccount,
+    NotPoolMember,
+    NeedsLogin,
+    LoginInProgress,
+    Quota,
+    Avoid,
+    EpochChanged,
+    BindingChanged,
+    PreferredSuperseded,
+}
+
+impl std::fmt::Display for SelectionStaleReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::UnknownAccount => "unknown_account",
+            Self::NotPoolMember => "not_pool_member",
+            Self::NeedsLogin => "needs_login",
+            Self::LoginInProgress => "login_in_progress",
+            Self::Quota => "quota",
+            Self::Avoid => "temporary_failure",
+            Self::EpochChanged => "epoch_changed",
+            Self::BindingChanged => "binding_changed",
+            Self::PreferredSuperseded => "preferred_superseded",
+        };
+        write!(f, "{reason}")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingSnapshot {
     #[serde(default)]
     pub preferred_accounts: BTreeMap<String, String>,
+    // NOTE (fix1 display honesty): `active_accounts` is the last *fresh pick* per pool. It is
+    // only updated on fresh (unbound) selections and never on bound/select_exact traffic, so it
+    // must not be read as "the account carrying traffic". Use `wired_accounts` for last-wired.
     #[serde(default)]
     pub active_accounts: BTreeMap<String, String>,
+    /// Last account actually wired to upstream per pool (recorded after revalidation, before
+    /// send). Updated for bound and fresh traffic alike, unlike `active_accounts`.
+    #[serde(default)]
+    pub wired_accounts: BTreeMap<String, String>,
     #[serde(default)]
     pub account_states: BTreeMap<String, AccountRoutingStatus>,
 }
@@ -90,6 +137,7 @@ pub struct Router {
     accounts: Mutex<HashMap<String, AccountRuntime>>,
     preferred: Mutex<HashMap<String, String>>,
     active: Mutex<HashMap<String, String>>,
+    wired: Mutex<HashMap<String, String>>,
     sequence: AtomicU64,
     switch_at: u8,
 }
@@ -118,6 +166,7 @@ impl Router {
                     .collect(),
             ),
             active: Mutex::new(HashMap::new()),
+            wired: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
             switch_at: config.proxy.switch_at,
         }
@@ -186,10 +235,13 @@ impl Router {
                         && a.quota_until.is_none_or(|v| v <= now)
                 });
             if eligible {
+                let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
                 return Some(Selection {
                     account_id: binding.account_id,
                     bound: true,
                     thread,
+                    account_generation: binding_epoch.unwrap_or(binding.account_generation),
+                    seq,
                 });
             }
         }
@@ -255,11 +307,21 @@ impl Router {
             if !self.affinity.put(key, selected.clone(), generation).await {
                 return None;
             }
+            return Some(Selection {
+                account_id: selected,
+                bound: false,
+                thread,
+                account_generation: generation,
+                seq,
+            });
         }
+        let account_generation = self.affinity.account_epoch(&selected).await;
         Some(Selection {
             account_id: selected,
             bound: false,
             thread,
+            account_generation,
+            seq,
         })
     }
 
@@ -304,8 +366,225 @@ impl Router {
                 .iter()
                 .map(|(pool, account)| (pool.clone(), account.clone()))
                 .collect(),
+            wired_accounts: self
+                .wired
+                .lock()
+                .await
+                .iter()
+                .map(|(pool, account)| (pool.clone(), account.clone()))
+                .collect(),
             account_states,
         }
+    }
+
+    /// Record the account actually wired to upstream for a pool. Call only after a selection
+    /// passed post-await revalidation, immediately before send. Never updates `active`, so
+    /// `active` (last fresh pick) and `wired` (last actually sent) cannot be conflated.
+    pub async fn note_wired(&self, pool_name: &str, account: &str) {
+        self.wired
+            .lock()
+            .await
+            .insert(pool_name.to_owned(), account.to_owned());
+    }
+
+    /// Last account actually wired per pool (as opposed to `active`, the last fresh pick).
+    pub async fn wired_account(&self, pool_name: &str) -> Option<String> {
+        self.wired.lock().await.get(pool_name).cloned()
+    }
+
+    /// Current affinity epoch for an account (no router mutex held across the lookup).
+    pub async fn current_generation(&self, account: &str) -> u64 {
+        self.affinity.account_epoch(account).await
+    }
+
+    /// Revalidate a stamped [`Selection`] after an await boundary (credential resolve, forced
+    /// refresh, connect/upgrade) and before touching the wire. Check-then-act only: no router
+    /// mutex is held across network I/O. Returns the stale reason on any mismatch; the caller
+    /// must abort this wire and either re-select (fresh work) or fail closed (bound work).
+    pub async fn validate_selection(
+        &self,
+        selection: &Selection,
+        pool_name: &str,
+        pool: &PoolConfig,
+    ) -> Result<(), SelectionStaleReason> {
+        let now = Instant::now();
+        // Snapshot runtime state without holding the mutex across affinity I/O below.
+        struct RuntimeProbe {
+            known: bool,
+            needs_login: bool,
+            login_in_progress: bool,
+            quota_blocked: bool,
+            avoid_blocked: bool,
+        }
+        let probe = {
+            let mut accounts = self.accounts.lock().await;
+            let wall_now = Utc::now();
+            for runtime in accounts.values_mut() {
+                reconcile_runtime(runtime, now, wall_now);
+            }
+            match accounts.get(&selection.account_id) {
+                Some(runtime) => RuntimeProbe {
+                    known: true,
+                    needs_login: runtime.needs_login,
+                    login_in_progress: runtime.login_in_progress,
+                    quota_blocked: runtime.quota_until.is_some_and(|until| until > now),
+                    avoid_blocked: runtime.avoid_until.is_some_and(|until| until > now),
+                },
+                None => RuntimeProbe {
+                    known: false,
+                    needs_login: false,
+                    login_in_progress: false,
+                    quota_blocked: false,
+                    avoid_blocked: false,
+                },
+            }
+        };
+        if !probe.known {
+            return Err(SelectionStaleReason::UnknownAccount);
+        }
+        if !pool
+            .members
+            .iter()
+            .any(|member| member == &selection.account_id)
+        {
+            return Err(SelectionStaleReason::NotPoolMember);
+        }
+        if probe.needs_login {
+            return Err(SelectionStaleReason::NeedsLogin);
+        }
+        if probe.login_in_progress {
+            return Err(SelectionStaleReason::LoginInProgress);
+        }
+        if probe.quota_blocked {
+            return Err(SelectionStaleReason::Quota);
+        }
+        if probe.avoid_blocked {
+            return Err(SelectionStaleReason::Avoid);
+        }
+        // Epoch check catches `invalidate_account` (auth failure / reauth) mid-resolve.
+        let current_epoch = self.affinity.account_epoch(&selection.account_id).await;
+        if current_epoch != selection.account_generation {
+            error!(
+                selected = selection.account_id,
+                seq = selection.seq,
+                selected_epoch = selection.account_generation,
+                current_epoch,
+                "selected vs wired mismatch: account epoch changed mid-resolve"
+            );
+            return Err(SelectionStaleReason::EpochChanged);
+        }
+        // Bound selections must still own their thread binding at the stamped generation.
+        if selection.bound
+            && let Some(key) = &selection.thread
+        {
+            match self.affinity.get(key).await {
+                Some(binding)
+                    if binding.account_id == selection.account_id
+                        && binding.account_generation == selection.account_generation => {}
+                _ => {
+                    error!(
+                        selected = selection.account_id,
+                        seq = selection.seq,
+                        selected_epoch = selection.account_generation,
+                        "selected vs wired mismatch: affinity binding changed mid-resolve"
+                    );
+                    return Err(SelectionStaleReason::BindingChanged);
+                }
+            }
+        }
+        // Fresh work: a configured-preferred flip to another eligible account mid-resolve
+        // supersedes this selection. Bound work ignores preference by design.
+        if !selection.bound {
+            let configured = self.preferred.lock().await.get(pool_name).cloned();
+            if let Some(preferred_id) = configured
+                && preferred_id != selection.account_id
+                && pool.members.contains(&preferred_id)
+            {
+                let preferred_eligible = {
+                    let accounts = self.accounts.lock().await;
+                    accounts.get(&preferred_id).is_some_and(|runtime| {
+                        !runtime.needs_login
+                            && !runtime.login_in_progress
+                            && runtime.quota_until.is_none_or(|until| until <= now)
+                            && runtime.avoid_until.is_none_or(|until| until <= now)
+                    })
+                };
+                if preferred_eligible {
+                    let usage_ok = {
+                        let accounts = self.accounts.lock().await;
+                        accounts
+                            .get(&preferred_id)
+                            .and_then(|runtime| runtime.usage)
+                            .is_none_or(|usage| usage < self.switch_at)
+                    };
+                    if usage_ok {
+                        error!(
+                            selected = selection.account_id,
+                            seq = selection.seq,
+                            selected_epoch = selection.account_generation,
+                            preferred = preferred_id,
+                            "selected vs wired mismatch: preferred account flipped mid-resolve"
+                        );
+                        return Err(SelectionStaleReason::PreferredSuperseded);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lightweight pre-wire check for dispatch paths that only carry an account id plus the
+    /// stamped generation (direct upstream connects). Same fail-closed semantics as
+    /// [`Self::validate_selection`] without pool/thread context.
+    pub async fn validate_account_wirable(
+        &self,
+        account: &str,
+        expected_generation: Option<u64>,
+    ) -> Result<(), SelectionStaleReason> {
+        let now = Instant::now();
+        let probe = {
+            let mut accounts = self.accounts.lock().await;
+            let wall_now = Utc::now();
+            for runtime in accounts.values_mut() {
+                reconcile_runtime(runtime, now, wall_now);
+            }
+            accounts.get(account).map(|runtime| {
+                (
+                    runtime.needs_login,
+                    runtime.login_in_progress,
+                    runtime.quota_until.is_some_and(|until| until > now),
+                    runtime.avoid_until.is_some_and(|until| until > now),
+                )
+            })
+        };
+        let Some((needs_login, login_in_progress, quota_blocked, avoid_blocked)) = probe else {
+            return Err(SelectionStaleReason::UnknownAccount);
+        };
+        if needs_login {
+            return Err(SelectionStaleReason::NeedsLogin);
+        }
+        if login_in_progress {
+            return Err(SelectionStaleReason::LoginInProgress);
+        }
+        if quota_blocked {
+            return Err(SelectionStaleReason::Quota);
+        }
+        if avoid_blocked {
+            return Err(SelectionStaleReason::Avoid);
+        }
+        if let Some(expected) = expected_generation {
+            let current = self.affinity.account_epoch(account).await;
+            if current != expected {
+                error!(
+                    selected = account,
+                    selected_epoch = expected,
+                    current_epoch = current,
+                    "selected vs wired mismatch: account epoch changed before wire"
+                );
+                return Err(SelectionStaleReason::EpochChanged);
+            }
+        }
+        Ok(())
     }
 
     /// Accounts the router currently excludes because their credentials need repair.
@@ -358,10 +637,18 @@ impl Router {
                     && a.quota_until.is_none_or(|v| v <= now)
                     && a.avoid_until.is_none_or(|v| v <= now)
             });
-        eligible.then(|| Selection {
+        if !eligible {
+            return None;
+        }
+        drop(accounts);
+        let account_generation = self.affinity.account_epoch(account).await;
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        Some(Selection {
             account_id: account.to_owned(),
             bound: true,
             thread: None,
+            account_generation,
+            seq,
         })
     }
     pub async fn end(&self, account: &str) {
@@ -835,6 +1122,8 @@ mod tests {
             RoutingSnapshot {
                 preferred_accounts: BTreeMap::from([("default".into(), "b".into())]),
                 active_accounts: BTreeMap::from([("default".into(), "b".into())]),
+                // `wired` tracks last actually-sent traffic, not fresh picks; no wire happened here.
+                wired_accounts: BTreeMap::new(),
                 account_states: BTreeMap::from([
                     (
                         "a".into(),
@@ -1372,5 +1661,252 @@ mod tests {
         assert_eq!(account.unavailable_reason.as_deref(), Some("quota"));
         assert!(account.retry_at_unix.is_some());
         assert_eq!(account.quota_windows["primary"].used_percent, Some(100));
+    }
+
+    fn stale_test_router(
+        dir: &std::path::Path,
+    ) -> (
+        Config,
+        Arc<AffinityStore>,
+        Router,
+        crate::config::PoolConfig,
+    ) {
+        let cfg = config(dir);
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.join("a.json"),
+                &cfg.proxy.affinity_key,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let pool = cfg.pools["default"].clone();
+        let router = Router::new(&cfg, affinity.clone());
+        (cfg, affinity, router, pool)
+    }
+
+    #[tokio::test]
+    async fn selection_carries_generation_and_monotonic_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        let first = router.select("default", &pool, None, None).await.unwrap();
+        let second = router.select("default", &pool, None, None).await.unwrap();
+        assert_eq!(
+            first.account_generation,
+            router.current_generation(&first.account_id).await
+        );
+        assert!(second.seq > first.seq);
+        let exact = router.select_exact(&pool, &first.account_id).await.unwrap();
+        assert_eq!(
+            exact.account_generation,
+            router.current_generation(&first.account_id).await
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_flip_mid_resolve_marks_fresh_selection_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        // First fresh pick lands on "a" (lowest last_assigned).
+        let selected = router.select("default", &pool, None, None).await.unwrap();
+        assert_eq!(selected.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&selected, "default", &pool)
+                .await
+                .is_ok()
+        );
+
+        // Operator flips the configured preference mid-resolve (during auth.resolve).
+        router.set_preferred("default", Some("b".to_owned())).await;
+
+        assert_eq!(
+            router.validate_selection(&selected, "default", &pool).await,
+            Err(SelectionStaleReason::PreferredSuperseded)
+        );
+        // Bound work is unaffected by preference flips.
+        let key = router.affinity.key("sticky-thread");
+        assert!(router.bind(key.clone(), "a").await);
+        let bound = router
+            .select("default", &pool, Some(key), None)
+            .await
+            .unwrap();
+        assert!(bound.bound);
+        assert!(
+            router
+                .validate_selection(&bound, "default", &pool)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_preferred_does_not_supersede_failover() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        // Preferred A is on quota cooldown while healthy B is available.
+        router.set_preferred("default", Some("a".to_owned())).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("3600"));
+        router.quota_failure("a", &headers).await;
+
+        // Failover must pick healthy B ...
+        let selected = router.select("default", &pool, None, None).await.unwrap();
+        assert_eq!(selected.account_id, "b");
+        // ... and revalidation must not reject B as superseded by blocked A.
+        assert!(
+            router
+                .validate_selection(&selected, "default", &pool)
+                .await
+                .is_ok()
+        );
+
+        // Once A's cooldown lapses it is eligible again, so the same B selection
+        // must now be reported as superseded by the healthy preferred account.
+        {
+            let mut accounts = router.accounts.lock().await;
+            let account = accounts.get_mut("a").unwrap();
+            account.quota_until = Some(Instant::now() - Duration::from_secs(1));
+            account.quota_reset_at = None;
+            account.quota_evidence = None;
+        }
+        assert_eq!(
+            router.validate_selection(&selected, "default", &pool).await,
+            Err(SelectionStaleReason::PreferredSuperseded)
+        );
+    }
+
+    #[tokio::test]
+    async fn avoid_preferred_does_not_supersede_failover() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        // Preferred A is on temporary avoid cooldown while healthy B is available.
+        router.set_preferred("default", Some("a".to_owned())).await;
+        router.soft_failure("a").await;
+
+        let selected = router.select("default", &pool, None, None).await.unwrap();
+        assert_eq!(selected.account_id, "b");
+        assert!(
+            router
+                .validate_selection(&selected, "default", &pool)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_failure_mid_resolve_marks_selection_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        let selected = router.select("default", &pool, None, None).await.unwrap();
+        assert!(
+            router
+                .validate_selection(&selected, "default", &pool)
+                .await
+                .is_ok()
+        );
+
+        router
+            .quota_failure(&selected.account_id, &HeaderMap::new())
+            .await;
+        assert_eq!(
+            router.validate_selection(&selected, "default", &pool).await,
+            Err(SelectionStaleReason::Quota)
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_invalidate_mid_resolve_marks_selection_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, affinity, router, pool) = stale_test_router(dir.path());
+        let key = affinity.key("bound-thread");
+        let selected = router
+            .select("default", &pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        assert!(
+            router
+                .validate_selection(&selected, "default", &pool)
+                .await
+                .is_ok()
+        );
+
+        // An auth failure elsewhere invalidates the account epoch + bindings mid-resolve.
+        assert!(affinity.invalidate_account(&selected.account_id).await);
+
+        let outcome = router.validate_selection(&selected, "default", &pool).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(SelectionStaleReason::EpochChanged) | Err(SelectionStaleReason::BindingChanged)
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reauth_required_blocks_401_continue_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        // 401-continue paths must revalidate before reusing the stale account: a concurrent
+        // reauth_required (refresh-token rejection) has to fail the re-check.
+        let selected = router.select_exact(&pool, "a").await.unwrap();
+        assert!(
+            router
+                .validate_selection(&selected, "default", &pool)
+                .await
+                .is_ok()
+        );
+
+        router.reauth_required("a").await;
+        assert_eq!(
+            router.validate_selection(&selected, "default", &pool).await,
+            Err(SelectionStaleReason::NeedsLogin)
+        );
+        assert!(
+            router
+                .validate_account_wirable("a", Some(selected.account_generation))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_tracking_is_independent_of_fresh_picks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, affinity, router, pool) = stale_test_router(dir.path());
+        let snapshot = router.routing_snapshot().await;
+        assert!(snapshot.active_accounts.is_empty());
+        assert!(snapshot.wired_accounts.is_empty());
+
+        // A fresh pick moves `active` but wires nothing yet.
+        let fresh = router.select("default", &pool, None, None).await.unwrap();
+        assert!(!fresh.bound);
+        let snapshot = router.routing_snapshot().await;
+        assert_eq!(snapshot.active_accounts["default"], fresh.account_id);
+        assert!(snapshot.wired_accounts.is_empty());
+
+        // Bound traffic never moves `active`, but wiring it must show up as wired.
+        let other = if fresh.account_id == "a" { "b" } else { "a" };
+        let key = affinity.key("thread");
+        assert!(router.bind(key.clone(), other).await);
+        let bound = router
+            .select("default", &pool, Some(key), None)
+            .await
+            .unwrap();
+        assert!(bound.bound);
+        assert_eq!(bound.account_id, other);
+        assert_eq!(
+            router.routing_snapshot().await.active_accounts["default"],
+            fresh.account_id
+        );
+        router.note_wired("default", &bound.account_id).await;
+        let snapshot = router.routing_snapshot().await;
+        assert_eq!(snapshot.active_accounts["default"], fresh.account_id);
+        assert_eq!(snapshot.wired_accounts["default"], bound.account_id);
+        assert_ne!(
+            snapshot.active_accounts["default"],
+            snapshot.wired_accounts["default"]
+        );
     }
 }

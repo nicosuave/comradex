@@ -531,7 +531,12 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         let active = routing
             .and_then(|routing| routing.active_accounts.get(name))
             .map_or("no fresh work yet", String::as_str);
-        println!("  {name:width$}  preferred {preferred}, active {active}");
+        // Display honesty (fix1): `active` is the last fresh pick only and never reflects
+        // bound/select_exact traffic; `wired` is the last account actually sent upstream.
+        let wired = routing
+            .and_then(|routing| routing.wired_accounts.get(name))
+            .map_or("nothing wired yet", String::as_str);
+        println!("  {name:width$}  preferred {preferred}, active {active}, wired {wired}");
     }
 
     println!("\ntraffic");
