@@ -146,6 +146,16 @@ async fn main() -> Result<()> {
                 c.pools.len(),
                 c.accounts.len()
             );
+            for (name, listener) in &c.listeners {
+                let base = format!(
+                    "http://{}/{}",
+                    listener.address, c.proxy.installation_secret
+                );
+                println!(
+                    "listener {name} openai_base_url (Codex 0.153+ context): {base}/backend-api/codex"
+                );
+                println!("listener {name} openai_base_url (older clients):       {base}/v1");
+            }
             Ok(())
         }
         CommandName::Serve => serve(&config_path).await,
@@ -438,6 +448,15 @@ fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) 
     let installed_url =
         install::install(codex_config, &state_dir(&config).join("install.json"), &url)?;
     println!("installed openai_base_url = {installed_url}");
+    if let Some(alternate) = install::alternate_url(&installed_url) {
+        println!("alternate openai_base_url = {alternate}");
+        println!(
+            "use the .../backend-api/codex URL for Codex 0.153+ with \
+             [features.context_management] experimental_mode = true and the .../v1 URL \
+             for older clients; `comradex install` rewrites this value in place from \
+             that flag, or edit openai_base_url by hand to switch shapes"
+        );
+    }
     Ok(())
 }
 
@@ -487,10 +506,19 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
     println!("service  {service}");
 
     match install::installed_record(&state.join("install.json")) {
-        Some(record) => println!(
-            "codex    routed through Comradex via {}",
-            record.codex_config.display()
-        ),
+        Some(record) => {
+            println!(
+                "codex    routed through Comradex via {}",
+                record.codex_config.display()
+            );
+            println!("         openai_base_url = {}", record.installed_url);
+            if let Some(alternate) = install::alternate_url(&record.installed_url) {
+                println!(
+                    "         alternate   URL = {alternate} \
+                     (backend shape for Codex 0.153+ context management, /v1 for older clients)"
+                );
+            }
+        }
         None => println!("codex    not routed through Comradex (run `comradex install`)"),
     }
 

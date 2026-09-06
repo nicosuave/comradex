@@ -71,7 +71,8 @@ use sse::{ProtocolEvent, SseDecoder, responses_json_events};
 use websocket_protocol::{
     DownstreamEndAction, FailureClassification, FailureKind, ProtocolLimits, ProtocolState,
     ReplayContext, ReplayMode, ReplayTarget, Settlement, TerminalKind, TurnEndDisposition, TurnId,
-    UpstreamEnd, analyze_response_create, classify_failure, fresh_replay_without_previous_response,
+    UpstreamEnd, analyze_response_create, classify_http_json_body, classify_terminal_event,
+    fresh_replay_without_previous_response, terminal_permits_affinity,
 };
 
 const FILE_CREATE_RESPONSE_LIMIT: usize = 1024 * 1024;
@@ -973,6 +974,18 @@ impl App {
         if !suffix.is_empty() && !suffix.starts_with('/') {
             return None;
         }
+        // A backend-shaped base URL combined with a backend-shaped request path would
+        // otherwise forward to `<upstream>/backend-api/codex/backend-api/codex/...`,
+        // missing both upstream and the path-keyed affinity matchers. No legitimate
+        // upstream route nests the base path, so collapse the redundant prefix and
+        // route the request exactly as if the client had sent it once.
+        let mut suffix = suffix;
+        while let Some(redundant) = suffix
+            .strip_prefix("/backend-api/codex")
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        {
+            suffix = redundant;
+        }
         let mut path = if suffix.is_empty() {
             "/".to_owned()
         } else {
@@ -983,6 +996,14 @@ impl App {
             path.push_str(query);
         }
         Some(path)
+    }
+
+    /// Whether the raw downstream path arrived under the backend alias
+    /// (`/<secret>/backend-api/codex/...`) rather than the legacy `/<secret>/v1/...`
+    /// prefix. The installation secret is base64url and cannot contain `/`, so the
+    /// alias segment is unambiguous in the raw path.
+    fn is_backend_shaped_downstream_path(raw_path: &str) -> bool {
+        raw_path.contains("/backend-api/codex/")
     }
 
     async fn handle_http(
@@ -1350,6 +1371,13 @@ impl App {
                         .observe_headers(&account, response.headers())
                         .await;
                     let status = response.status();
+                    // Defer success affinity for native Responses until the
+                    // body terminal confirms a non-quota outcome. Header-time
+                    // binds would otherwise poison affinity when a late body
+                    // (HTTP 200 + SSE `type:error` / quota-shaped
+                    // `incomplete`/`failed`) reclassifies as quota.
+                    let defer_affinity = status.is_success() && is_native_responses(&path);
+                    let mut deferred_affinity: Vec<crate::routing::ThreadKey> = Vec::new();
                     if status.is_success()
                         && let Some(turn_state) = response
                             .headers()
@@ -1361,7 +1389,11 @@ impl App {
                             .router
                             .affinity
                             .key(&format!("turn-state:{turn_state}"));
-                        self.router.bind(alias, &account).await;
+                        if defer_affinity {
+                            deferred_affinity.push(alias);
+                        } else {
+                            self.router.bind(alias, &account).await;
+                        }
                     }
                     if status == StatusCode::UNAUTHORIZED {
                         if attempt == 0 {
@@ -1417,6 +1449,7 @@ impl App {
                             self.router.clone(),
                             &selected,
                             false,
+                            Vec::new(),
                         ));
                     }
                     if status == StatusCode::FORBIDDEN {
@@ -1426,12 +1459,17 @@ impl App {
                             self.router.clone(),
                             &selected,
                             false,
+                            Vec::new(),
                         ));
                     }
                     if status.is_success() {
                         for (kind, key) in &affinity_keys {
                             if *kind != metadata::AffinityKind::File {
-                                self.router.bind(key.clone(), &account).await;
+                                if defer_affinity {
+                                    deferred_affinity.push(key.clone());
+                                } else {
+                                    self.router.bind(key.clone(), &account).await;
+                                }
                             }
                         }
                     }
@@ -1490,11 +1528,17 @@ impl App {
                         return map_legacy_compact_response(response).await;
                     }
                     request_lease.disarm();
+                    let observe = status.is_success() && is_native_responses(&path);
                     return Ok(map_http_response_leased(
                         response,
                         self.router.clone(),
                         &selected,
-                        status.is_success() && is_native_responses(&path),
+                        observe,
+                        if observe {
+                            deferred_affinity
+                        } else {
+                            Vec::new()
+                        },
                     ));
                 }
                 Err(e) => {
@@ -2686,7 +2730,7 @@ impl App {
                                 client.send(message).await?;
                                 continue;
                             };
-                            let failure = classify_failure(&event);
+                            let failure = classify_terminal_event(&event);
                             if failure.kind != FailureKind::None
                                 && matches!(
                                     event.get("type").and_then(serde_json::Value::as_str),
@@ -3509,7 +3553,7 @@ impl App {
                     && is_native_responses(&path)
                     && (self.config.proxy.responses_websocket_mode
                         == ResponsesWebsocketMode::Direct
-                        || req.uri().path().contains("/backend-api/codex/"));
+                        || Self::is_backend_shaped_downstream_path(req.uri().path()));
                 stats.open_upgrades.fetch_add(1, Ordering::Relaxed);
                 let upgrade_guard = OpenUpgradeGuard(stats.clone());
                 let spawned = self
@@ -4034,6 +4078,7 @@ fn map_http_response_leased(
     router: Arc<Router>,
     selection: &Selection,
     observe_response_ids: bool,
+    deferred_affinity: Vec<crate::routing::ThreadKey>,
 ) -> Response<ProxyBody> {
     let (mut parts, body) = response.into_parts();
     headers::strip_hop_by_hop(&mut parts.headers);
@@ -4043,8 +4088,12 @@ fn map_http_response_leased(
         seq: selection.seq,
     });
     let account = selection.account_id.clone();
-    let observer = observe_response_ids
-        .then(|| response_observer_for_content_type(parts.headers.get(CONTENT_TYPE)));
+    let response_headers = parts.headers.clone();
+    let observer = observe_response_ids.then(|| {
+        HttpResponseObserver::new(response_observer_for_content_type(
+            parts.headers.get(CONTENT_TYPE),
+        ))
+    });
     Response::from_parts(
         parts,
         BodyExt::boxed(LeasedIncoming {
@@ -4052,6 +4101,8 @@ fn map_http_response_leased(
             router,
             account: Some(account),
             observer,
+            response_headers,
+            deferred_affinity,
             pending_frame: None,
             pending_binding: None,
             pending_end: false,
@@ -4065,13 +4116,15 @@ struct LeasedIncoming {
     router: Arc<Router>,
     account: Option<String>,
     observer: Option<HttpResponseObserver>,
+    response_headers: hyper::HeaderMap,
+    deferred_affinity: Vec<crate::routing::ThreadKey>,
     pending_frame: Option<Frame<bytes::Bytes>>,
     pending_binding: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
     pending_end: bool,
     idle: Pin<Box<tokio::time::Sleep>>,
 }
 
-enum HttpResponseObserver {
+enum HttpResponseObserverKind {
     Sse(SseDecoder),
     Json(Option<Vec<u8>>),
     /// Wire bytes, not Content-Type, select the observer. At most the small
@@ -4080,78 +4133,198 @@ enum HttpResponseObserver {
     Undecided(Vec<u8>),
 }
 
-fn response_observer_for_content_type(
-    _content_type: Option<&hyper::header::HeaderValue>,
-) -> HttpResponseObserver {
-    HttpResponseObserver::Undecided(Vec::new())
+/// Canonical body observer for the HTTP lane. It defers all success-affinity
+/// binds (previous-response IDs plus header-time affinity keys) until the
+/// body terminal confirms a non-quota outcome, and records a quota-terminal
+/// classification for `quota_failure(headers)` with retry-after preserved.
+struct HttpResponseObserver {
+    kind: HttpResponseObserverKind,
+    deferred_ids: Vec<String>,
+    quota: Option<FailureClassification>,
+    terminal: Option<sse::TerminalStatus>,
 }
 
 impl HttpResponseObserver {
-    fn observe(&mut self, data: &[u8]) -> Vec<String> {
-        match self {
-            Self::Sse(decoder) => observe_sse_response_ids(decoder, data),
-            Self::Json(json) => {
-                if let Some(bytes) = json {
-                    if bytes.len().saturating_add(data.len()) <= RESPONSES_JSON_RESPONSE_LIMIT {
-                        bytes.extend_from_slice(data);
+    fn new(kind: HttpResponseObserverKind) -> Self {
+        Self {
+            kind,
+            deferred_ids: Vec::new(),
+            quota: None,
+            terminal: None,
+        }
+    }
+
+    fn observe(&mut self, data: &[u8]) {
+        if matches!(self.kind, HttpResponseObserverKind::Sse(_)) {
+            let batched = {
+                let HttpResponseObserverKind::Sse(decoder) = &mut self.kind else {
+                    unreachable!("checked Sse kind")
+                };
+                let mut batched = Vec::new();
+                for slice in data.chunks(SSE_DECODE_SLICE_BYTES) {
+                    match decoder.push(slice) {
+                        Ok(events) => batched.extend(events),
+                        Err(_) => continue,
+                    };
+                }
+                batched
+            };
+            if !batched.is_empty() {
+                self.observe_events(batched);
+            }
+            return;
+        }
+        if matches!(self.kind, HttpResponseObserverKind::Json(_)) {
+            if let HttpResponseObserverKind::Json(json) = &mut self.kind
+                && let Some(bytes) = json
+            {
+                if bytes.len().saturating_add(data.len()) <= RESPONSES_JSON_RESPONSE_LIMIT {
+                    bytes.extend_from_slice(data);
+                } else {
+                    *json = None;
+                }
+            }
+            return;
+        }
+        // Undecided: decide from a bounded wire prefix without holding the
+        // borrow across the recursive `observe` calls below.
+        let (decided, previous) = {
+            let HttpResponseObserverKind::Undecided(buffered) = &mut self.kind else {
+                unreachable!("checked Undecided kind")
+            };
+            let mut probe = buffered.clone();
+            let remaining = UNKNOWN_CONTENT_SNIFF_BYTES.saturating_sub(probe.len());
+            probe.extend_from_slice(&data[..data.len().min(remaining)]);
+            let kind = sniffed_body_kind(&probe).or_else(|| {
+                (probe.len() >= UNKNOWN_CONTENT_SNIFF_BYTES).then_some(SniffedBodyKind::Json)
+            });
+            let Some(kind) = kind else {
+                *buffered = probe;
+                return;
+            };
+            let previous = std::mem::take(buffered);
+            (kind, previous)
+        };
+        self.kind = match decided {
+            SniffedBodyKind::Json => HttpResponseObserverKind::Json(Some(Vec::new())),
+            SniffedBodyKind::Sse => HttpResponseObserverKind::Sse(SseDecoder::default()),
+        };
+        self.observe(&previous);
+        self.observe(data);
+    }
+
+    fn observe_events(&mut self, events: Vec<ProtocolEvent>) {
+        for event in events {
+            // Canonical terminal classification: unwrap `event.error OR
+            // `event.response.error`, narrow `incomplete_details`, numeric
+            // `status`/`status_code` fallback.
+            let classification = classify_terminal_event(&event.value);
+            if classification.kind == FailureKind::Quota {
+                self.quota = Some(classification);
+                self.terminal = event.terminal.or(self.terminal);
+                // Quota terminals never bind previous-response IDs; drop any
+                // IDs buffered from earlier non-terminal events in the same
+                // quota-failed body so a late quota reclassification does not
+                // leave success affinity behind.
+                self.deferred_ids.clear();
+                continue;
+            }
+            if let Some(id) = response_id_from_protocol_event(event.clone())
+                && !self.deferred_ids.contains(&id)
+            {
+                self.deferred_ids.push(id);
+            }
+            if event.terminal.is_some() {
+                self.terminal = event.terminal;
+            }
+        }
+    }
+
+    fn finish(mut self) -> HttpObservedBody {
+        // Collect trailing SSE events without holding the decoder borrow
+        // across `observe_events(&mut self)`.
+        let trailing = if matches!(self.kind, HttpResponseObserverKind::Sse(_)) {
+            let HttpResponseObserverKind::Sse(decoder) = &mut self.kind else {
+                unreachable!("checked Sse kind")
+            };
+            decoder.finish().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !trailing.is_empty() {
+            self.observe_events(trailing);
+        }
+        match &mut self.kind {
+            HttpResponseObserverKind::Sse(_) => {}
+            HttpResponseObserverKind::Json(json) => {
+                if let Some(bytes) = json.take() {
+                    let classification = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map(|value| classify_http_json_body(&value))
+                        .unwrap_or_else(|_| FailureClassification {
+                            kind: FailureKind::None,
+                            code: None,
+                            message: None,
+                            response_id: None,
+                        });
+                    if classification.kind == FailureKind::Quota {
+                        self.quota = Some(classification);
+                        self.deferred_ids.clear();
                     } else {
-                        *json = None;
+                        self.deferred_ids = response_ids_from_json(&bytes);
+                        // Record a non-quota terminal for affinity gating when
+                        // the JSON body implies one.
+                        if self.terminal.is_none() {
+                            self.terminal = serde_json::from_slice::<serde_json::Value>(&bytes)
+                                .ok()
+                                .and_then(|value| {
+                                    let response = value.get("response").unwrap_or(&value);
+                                    match response.get("status").and_then(serde_json::Value::as_str)
+                                    {
+                                        Some("completed") => Some(sse::TerminalStatus::Completed),
+                                        Some("failed") => Some(sse::TerminalStatus::Failed),
+                                        Some("incomplete") => Some(sse::TerminalStatus::Incomplete),
+                                        _ => None,
+                                    }
+                                });
+                        }
                     }
                 }
-                Vec::new()
             }
-            Self::Undecided(buffered) => {
-                let mut probe = buffered.clone();
-                let remaining = UNKNOWN_CONTENT_SNIFF_BYTES.saturating_sub(probe.len());
-                probe.extend_from_slice(&data[..data.len().min(remaining)]);
-                let kind = sniffed_body_kind(&probe).or_else(|| {
-                    (probe.len() >= UNKNOWN_CONTENT_SNIFF_BYTES).then_some(SniffedBodyKind::Json)
-                });
-                let Some(kind) = kind else {
-                    *buffered = probe;
-                    return Vec::new();
-                };
-                let previous = std::mem::take(buffered);
-                *self = match kind {
-                    SniffedBodyKind::Json => Self::Json(Some(Vec::new())),
-                    SniffedBodyKind::Sse => Self::Sse(SseDecoder::default()),
-                };
-                let mut ids = self.observe(&previous);
-                ids.extend(self.observe(data));
-                ids
+            HttpResponseObserverKind::Undecided(bytes) => {
+                let bytes = std::mem::take(bytes);
+                let classification = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map(|value| classify_http_json_body(&value))
+                    .unwrap_or_else(|_| FailureClassification {
+                        kind: FailureKind::None,
+                        code: None,
+                        message: None,
+                        response_id: None,
+                    });
+                if classification.kind == FailureKind::Quota {
+                    self.quota = Some(classification);
+                } else {
+                    self.deferred_ids = response_ids_from_json(&bytes);
+                }
             }
         }
-    }
-
-    fn finish(self) -> Vec<String> {
-        match self {
-            Self::Sse(mut decoder) => response_ids_from_sse_finish(&mut decoder),
-            Self::Json(Some(bytes)) => response_ids_from_json(&bytes),
-            Self::Json(None) => Vec::new(),
-            Self::Undecided(bytes) => response_ids_from_json(&bytes),
+        HttpObservedBody {
+            ids: std::mem::take(&mut self.deferred_ids),
+            quota: self.quota,
+            terminal: self.terminal,
         }
     }
 }
 
-fn observe_sse_response_ids(decoder: &mut SseDecoder, data: &[u8]) -> Vec<String> {
-    let mut response_id = None;
-    for slice in data.chunks(SSE_DECODE_SLICE_BYTES) {
-        if let Ok(events) = decoder.push(slice)
-            && response_id.is_none()
-        {
-            response_id = events.into_iter().find_map(response_id_from_protocol_event);
-        }
-    }
-    response_id.into_iter().collect()
+struct HttpObservedBody {
+    ids: Vec<String>,
+    quota: Option<FailureClassification>,
+    terminal: Option<sse::TerminalStatus>,
 }
 
-fn response_ids_from_sse_finish(decoder: &mut SseDecoder) -> Vec<String> {
-    decoder
-        .finish()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(response_id_from_protocol_event)
-        .collect()
+fn response_observer_for_content_type(
+    _content_type: Option<&hyper::header::HeaderValue>,
+) -> HttpResponseObserverKind {
+    HttpResponseObserverKind::Undecided(Vec::new())
 }
 
 impl Body for LeasedIncoming {
@@ -4192,29 +4365,65 @@ impl Body for LeasedIncoming {
                     self.idle
                         .as_mut()
                         .reset(tokio::time::Instant::now() + HTTP_RESPONSE_BODY_IDLE_TIMEOUT);
-                    let ids = frame
-                        .data_ref()
-                        .map(|data| self.observe_response_data(data))
-                        .unwrap_or_default();
-                    if ids.is_empty() {
+                    // Streaming chunks are only observed; all affinity binds
+                    // are deferred until the body terminal confirms a
+                    // non-quota outcome, so frames pass through without delay.
+                    if let Some(data) = frame.data_ref()
+                        && let Some(observer) = self.observer.as_mut()
+                    {
+                        observer.observe(data);
+                    }
+                    // A Content-Length terminal arrives as the final DATA frame
+                    // with `inner.is_end_stream() == true`; hyper's h1 dispatch
+                    // then calls `write_body_and_end` without polling again, and
+                    // trailers are terminal unconditionally. Finalizing only on
+                    // the subsequent `None` would therefore skip quota/affinity.
+                    // Finalize exactly once here, holding the terminal frame
+                    // until the binding completes.
+                    let terminal = frame.is_trailers() || self.inner.is_end_stream();
+                    if !terminal {
                         return Poll::Ready(Some(Ok(frame)));
                     }
-                    self.pending_frame = Some(frame);
-                    self.pending_binding = self.response_binding(ids);
+                    let Some(observer) = self.observer.take() else {
+                        return Poll::Ready(Some(Ok(frame)));
+                    };
+                    let observed = observer.finish();
+                    if let Some(binding) = self.finish_binding(observed) {
+                        self.pending_frame = Some(frame);
+                        self.pending_binding = Some(binding);
+                        continue;
+                    }
+                    return Poll::Ready(Some(Ok(frame)));
                 }
                 Poll::Ready(None) => {
-                    let ids = self.finish_response_observer();
-                    if ids.is_empty() {
+                    let Some(observer) = self.observer.take() else {
                         return Poll::Ready(None);
+                    };
+                    let observed = observer.finish();
+                    let binding = self.finish_binding(observed);
+                    if let Some(binding) = binding {
+                        self.pending_end = true;
+                        self.pending_binding = Some(binding);
+                        continue;
                     }
-                    self.pending_end = true;
-                    self.pending_binding = self.response_binding(ids);
+                    return Poll::Ready(None);
                 }
             }
         }
     }
 
     fn is_end_stream(&self) -> bool {
+        // Do not report end-of-stream while finalization is outstanding.
+        // Hyper's h1 dispatch ends the body without another poll once
+        // `is_end_stream()` is true after DATA (and always after trailers),
+        // so an unfinalized Content-Length terminal or a pending binding must
+        // keep this false to force the extra poll that drives finalization.
+        if self.pending_binding.is_some() || self.pending_frame.is_some() || self.pending_end {
+            return false;
+        }
+        if self.observer.is_some() && self.inner.is_end_stream() {
+            return false;
+        }
         self.inner.is_end_stream()
     }
 
@@ -4224,31 +4433,40 @@ impl Body for LeasedIncoming {
 }
 
 impl LeasedIncoming {
-    fn observe_response_data(&mut self, data: &[u8]) -> Vec<String> {
-        self.observer
-            .as_mut()
-            .map(|observer| observer.observe(data))
-            .unwrap_or_default()
-    }
-
-    fn finish_response_observer(&mut self) -> Vec<String> {
-        self.observer
-            .take()
-            .map(HttpResponseObserver::finish)
-            .unwrap_or_default()
-    }
-
-    fn response_binding(
+    fn finish_binding(
         &self,
-        ids: Vec<String>,
+        observed: HttpObservedBody,
     ) -> Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>> {
         let account = self.account.clone()?;
+        // Without an observer there is no deferred work; immediate
+        // header-time binds (non-native paths) already ran.
         let router = self.router.clone();
+        let headers = self.response_headers.clone();
+        let deferred_affinity = self.deferred_affinity.clone();
         Some(Box::pin(async move {
-            for response_id in ids {
+            if let Some(quota) = observed.quota {
+                // Late body reclassification as quota: feed
+                // `quota_failure(headers)` preserving retry-after and bind
+                // nothing (no previous-response IDs, no deferred affinity,
+                // no continuation).
+                let _ = quota;
+                router.quota_failure(&account, &headers).await;
+                return;
+            }
+            // Bind deferred success affinity only behind a non-quota
+            // terminal. Normal `incomplete` (max_tokens/length/
+            // content_filter) keeps `terminal == Incomplete` with affinity
+            // intact; bodies without any terminal bind nothing.
+            if observed.terminal.is_none() {
+                return;
+            }
+            for response_id in observed.ids {
                 let key = router
                     .affinity
                     .key(&format!("previous-response:{response_id}"));
+                router.bind(key, &account).await;
+            }
+            for key in deferred_affinity {
                 router.bind(key, &account).await;
             }
         }))
@@ -4566,6 +4784,77 @@ async fn bind_response_id_from_event(app: &Arc<App>, event: &str, account: &str)
     app.router.bind(key, account).await;
 }
 
+fn bridge_safe_headers(headers: &hyper::HeaderMap) -> serde_json::Map<String, serde_json::Value> {
+    let mut safe_headers = serde_json::Map::new();
+    for name in [
+        "retry-after",
+        "x-request-id",
+        "openai-request-id",
+        "openai-model",
+        "x-models-etag",
+        "x-reasoning-included",
+        "x-codex-turn-state",
+        "x-codex-primary-used-percent",
+        "x-codex-secondary-used-percent",
+        "x-codex-primary-window-minutes",
+        "x-codex-secondary-window-minutes",
+    ] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            safe_headers.insert(name.to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+    }
+    for (name, value) in headers {
+        let name = name.as_str();
+        if (name.starts_with("x-ratelimit-") || is_safe_codex_quota_header(name))
+            && let Ok(value) = value.to_str()
+        {
+            safe_headers.insert(name.to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+    }
+    safe_headers
+}
+
+/// Enriches a quota-terminal payload forwarded on HTTP 200 with the upstream
+/// retry-after/quota headers so downstream observes the same cooldown signal
+/// that feeds `quota_failure(headers)`.
+fn enrich_bridge_quota_payload(
+    payload: &str,
+    value: &serde_json::Value,
+    headers: &hyper::HeaderMap,
+) -> String {
+    let Ok(mut rewritten) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return payload.to_owned();
+    };
+    let Some(object) = rewritten.as_object_mut() else {
+        return payload.to_owned();
+    };
+    // Preserve any existing headers object, filling only missing safe entries.
+    let mut merged = object
+        .get("headers")
+        .and_then(|headers| headers.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for (name, header) in bridge_safe_headers(headers) {
+        merged.entry(name).or_insert(header);
+    }
+    object.insert("headers".to_owned(), serde_json::Value::Object(merged));
+    // Ensure a numeric status is present for quota terminals synthesized from
+    // SSE `type:error` or `response.failed/incomplete` without one.
+    if object.get("status").is_none_or(serde_json::Value::is_null) {
+        let numeric = value
+            .get("status")
+            .and_then(|status| status.as_u64())
+            .or_else(|| value.get("status_code").and_then(|status| status.as_u64()));
+        object.insert(
+            "status".to_owned(),
+            numeric
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|| serde_json::Value::from(429)),
+        );
+    }
+    serde_json::to_string(&rewritten).unwrap_or_else(|_| payload.to_owned())
+}
+
 async fn pump_http_response_to_websocket(
     response: Response<ProxyBody>,
     outbound: &BridgeSender,
@@ -4621,6 +4910,22 @@ async fn pump_http_response_to_websocket(
             }
         };
         let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+        // Canonical body classification on the non-success Bridge path:
+        // a quota-shaped error body (numeric 429, quota code/message)
+        // feeds `quota_failure(headers)` even when the transport status is
+        // not itself 429/402.
+        if let Some(account) = selected_account.as_deref()
+            && let Some(body_value) = parsed.as_ref()
+        {
+            let body_classification = if body_value.get("type").is_some() {
+                classify_terminal_event(body_value)
+            } else {
+                classify_http_json_body(body_value)
+            };
+            if body_classification.kind == FailureKind::Quota {
+                app.router.quota_failure(account, &response_headers).await;
+            }
+        }
         let error = parsed
             .as_ref()
             .and_then(|value| value.get("error"))
@@ -4677,6 +4982,7 @@ async fn pump_http_response_to_websocket(
                 selected_account.as_deref(),
                 &mut capture,
                 continuation,
+                &response_headers,
             )
             .await?
             {
@@ -4721,6 +5027,7 @@ async fn pump_http_response_to_websocket(
                 selected_account.as_deref(),
                 &mut capture,
                 continuation,
+                &response_headers,
             )
             .await?
             {
@@ -4738,6 +5045,7 @@ async fn pump_http_response_to_websocket(
             selected_account.as_deref(),
             &mut capture,
             continuation,
+            &response_headers,
         )
         .await?
         {
@@ -4774,6 +5082,10 @@ async fn pump_http_response_to_websocket(
         let response = value.get("response").cloned().unwrap_or(value);
         responses_json_events(response)?
     };
+    // Canonical classification also runs on the synthesized non-streaming
+    // lifecycle: a quota-shaped `failed`/`incomplete` response feeds
+    // `quota_failure(headers)` with retry-after preserved, and suppresses
+    // continuation/affinity inside `send_protocol_events`.
     if !send_protocol_events(
         events,
         outbound,
@@ -4781,6 +5093,7 @@ async fn pump_http_response_to_websocket(
         selected_account.as_deref(),
         &mut capture,
         continuation,
+        &response_headers,
     )
     .await?
     {
@@ -4804,14 +5117,45 @@ async fn send_protocol_events(
     account: Option<&str>,
     capture: &mut HttpBridgeCapture,
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
+    response_headers: &hyper::HeaderMap,
 ) -> Result<bool> {
     for event in events {
+        // Canonical terminal classification on the Bridge path: unwrap
+        // `event.error OR event.response.error` (plus narrow
+        // `incomplete_details` and numeric `status`/`status_code` fallbacks
+        // inside `classify_terminal_event`).
+        let classification = classify_terminal_event(&event.value);
+        let is_quota = classification.kind == FailureKind::Quota;
+        if is_quota {
+            if let Some(account) = account {
+                app.router.quota_failure(account, response_headers).await;
+            }
+            // Never bind previous-response affinity nor cache a continuation
+            // for quota terminals; the account is cooling down.
+            let previous_response_id = capture.response_id.clone();
+            capture.observe(&event.value);
+            capture.response_id = previous_response_id;
+            let payload =
+                enrich_bridge_quota_payload(&event.payload, &event.value, response_headers);
+            if !outbound.send(Message::Text(payload.into())).await {
+                capture.delivery_failed = true;
+                anyhow::bail!("downstream WebSocket writer stopped before event delivery")
+            }
+            capture.delivered_event = true;
+            if event.terminal.is_some() {
+                return Ok(true);
+            }
+            continue;
+        }
         capture.observe(&event.value);
-        if let Some(account) = account {
+        if let Some(account) = account
+            && terminal_permits_affinity(&classification)
+        {
             bind_response_id_from_event(app, &event.payload, account).await;
         }
         let terminal = event.terminal.is_some();
         if event.terminal == Some(sse::TerminalStatus::Completed)
+            && terminal_permits_affinity(&classification)
             && let Some(response_id) = capture.response_id.clone()
         {
             *continuation.lock().expect("bridge continuation") = Some(HttpBridgeContinuation {
@@ -4832,6 +5176,7 @@ async fn send_protocol_events(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_sse_data(
     decoder: &mut SseDecoder,
     data: &[u8],
@@ -4840,6 +5185,7 @@ async fn send_sse_data(
     account: Option<&str>,
     capture: &mut HttpBridgeCapture,
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
+    response_headers: &hyper::HeaderMap,
 ) -> Result<bool> {
     for slice in data.chunks(SSE_DECODE_SLICE_BYTES) {
         if send_protocol_events(
@@ -4849,6 +5195,7 @@ async fn send_sse_data(
             account,
             capture,
             continuation,
+            response_headers,
         )
         .await?
         {
@@ -5246,71 +5593,631 @@ mod tests {
 
     #[test]
     fn response_observer_binds_json_without_content_type() {
-        let mut observer = response_observer_for_content_type(None);
-        assert!(matches!(observer, HttpResponseObserver::Undecided(_)));
-        assert!(
-            observer
-                .observe(br#"{"id":"resp_missing_type","object":"response"}"#)
-                .is_empty()
-        );
-        assert_eq!(observer.finish(), ["resp_missing_type"]);
+        let mut observer = HttpResponseObserver::new(response_observer_for_content_type(None));
+        assert!(matches!(
+            observer.kind,
+            HttpResponseObserverKind::Undecided(_)
+        ));
+        observer.observe(br#"{"id":"resp_missing_type","object":"response","status":"completed"}"#);
+        let observed = observer.finish();
+        assert_eq!(observed.ids, ["resp_missing_type"]);
+        assert!(observed.quota.is_none());
+        assert_eq!(observed.terminal, Some(sse::TerminalStatus::Completed));
     }
 
     #[test]
     fn response_observer_binds_json_with_generic_content_type() {
         let content_type = hyper::header::HeaderValue::from_static("application/octet-stream");
-        let mut observer = response_observer_for_content_type(Some(&content_type));
-        assert!(matches!(observer, HttpResponseObserver::Undecided(_)));
-        assert!(
-            observer
-                .observe(br#"{"response":{"id":"resp_generic_type"}}"#)
-                .is_empty()
-        );
-        assert_eq!(observer.finish(), ["resp_generic_type"]);
+        let mut observer =
+            HttpResponseObserver::new(response_observer_for_content_type(Some(&content_type)));
+        assert!(matches!(
+            observer.kind,
+            HttpResponseObserverKind::Undecided(_)
+        ));
+        observer.observe(br#"{"response":{"id":"resp_generic_type","status":"completed"}}"#);
+        let observed = observer.finish();
+        assert_eq!(observed.ids, ["resp_generic_type"]);
+        assert!(observed.quota.is_none());
     }
 
     #[test]
     fn response_observer_keeps_explicit_sse_streaming() {
         let content_type = hyper::header::HeaderValue::from_static("text/event-stream");
-        let mut observer = response_observer_for_content_type(Some(&content_type));
-        assert!(matches!(observer, HttpResponseObserver::Undecided(_)));
+        let mut observer =
+            HttpResponseObserver::new(response_observer_for_content_type(Some(&content_type)));
+        assert!(matches!(
+            observer.kind,
+            HttpResponseObserverKind::Undecided(_)
+        ));
         let event = br#"data: {"type":"response.created","response":{"id":"resp_stream"}}
 
 "#;
-        let ids = observer.observe(event);
-        assert_eq!(ids, ["resp_stream"]);
-        assert!(matches!(observer, HttpResponseObserver::Sse(_)));
-        assert!(observer.finish().is_empty());
+        // Streaming chunks are only buffered; binds happen at the body
+        // terminal, so no IDs are reported synchronously.
+        observer.observe(event);
+        assert!(matches!(observer.kind, HttpResponseObserverKind::Sse(_)));
+        // Feed the terminal to complete the lifecycle.
+        observer.observe(
+            br#"data: {"type":"response.completed","response":{"id":"resp_stream","status":"completed"}}
+
+"#,
+        );
+        let observed = observer.finish();
+        assert_eq!(observed.ids, ["resp_stream"]);
+        assert_eq!(observed.terminal, Some(sse::TerminalStatus::Completed));
+        assert!(observed.quota.is_none());
 
         // A mislabeled stream takes the dual path, but still discovers the ID
         // from the current frame instead of waiting for EOF/JSON parsing.
         let generic = hyper::header::HeaderValue::from_static("application/octet-stream");
-        let mut observer = response_observer_for_content_type(Some(&generic));
-        let ids = observer.observe(event);
-        assert_eq!(ids, ["resp_stream"]);
-        assert!(observer.finish().is_empty());
+        let mut observer =
+            HttpResponseObserver::new(response_observer_for_content_type(Some(&generic)));
+        observer.observe(event);
+        observer.observe(
+            br#"data: {"type":"response.completed","response":{"id":"resp_stream","status":"completed"}}
+
+"#,
+        );
+        let observed = observer.finish();
+        assert_eq!(observed.ids, ["resp_stream"]);
 
         // Content-Type cannot override a JSON wire body.
         let mislabeled = hyper::header::HeaderValue::from_static("text/event-stream");
-        let mut observer = response_observer_for_content_type(Some(&mislabeled));
-        assert!(
-            observer
-                .observe(b"  {\"id\":\"resp_mislabeled_json\",\"object\":\"response\"}")
-                .is_empty()
+        let mut observer =
+            HttpResponseObserver::new(response_observer_for_content_type(Some(&mislabeled)));
+        observer.observe(
+            b"  {\"id\":\"resp_mislabeled_json\",\"object\":\"response\",\"status\":\"completed\"}",
         );
-        assert_eq!(observer.finish(), ["resp_mislabeled_json"]);
+        let observed = observer.finish();
+        assert_eq!(observed.ids, ["resp_mislabeled_json"]);
     }
 
     #[test]
     fn response_observer_ignores_malformed_and_non_response_bodies() {
-        let mut malformed = response_observer_for_content_type(None);
-        assert!(malformed.observe(br#"{"id":"resp_broken""#).is_empty());
-        assert!(malformed.finish().is_empty());
+        let mut malformed = HttpResponseObserver::new(response_observer_for_content_type(None));
+        malformed.observe(br#"{"id":"resp_broken""#);
+        let observed = malformed.finish();
+        assert!(observed.ids.is_empty());
+        assert!(observed.quota.is_none());
 
         let generic = hyper::header::HeaderValue::from_static("text/plain");
-        let mut unrelated = response_observer_for_content_type(Some(&generic));
-        assert!(unrelated.observe(br#"{"ok":true,"items":[]}"#).is_empty());
-        assert!(unrelated.finish().is_empty());
+        let mut unrelated =
+            HttpResponseObserver::new(response_observer_for_content_type(Some(&generic)));
+        unrelated.observe(br#"{"ok":true,"items":[]}"#);
+        let observed = unrelated.finish();
+        assert!(observed.ids.is_empty());
+        assert!(observed.quota.is_none());
+    }
+
+    #[test]
+    fn http_observer_suppresses_affinity_for_quota_shaped_incomplete() {
+        // Task #2 (b): 200 + `response.incomplete` with quota phrasing in
+        // both `response.error.message` and `incomplete_details.reason`
+        // classifies Quota with no affinity bind.
+        for signal in [
+            serde_json::json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_quota",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "The usage limit has been reached"},
+                    "error": {"message": "The usage limit has been reached"}
+                }
+            }),
+            serde_json::json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_quota",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "usage_limit_reached"},
+                    "error": {"code": "usage_limit_reached"}
+                }
+            }),
+        ] {
+            let classification = classify_terminal_event(&signal);
+            assert_eq!(classification.kind, FailureKind::Quota);
+            assert!(!terminal_permits_affinity(&classification));
+        }
+
+        // Same envelope through the HTTP observer: IDs are dropped and quota
+        // is recorded for `quota_failure(headers)`.
+        let mut observer = HttpResponseObserver::new(response_observer_for_content_type(None));
+        let body = serde_json::json!({
+            "id": "resp_quota",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "The usage limit has been reached"},
+            "error": {"message": "The usage limit has been reached"}
+        });
+        observer.observe(&serde_json::to_vec(&body).unwrap());
+        let observed = observer.finish();
+        assert!(observed.ids.is_empty());
+        assert_eq!(
+            observed.quota.as_ref().map(|quota| &quota.kind),
+            Some(&FailureKind::Quota)
+        );
+
+        // SSE `type:error` on HTTP 200 with quota strings is a terminal
+        // quota failure (Task #2 (d)).
+        let mut decoder = SseDecoder::default();
+        let events = decoder
+            .push(
+                b"data: {\"type\":\"error\",\"status_code\":429,\"error\":{\"code\":\"\",\"type\":\"\",\"message\":\"\"}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(events[0].terminal, Some(sse::TerminalStatus::Failed));
+        let classification = classify_terminal_event(&events[0].value);
+        assert_eq!(classification.kind, FailureKind::Quota);
+
+        let mut decoder = SseDecoder::default();
+        let events = decoder
+            .push(
+                b"data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit exceeded\"}}\n\n",
+            )
+            .unwrap();
+        assert_eq!(events[0].terminal, Some(sse::TerminalStatus::Failed));
+        assert_eq!(
+            classify_terminal_event(&events[0].value).kind,
+            FailureKind::Quota
+        );
+    }
+
+    #[tokio::test]
+    async fn leased_content_length_quota_terminal_cools_down_without_second_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_app, _listener, router, _stats) = direct_test_app(dir.path());
+        let pool = PoolConfig {
+            members: vec!["a".into(), "b".into()],
+            preferred: None,
+        };
+        let selection = router
+            .select_exact(&pool, "a")
+            .await
+            .expect("select account a");
+        let payload = Bytes::from_static(br#"{"id":"resp_quota","status":"incomplete","incomplete_details":{"reason":"The usage limit has been reached"},"error":{"message":"The usage limit has been reached"}}"#);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let payload_clone = payload.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let body = payload_clone.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let b = body.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .header("retry-after", "2")
+                                    .body(Full::new(b))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let upstream_resp = client
+            .request(
+                Request::builder()
+                    .uri(format!("http://{addr}/v1/responses"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deferred = vec![router.affinity.key("thread:p1-quota")];
+        let leased = map_http_response_leased(
+            upstream_resp,
+            router.clone(),
+            &selection,
+            true,
+            deferred.clone(),
+        );
+        let mut body = leased.into_body();
+        // Mimic hyper h1 dispatch.rs: after a DATA frame, hyper checks
+        // `body.is_end_stream()` and, when true, calls `write_body_and_end`
+        // without polling again. A Content-Length terminal must therefore be
+        // finalized before that point.
+        let mut bytes = Vec::new();
+        loop {
+            let frame_opt = body.frame().await;
+            let Some(frame) = frame_opt else {
+                break;
+            };
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                bytes.extend_from_slice(&data);
+            }
+            if body.is_end_stream() {
+                break;
+            }
+        }
+        assert_eq!(bytes, payload.to_vec());
+        assert!(
+            router.select_exact(&pool, "a").await.is_none(),
+            "quota-terminal Content-Length body must cool down account a"
+        );
+        for key in &deferred {
+            assert!(
+                router.affinity.get(key).await.is_none(),
+                "quota terminal must not bind deferred affinity"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn leased_content_length_completed_binds_deferred_affinity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_app, _listener, router, _stats) = direct_test_app(dir.path());
+        let pool = PoolConfig {
+            members: vec!["a".into(), "b".into()],
+            preferred: None,
+        };
+        let selection = router
+            .select_exact(&pool, "a")
+            .await
+            .expect("select account a");
+        let payload =
+            Bytes::from_static(br#"{"id":"resp_ok","object":"response","status":"completed"}"#);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let payload_clone = payload.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let body = payload_clone.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let b = body.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(b))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let upstream_resp = client
+            .request(
+                Request::builder()
+                    .uri(format!("http://{addr}/v1/responses"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deferred_key = router.affinity.key("thread:p1-success");
+        let leased = map_http_response_leased(
+            upstream_resp,
+            router.clone(),
+            &selection,
+            true,
+            vec![deferred_key.clone()],
+        );
+        let mut body = leased.into_body();
+        let mut bytes = Vec::new();
+        loop {
+            let frame_opt = body.frame().await;
+            let Some(frame) = frame_opt else {
+                break;
+            };
+            let frame = frame.unwrap();
+            if let Ok(data) = frame.into_data() {
+                bytes.extend_from_slice(&data);
+            }
+            if body.is_end_stream() {
+                break;
+            }
+        }
+        assert_eq!(bytes, payload.to_vec());
+        // Full drain (hyper may still poll for None after is_end_stream when
+        // finalization held the terminal frame); must end cleanly.
+        while body.frame().await.is_some() {}
+        assert!(body.is_end_stream());
+        assert!(
+            router.select_exact(&pool, "a").await.is_some(),
+            "completed body must not cool down the account"
+        );
+        assert_eq!(
+            router
+                .affinity
+                .get(&deferred_key)
+                .await
+                .map(|binding| binding.account_id),
+            Some("a".to_owned()),
+            "completed body must bind deferred affinity"
+        );
+        let previous_key = router.affinity.key("previous-response:resp_ok");
+        assert_eq!(
+            router
+                .affinity
+                .get(&previous_key)
+                .await
+                .map(|binding| binding.account_id),
+            Some("a".to_owned()),
+            "completed body must bind previous-response id"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn leased_chunked_sse_multi_frame_still_finalizes_on_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_app, _listener, router, _stats) = direct_test_app(dir.path());
+        let pool = PoolConfig {
+            members: vec!["a".into(), "b".into()],
+            preferred: None,
+        };
+        let selection = router
+            .select_exact(&pool, "a")
+            .await
+            .expect("select account a");
+        let chunk1 = Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chunked\"}}\n\n",
+        );
+        let chunk2 = Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_chunked\",\"status\":\"completed\"}}\n\n",
+        );
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let (c1, c2) = (chunk1.clone(), chunk2.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let (c1, c2) = (c1.clone(), c2.clone());
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let (c1, c2) = (c1.clone(), c2.clone());
+                        async move {
+                            let stream = futures_util::stream::iter(vec![
+                                Ok::<_, std::io::Error>(Frame::data(c1)),
+                                Ok::<_, std::io::Error>(Frame::data(c2)),
+                            ]);
+                            let body = BodyExt::boxed(http_body_util::StreamBody::new(stream));
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream")
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let upstream_resp = client
+            .request(
+                Request::builder()
+                    .uri(format!("http://{addr}/v1/responses"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deferred_key = router.affinity.key("thread:p1-chunked");
+        let leased = map_http_response_leased(
+            upstream_resp,
+            router.clone(),
+            &selection,
+            true,
+            vec![deferred_key.clone()],
+        );
+        let mut body = leased.into_body();
+        // Chunked terminals arrive as `None` (inner never reports end after
+        // DATA), so hyper polls until `None`; collect everything.
+        let mut collected = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("chunked frame");
+            if let Ok(data) = frame.into_data() {
+                collected.extend_from_slice(&data);
+            }
+        }
+        assert!(collected.starts_with(&chunk1[..]));
+        assert!(collected.ends_with(&chunk2[..]));
+        // Chunked `Incoming` never reports `is_end_stream() == true`
+        // (`DecodedLength::CHUNKED != ZERO` even after `None`); end is the
+        // `None` itself, which must have driven affinity finalization.
+        assert!(body.frame().await.is_none());
+        assert!(
+            router.select_exact(&pool, "a").await.is_some(),
+            "chunked success must not cool down the account"
+        );
+        assert_eq!(
+            router
+                .affinity
+                .get(&deferred_key)
+                .await
+                .map(|binding| binding.account_id),
+            Some("a".to_owned()),
+            "chunked SSE terminal must bind deferred affinity via None path"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn leased_terminal_finalizes_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_app, _listener, router, _stats) = direct_test_app(dir.path());
+        let pool = PoolConfig {
+            members: vec!["a".into(), "b".into()],
+            preferred: None,
+        };
+        let selection = router
+            .select_exact(&pool, "a")
+            .await
+            .expect("select account a");
+        let payload = Bytes::from_static(br#"{"id":"resp_quota","status":"incomplete","incomplete_details":{"reason":"usage_limit_reached"},"error":{"code":"usage_limit_reached","message":"usage limit reached"}}"#);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let payload_clone = payload.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let body = payload_clone.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let b = body.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .header("retry-after", "2")
+                                    .body(Full::new(b))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let upstream_resp = client
+            .request(
+                Request::builder()
+                    .uri(format!("http://{addr}/v1/responses"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deferred_key = router.affinity.key("thread:p1-once");
+        let leased = map_http_response_leased(
+            upstream_resp,
+            router.clone(),
+            &selection,
+            true,
+            vec![deferred_key.clone()],
+        );
+        let mut body = leased.into_body();
+        // Drive through data-end, trailers (none expected), and repeated
+        // `None` polls: finalization across all three paths must run once.
+        let mut frames = 0usize;
+        while let Some(frame) = body.frame().await {
+            frames += 1;
+            let _ = frame.unwrap();
+            if frames > 4 {
+                panic!("terminal body must end promptly");
+            }
+        }
+        assert_eq!(
+            frames, 1,
+            "single-frame body must yield exactly one data frame"
+        );
+        assert!(body.is_end_stream());
+        // Repeated end polls stay ended without side effects.
+        assert!(body.frame().await.is_none());
+        assert!(body.frame().await.is_none());
+        assert!(body.is_end_stream());
+        assert!(
+            router.select_exact(&pool, "a").await.is_none(),
+            "quota cooldown must persist after repeated end polls (exactly-once finalize)"
+        );
+        assert!(
+            router.affinity.get(&deferred_key).await.is_none(),
+            "quota terminal must never bind affinity, even across repeated ends"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn normal_incomplete_and_soft_failures_never_report_quota() {
+        // Task #2 (c): normal `incomplete` (max_tokens) stays
+        // success/Incomplete with affinity intact.
+        let normal = serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_normal",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}
+            }
+        });
+        let classification = classify_terminal_event(&normal);
+        assert_ne!(classification.kind, FailureKind::Quota);
+        assert!(terminal_permits_affinity(&classification));
+
+        // Task #2 (e): 502/server_error stays soft, never quota.
+        let server_error = serde_json::json!({
+            "type": "response.failed",
+            "status": 502,
+            "response": {
+                "id": "resp_soft",
+                "status": "failed",
+                "error": {"code": "server_error", "message": "upstream unavailable"}
+            }
+        });
+        let classification = classify_terminal_event(&server_error);
+        assert_ne!(classification.kind, FailureKind::Quota);
+        assert!(terminal_permits_affinity(&classification));
+
+        // Bare `limit|usage|quota|overloaded` substrings never match.
+        for message in [
+            "limit reached",
+            "usage stats",
+            "quota info",
+            "overloaded",
+            "content_filter",
+            "length",
+        ] {
+            let event = serde_json::json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_bare",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": message}
+                }
+            });
+            assert_ne!(
+                classify_terminal_event(&event).kind,
+                FailureKind::Quota,
+                "bare substring must not match: {message}"
+            );
+        }
+
+        // Body numeric 200 never acts as a failure signal.
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "status": 200,
+            "status_code": 200,
+            "response": {"id": "resp_ok", "status": "completed"}
+        });
+        assert_ne!(classify_terminal_event(&completed).kind, FailureKind::Quota);
     }
 
     #[test]
@@ -5901,6 +6808,91 @@ mod tests {
             &Method::POST,
             "/anything-new",
         ));
+    }
+
+    #[test]
+    fn downstream_prefixes_normalize_to_one_stripped_path_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _, _, _) = direct_test_app(dir.path());
+        let authorized = |raw: &str| app.authorized_path(&raw.parse::<Uri>().unwrap());
+        // `/responses`, upgrade sideband paths, call creation, and the context surface
+        // resolve identically under both prefixes, so routing, affinity, quota, and
+        // retry handling cannot diverge across the cutover.
+        for stripped in [
+            "/responses",
+            "/responses?stream=true",
+            "/live/rtc_abcdefghijkl",
+            "/realtime?call_id=rtc_abcdefghijkl",
+            "/realtime/calls",
+            "/alpha/history/v2/list_items?cursor=opaque",
+            "/alpha/notes/v2/read_file",
+        ] {
+            assert_eq!(
+                authorized(&format!("/0123456789abcdef/v1{stripped}")).as_deref(),
+                Some(stripped),
+                "v1 prefix for {stripped}"
+            );
+            assert_eq!(
+                authorized(&format!("/0123456789abcdef/backend-api/codex{stripped}")).as_deref(),
+                Some(stripped),
+                "backend prefix for {stripped}"
+            );
+        }
+        // A doubled backend prefix collapses instead of forwarding a doubled upstream
+        // path that would miss both upstream and the path-keyed affinity matchers.
+        assert_eq!(
+            authorized("/0123456789abcdef/backend-api/codex/backend-api/codex/responses")
+                .as_deref(),
+            Some("/responses")
+        );
+        assert_eq!(
+            authorized("/0123456789abcdef/v1/backend-api/codex/responses").as_deref(),
+            Some("/responses")
+        );
+        // Secret-less, wrong-secret, and wrong-prefix requests stay rejected.
+        for rejected in [
+            "/responses",
+            "/v1/responses",
+            "/backend-api/codex/responses",
+            "/wrong-secret/v1/responses",
+            "/wrong-secret/backend-api/codex/responses",
+            "/0123456789abcdef/backend-api/responses",
+            "/0123456789abcdef/backend-api/codexevil/responses",
+            "/0123456789abcdef/v1evil/responses",
+            "/0123456789abcdef/v2/responses",
+        ] {
+            assert_eq!(authorized(rejected), None, "must reject {rejected}");
+        }
+        assert!(App::is_backend_shaped_downstream_path(
+            "/0123456789abcdef/backend-api/codex/responses"
+        ));
+        assert!(!App::is_backend_shaped_downstream_path(
+            "/0123456789abcdef/v1/responses"
+        ));
+    }
+
+    #[test]
+    fn websocket_beta_tokens_follow_the_stripped_responses_path() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("openai-beta", "responses=experimental".parse().unwrap());
+        normalize_websocket_beta(&mut headers, "/responses");
+        assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "openai-beta",
+            "foo, responses_websockets=2026-02-06".parse().unwrap(),
+        );
+        normalize_websocket_beta(&mut headers, "/realtime?call_id=rtc_abcdefghijkl");
+        assert_eq!(headers["openai-beta"], "foo");
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "openai-beta",
+            "responses_websockets=2026-02-06".parse().unwrap(),
+        );
+        normalize_websocket_beta(&mut headers, "/live/rtc_abcdefghijkl");
+        assert!(!headers.contains_key("openai-beta"));
     }
 
     #[test]
@@ -6651,6 +7643,205 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         assert_eq!(calls[3].authorization, "Bearer token-a");
 
         proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_alias_serves_responses_exactly_like_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let seen_task = seen.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let seen = seen_task.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .unwrap()
+                                .push(req.uri().path_and_query().unwrap().to_string());
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            drop(body);
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#,
+                                    )))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::HttpBridge,
+        )
+        .await;
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let payload = Bytes::from_static(br#"{"input":"fresh"}"#);
+        for downstream in [
+            "/0123456789abcdef/v1/responses?test=1",
+            "/0123456789abcdef/backend-api/codex/responses?test=1",
+            // A doubled backend prefix collapses instead of doubling upstream.
+            "/0123456789abcdef/backend-api/codex/backend-api/codex/responses?test=1",
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_addr}{downstream}"))
+                .header(AUTHORIZATION, "Bearer caller-token")
+                .body(Full::new(payload.clone()))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "for {downstream}");
+            response.into_body().collect().await.unwrap();
+        }
+        // Secret-less and wrong-prefix requests never reach upstream.
+        for rejected in [
+            "/0123456789abcdef/backend-api/responses",
+            "/wrong-secret/v1/responses",
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_addr}{rejected}"))
+                .header(AUTHORIZATION, "Bearer caller-token")
+                .body(Full::new(payload.clone()))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "for {rejected}");
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/backend-api/codex/responses?test=1".to_owned(); 3]
+        );
+
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn realtime_call_binding_accepts_every_location_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let location: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let location_task = location.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let location = location_task.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let location = location.clone();
+                        async move {
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            drop(body);
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::CREATED)
+                                    .header(LOCATION, location.lock().unwrap().clone())
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(b"{}")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (app, listener, _, _) = direct_test_app_with_upstream(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        );
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer caller-token".parse().unwrap());
+        // Call creation arrives on the stripped path under both downstream prefixes,
+        // so every Location shape the backend may return must bind the same call.
+        for (call_id, location_value) in [
+            (
+                "rtc_aaaaaaaaaaaaaaaa",
+                "/v1/realtime/calls/rtc_aaaaaaaaaaaaaaaa",
+            ),
+            (
+                "rtc_bbbbbbbbbbbbbbbb",
+                "/backend-api/codex/realtime/calls/rtc_bbbbbbbbbbbbbbbb",
+            ),
+            (
+                "rtc_cccccccccccccccc",
+                "/realtime/calls/rtc_cccccccccccccccc",
+            ),
+            (
+                "rtc_dddddddddddddddd",
+                "https://chatgpt.com/backend-api/codex/realtime/calls/rtc_dddddddddddddddd?token=private",
+            ),
+        ] {
+            *location.lock().unwrap() = location_value.to_owned();
+            let replay = ReplayBody::from_bytes(
+                Bytes::from_static(b"{}"),
+                app.config.proxy.max_request_bytes,
+                app.config.proxy.max_spool_bytes,
+                app.stats.clone(),
+            )
+            .unwrap();
+            let response = app
+                .handle_http_replay(
+                    headers.clone(),
+                    Method::POST,
+                    &listener,
+                    "/realtime/calls".to_owned(),
+                    replay,
+                    ServingLane::Http,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CREATED,
+                "for {location_value}"
+            );
+            assert!(matches!(
+                app.live_calls.account(call_id).await.as_deref(),
+                Some("a" | "b")
+            ));
+        }
+        // An unparseable Location still fails closed instead of leaving an unbound call.
+        *location.lock().unwrap() = "/elsewhere/rtc_eeeeeeeeeeeeeeee".to_owned();
+        let replay = ReplayBody::from_bytes(
+            Bytes::from_static(b"{}"),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            app.stats.clone(),
+        )
+        .unwrap();
+        let response = app
+            .handle_http_replay(
+                headers,
+                Method::POST,
+                &listener,
+                "/realtime/calls".to_owned(),
+                replay,
+                ServingLane::Http,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(app.live_calls.account("rtc_eeeeeeeeeeeeeeee").await, None);
+
         upstream_task.abort();
     }
 

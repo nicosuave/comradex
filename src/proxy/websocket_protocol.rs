@@ -442,7 +442,7 @@ impl ProtocolState {
         if let Some(id) = response_id.as_deref() {
             validate_identifier(id, self.limits.max_identifier_bytes, "response_id")?;
         }
-        let failure = classify_failure(event);
+        let failure = classify_terminal_event(event);
         let terminal = terminal_kind(event_type.as_deref());
 
         let mut turn_ids = if event_type.as_deref() == Some("response.created") {
@@ -899,10 +899,129 @@ pub fn fresh_replay_without_previous_response(
     Ok(fresh)
 }
 
+fn numeric_status_value(value: &Value) -> Option<u16> {
+    if let Some(number) = value.as_u64()
+        && let Ok(status) = u16::try_from(number)
+    {
+        return Some(status);
+    }
+    if let Some(number) = value.as_i64()
+        && let Ok(status) = u16::try_from(number)
+    {
+        return Some(status);
+    }
+    value
+        .as_str()
+        .filter(|text| !text.is_empty())
+        .and_then(|text| text.trim().parse::<u16>().ok())
+}
+
+fn envelope_numeric_status(
+    event: &Value,
+    error: Option<&serde_json::Map<String, Value>>,
+) -> Option<u16> {
+    for key in ["status", "status_code"] {
+        if let Some(status) = event.get(key).and_then(numeric_status_value) {
+            return Some(status);
+        }
+    }
+    if let Some(error) = error {
+        for key in ["status", "status_code"] {
+            if let Some(status) = error.get(key).and_then(numeric_status_value) {
+                return Some(status);
+            }
+        }
+    }
+    None
+}
+
+fn is_quota_code(code: &str) -> bool {
+    matches!(
+        code,
+        "rate_limit_exceeded"
+            | "usage_limit_reached"
+            | "insufficient_quota"
+            | "quota_exceeded"
+            | "usage_not_included"
+            | "overloaded_error"
+            | "server_is_overloaded"
+    )
+}
+
+fn is_quota_message(message: &str) -> bool {
+    message.contains("usage limit")
+        || message.contains("insufficient quota")
+        || message.contains("server is overloaded")
+}
+
+/// Narrow quota signals from `response.incomplete_details` and
+/// `response.error.message` for quota-shaped `incomplete`/`failed` terminals.
+/// Only exact codes and the existing narrow substrings count; bare
+/// `limit|usage|quota|overloaded` substrings never match.
+fn incomplete_quota_signal(event: &Value) -> (Option<String>, Option<String>) {
+    let event_type = event.get("type").and_then(Value::as_str);
+    if !matches!(
+        event_type,
+        Some("response.incomplete" | "response.failed" | "error")
+    ) {
+        return (None, None);
+    }
+    let response = match event.get("response") {
+        Some(response) => response,
+        None => return (None, None),
+    };
+    let mut matched_code: Option<String> = None;
+    let mut matched_message: Option<String> = None;
+    let mut check_text = |text: &str| {
+        let normalized = text.to_ascii_lowercase();
+        if matched_code.is_none() && is_quota_code(normalized.as_str()) {
+            matched_code = Some(bounded_owned(text, MAX_CLASSIFIED_CODE_BYTES));
+        }
+        if is_quota_message(normalized.as_str()) {
+            matched_message
+                .get_or_insert_with(|| bounded_owned(text, MAX_CLASSIFIED_MESSAGE_BYTES));
+        }
+    };
+    if let Some(details) = response.get("incomplete_details") {
+        for key in ["reason", "details"] {
+            if let Some(text) = details.get(key).and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                check_text(text);
+            }
+        }
+        // Some upstreams put the reason directly as a string.
+        if let Some(text) = details.as_str()
+            && !text.is_empty()
+        {
+            check_text(text);
+        }
+    }
+    // `response.error.message` may differ from the primary `event.error`
+    // object when the envelope carries both.
+    if let Some(text) = response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        check_text(text);
+    }
+    if let Some(text) = response
+        .get("error")
+        .and_then(|error| error.get("code").or_else(|| error.get("type")))
+        .and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        check_text(text);
+    }
+    (matched_code, matched_message)
+}
+
 pub fn classify_failure(event: &Value) -> FailureClassification {
     let response_id =
         response_id(event).map(|value| bounded_owned(value, DEFAULT_MAX_IDENTIFIER_BYTES));
-    let Some(error) = event
+    let error = event
         .get("error")
         .or_else(|| {
             event
@@ -914,13 +1033,10 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
             (event.get("type").and_then(Value::as_str) == Some("error"))
                 .then(|| event.as_object())
                 .flatten()
-        })
-    else {
-        return FailureClassification::none();
-    };
+        });
     let nonempty_string = |key| {
         error
-            .get(key)
+            .and_then(|error| error.get(key))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
     };
@@ -932,12 +1048,12 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
         .map(|value| bounded_owned(value, MAX_CLASSIFIED_CODE_BYTES).to_ascii_lowercase())
         .unwrap_or_default();
     let param = error
-        .get("param")
+        .and_then(|error| error.get("param"))
         .and_then(Value::as_str)
         .map(|value| bounded_owned(value, MAX_CLASSIFIED_CODE_BYTES).to_ascii_lowercase())
         .unwrap_or_default();
     let message = error
-        .get("message")
+        .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(|value| bounded_owned(value, MAX_CLASSIFIED_MESSAGE_BYTES));
@@ -957,19 +1073,7 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
                 stale_message,
                 "invalid `previous_response_id`" | "invalid previous_response_id"
             ));
-    let quota = [
-        "rate_limit_exceeded",
-        "usage_limit_reached",
-        "insufficient_quota",
-        "usage_not_included",
-        "quota_exceeded",
-        "overloaded_error",
-        "server_is_overloaded",
-    ]
-    .contains(&normalized_code)
-        || normalized_message.contains("usage limit")
-        || normalized_message.contains("insufficient quota")
-        || normalized_message.contains("server is overloaded");
+    let mut quota = is_quota_code(normalized_code) || is_quota_message(normalized_message.as_str());
     let authentication = [
         "invalid_api_key",
         "authentication_error",
@@ -998,6 +1102,41 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
     ]
     .contains(&normalized_code);
 
+    // Quota-shaped `incomplete`/`failed` terminals carry the signal in
+    // `response.incomplete_details` or `response.error.message` rather than
+    // the primary error object.
+    let (incomplete_code, incomplete_message) = incomplete_quota_signal(event);
+    if incomplete_code.is_some() || incomplete_message.is_some() {
+        quota = true;
+    }
+
+    // Numeric fallback: envelope or nested error `status`/`status_code` as
+    // numbers or numeric strings. Only 429/402 act as failure signals; a body
+    // numeric 200 never overrides transport status. 402 counts as quota only
+    // alongside a quota-shaped string signal to avoid billing confusion.
+    // 401/403 stay authentication.
+    let numeric = envelope_numeric_status(event, error);
+    let numeric_quota = match numeric {
+        Some(429) => true,
+        Some(402) => quota || incomplete_code.is_some() || incomplete_message.is_some(),
+        _ => false,
+    };
+    if numeric_quota {
+        quota = true;
+    }
+    let numeric_auth = matches!(numeric, Some(401 | 403));
+    let authentication = authentication || numeric_auth;
+
+    // Without any error object, numeric signal, or narrow incomplete signal
+    // there is nothing to classify.
+    if error.is_none()
+        && numeric.is_none()
+        && incomplete_code.is_none()
+        && incomplete_message.is_none()
+    {
+        return FailureClassification::none();
+    }
+
     let kind = if previous_response_not_found {
         FailureKind::PreviousResponseNotFound
     } else if authentication {
@@ -1011,6 +1150,11 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
     } else {
         FailureKind::Other
     };
+    // Prefer the primary error code/message; fall back to the narrow
+    // incomplete signal so quota terminals without an error object still
+    // carry evidence.
+    let code = code.or_else(|| incomplete_code.map(|value| value.to_ascii_lowercase()));
+    let message = message.or(incomplete_message);
     FailureClassification {
         kind,
         code,
@@ -1026,6 +1170,90 @@ pub fn response_id(event: &Value) -> Option<&str> {
         .or_else(|| event.get("response_id"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+/// Canonical terminal classification shared by Direct, Bridge, and HTTP
+/// lanes. Only terminal event types (`response.failed`,
+/// `response.incomplete`, `error`) can yield a quota failure; a quota-shaped
+/// signal on any other terminal (completed/cancelled/non-terminal) is
+/// downgraded to `Other` so normal `incomplete` (max_tokens/length/
+/// content_filter) and success affinity stay intact.
+pub fn classify_terminal_event(event: &Value) -> FailureClassification {
+    let terminal = terminal_kind(event.get("type").and_then(Value::as_str));
+    let classification = classify_failure(event);
+    match classification.kind {
+        FailureKind::Quota => match terminal {
+            Some(TerminalKind::Failed) | Some(TerminalKind::Incomplete) => classification,
+            _ => FailureClassification {
+                kind: FailureKind::Other,
+                code: classification.code,
+                message: classification.message,
+                response_id: classification.response_id,
+            },
+        },
+        _ => classification,
+    }
+}
+
+/// Whether a terminal classification permits success-affinity binding and
+/// continuation caching. Quota terminals must never bind previous-response
+/// IDs nor cache continuations.
+pub fn terminal_permits_affinity(classification: &FailureClassification) -> bool {
+    !matches!(classification.kind, FailureKind::Quota)
+}
+
+/// Classifies a non-streaming Responses JSON body (`value.response ?? value`).
+/// Event-shaped bodies classify directly; response-shaped bodies synthesize
+/// the terminal implied by `response.status` before classification so
+/// `incomplete_details`/`error` signals are evaluated in terminal context.
+/// A body numeric 200 never counts as success here; only the terminal
+/// classification matters to the caller.
+pub fn classify_http_json_body(value: &Value) -> FailureClassification {
+    if value.get("type").and_then(Value::as_str).is_some() {
+        return classify_terminal_event(value);
+    }
+    let response = value.get("response").unwrap_or(value);
+    let status = response
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let terminal_type = match status.as_str() {
+        "failed" => "response.failed",
+        "incomplete" => "response.incomplete",
+        "completed" => "response.completed",
+        "cancelled" => "response.cancelled",
+        _ => {
+            // No explicit terminal status. If the body carries an error
+            // object with quota/auth signals, evaluate it as a failure
+            // terminal; otherwise there is nothing to classify.
+            if response.get("error").is_some_and(|error| error.is_object())
+                || value.get("error").is_some_and(|error| error.is_object())
+            {
+                let synthetic = serde_json::json!({
+                    "type": "error",
+                    "status": value.get("status").cloned()
+                        .or_else(|| value.get("status_code").cloned())
+                        .unwrap_or(serde_json::Value::Null),
+                    "status_code": value.get("status_code").cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "error": value.get("error").cloned()
+                        .or_else(|| response.get("error").cloned())
+                        .unwrap_or(serde_json::Value::Null),
+                    "response": response.clone(),
+                });
+                return classify_terminal_event(&synthetic);
+            }
+            return FailureClassification::none();
+        }
+    };
+    let synthetic = serde_json::json!({
+        "type": terminal_type,
+        "status": value.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "status_code": value.get("status_code").cloned().unwrap_or(serde_json::Value::Null),
+        "response": response.clone(),
+    });
+    classify_terminal_event(&synthetic)
 }
 
 pub fn finite_sequence_number(event: &Value) -> Option<SequenceNumber> {
@@ -1823,6 +2051,140 @@ mod tests {
                 FailureKind::Other
             );
         }
+    }
+
+    #[test]
+    fn numeric_only_error_with_empty_strings_is_quota() {
+        // Task #2 (a): `{"type":"error","status_code":429}` with empty string
+        // fields must classify Quota via the numeric fallback.
+        for event in [
+            json!({"type":"error","status_code":429,"error":{"code":"","type":"","message":""}}),
+            json!({"type":"error","status_code":429}),
+            json!({"type":"error","status":429,"error":{"code":"","type":"","message":""}}),
+            json!({"type":"error","error":{"code":"","type":"","message":"","status_code":429}}),
+            json!({"type":"error","status_code":"429","error":{"code":"","message":""}}),
+        ] {
+            assert_eq!(classify_failure(&event).kind, FailureKind::Quota);
+            assert_eq!(classify_terminal_event(&event).kind, FailureKind::Quota);
+        }
+        // 402 needs quota-shaped string context to avoid billing confusion.
+        assert_eq!(
+            classify_failure(&json!({"type":"error","status_code":402})).kind,
+            FailureKind::Other
+        );
+        assert_eq!(
+            classify_failure(&json!({
+                "type":"error","status_code":402,
+                "error":{"code":"usage_limit_reached"}
+            }))
+            .kind,
+            FailureKind::Quota
+        );
+        // 401/403 stay authentication; 200 and 5xx never become quota.
+        assert!(matches!(
+            classify_failure(&json!({"type":"error","status_code":401})).kind,
+            FailureKind::Authentication { .. }
+        ));
+        assert!(matches!(
+            classify_failure(&json!({"type":"error","status_code":403})).kind,
+            FailureKind::Authentication { .. }
+        ));
+        assert_ne!(
+            classify_failure(&json!({"type":"error","status_code":200})).kind,
+            FailureKind::Quota
+        );
+        assert_ne!(
+            classify_failure(&json!({"type":"error","status_code":502})).kind,
+            FailureKind::Quota
+        );
+    }
+
+    #[test]
+    fn quota_shaped_incomplete_requires_narrow_signal_and_terminal() {
+        // Task #2 (b): quota phrasing in `response.error.message` and in
+        // `incomplete_details.reason` classifies Quota with no affinity bind.
+        for event in [
+            json!({
+                "type":"response.incomplete",
+                "response":{
+                    "id":"resp_q","status":"incomplete",
+                    "error":{"message":"The usage limit has been reached"}
+                }
+            }),
+            json!({
+                "type":"response.incomplete",
+                "response":{
+                    "id":"resp_q","status":"incomplete",
+                    "incomplete_details":{"reason":"The usage limit has been reached"}
+                }
+            }),
+            json!({
+                "type":"response.failed",
+                "response":{
+                    "id":"resp_q","status":"failed",
+                    "incomplete_details":{"reason":"usage_limit_reached"}
+                }
+            }),
+        ] {
+            let classification = classify_terminal_event(&event);
+            assert_eq!(classification.kind, FailureKind::Quota);
+            assert!(!terminal_permits_affinity(&classification));
+        }
+        // Task #2 (c): normal `incomplete` stays non-quota with affinity.
+        for reason in [
+            "max_output_tokens",
+            "max_tokens",
+            "length",
+            "content_filter",
+        ] {
+            let event = json!({
+                "type":"response.incomplete",
+                "response":{
+                    "id":"resp_n","status":"incomplete",
+                    "incomplete_details":{"reason":reason}
+                }
+            });
+            let classification = classify_terminal_event(&event);
+            assert_ne!(classification.kind, FailureKind::Quota);
+            assert!(terminal_permits_affinity(&classification));
+        }
+        // Quota signal on a non-terminal (completed) downgrades to Other.
+        let completed = json!({
+            "type":"response.completed",
+            "response":{
+                "id":"resp_c","status":"completed",
+                "error":{"code":"rate_limit_exceeded"}
+            }
+        });
+        assert_ne!(classify_terminal_event(&completed).kind, FailureKind::Quota);
+        // Task #2 (e): 502/server_error stays soft, never quota.
+        let soft = json!({
+            "type":"response.failed",
+            "status":502,
+            "response":{
+                "id":"resp_s","status":"failed",
+                "error":{"code":"server_error","message":"bad gateway"}
+            }
+        });
+        let classification = classify_terminal_event(&soft);
+        assert_ne!(classification.kind, FailureKind::Quota);
+        assert!(terminal_permits_affinity(&classification));
+        // Non-streaming JSON (`value.response ?? value`) with quota-shaped
+        // incomplete classifies Quota.
+        let body = json!({
+            "id":"resp_q","status":"incomplete",
+            "incomplete_details":{"reason":"insufficient_quota"},
+            "error":{"message":"insufficient quota"}
+        });
+        assert_eq!(classify_http_json_body(&body).kind, FailureKind::Quota);
+        let normal_body = json!({
+            "id":"resp_n","status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"}
+        });
+        assert_ne!(
+            classify_http_json_body(&normal_body).kind,
+            FailureKind::Quota
+        );
     }
 
     #[test]
