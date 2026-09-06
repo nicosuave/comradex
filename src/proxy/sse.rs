@@ -25,6 +25,10 @@ impl TerminalStatus {
             "response.completed" => Some(Self::Completed),
             "response.failed" => Some(Self::Failed),
             "response.incomplete" => Some(Self::Incomplete),
+            // Align with the Direct WS `terminal_kind` mapping (`error ->
+            // Failed`) so `HTTP 200 + SSE type:error` is a terminal failure
+            // rather than a forwarded non-terminal followed by PrematureEof.
+            "error" => Some(Self::Failed),
             _ => None,
         }
     }
@@ -577,6 +581,26 @@ mod tests {
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
             ["response.created", "response.completed"]
+        );
+    }
+
+    #[test]
+    fn type_error_is_terminal_failed_for_http_200_quota() {
+        // Task #2 (d): `SSE type:error` on HTTP 200 is a terminal failure
+        // (aligned with the WS `error -> Failed` mapping), so a quota-shaped
+        // error does not fall through to PrematureEof/generic close.
+        let mut decoder = SseDecoder::default();
+        let events = decoder
+            .push(b"data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Rate limit exceeded\"}}\n\n")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "error");
+        assert_eq!(events[0].terminal, Some(TerminalStatus::Failed));
+        assert!(decoder.is_terminal());
+        assert_eq!(
+            decoder.finish().unwrap().len(),
+            0,
+            "trailing input after a terminal error is discarded"
         );
     }
 }
