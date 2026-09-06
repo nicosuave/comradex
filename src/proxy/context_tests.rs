@@ -914,6 +914,47 @@ async fn backend_alias_requires_exact_install_secret_and_path_segment() {
 }
 
 #[tokio::test]
+async fn backend_alias_collapses_a_doubled_prefix_before_routing() {
+    let upstream = start_upstream(Arc::new(|_| (StatusCode::OK, json!({"ok": true})))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let test = context_test_app(dir.path(), upstream.address);
+
+    // The context surface is reachable under both prefixes, and a doubled backend
+    // prefix collapses to the same stripped path the affinity matchers expect.
+    for (raw, stripped) in [
+        (
+            format!("/{SECRET}/backend-api/codex/backend-api/codex/responses"),
+            "/responses",
+        ),
+        (
+            format!("/{SECRET}/backend-api/codex/alpha/notes/v2/read_file"),
+            "/alpha/notes/v2/read_file",
+        ),
+        (
+            format!("/{SECRET}/v1/alpha/history/v2/list_items"),
+            "/alpha/history/v2/list_items",
+        ),
+        (
+            format!("/{SECRET}/backend-api/codex/live/rtc_abcdefghijkl"),
+            "/live/rtc_abcdefghijkl",
+        ),
+    ] {
+        assert_eq!(
+            test.app.authorized_path(&raw.parse().unwrap()).as_deref(),
+            Some(stripped)
+        );
+    }
+    // The collapsed path forwards to the single upstream route, never doubled.
+    assert_eq!(
+        test.app
+            .upstream_uri("/responses", false)
+            .unwrap()
+            .to_string(),
+        format!("http://{}/backend-api/codex/responses", upstream.address)
+    );
+}
+
+#[tokio::test]
 async fn context_401_retries_refreshed_credentials_on_the_same_physical_owner() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("a");

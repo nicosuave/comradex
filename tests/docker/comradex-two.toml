@@ -11,6 +11,13 @@ affinity_key = "docker-two-account-affinity-key-32-bytes"
 address = "0.0.0.0:10100"
 pool = "default"
 
+# Downstream client URL shapes served behind the installation secret (see README
+# "Connecting Codex"). Both stay working; no daemon change is needed to cut over.
+#   Codex 0.153+ with context_management experimental_mode:
+#     openai_base_url = "http://0.0.0.0:10100/docker-two-account-secret/backend-api/codex"
+#   Older clients:
+#     openai_base_url = "http://0.0.0.0:10100/docker-two-account-secret/v1"
+
 [listeners.reverse]
 address = "0.0.0.0:10101"
 pool = "reverse"

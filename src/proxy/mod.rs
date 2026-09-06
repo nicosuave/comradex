@@ -974,6 +974,18 @@ impl App {
         if !suffix.is_empty() && !suffix.starts_with('/') {
             return None;
         }
+        // A backend-shaped base URL combined with a backend-shaped request path would
+        // otherwise forward to `<upstream>/backend-api/codex/backend-api/codex/...`,
+        // missing both upstream and the path-keyed affinity matchers. No legitimate
+        // upstream route nests the base path, so collapse the redundant prefix and
+        // route the request exactly as if the client had sent it once.
+        let mut suffix = suffix;
+        while let Some(redundant) = suffix
+            .strip_prefix("/backend-api/codex")
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        {
+            suffix = redundant;
+        }
         let mut path = if suffix.is_empty() {
             "/".to_owned()
         } else {
@@ -984,6 +996,14 @@ impl App {
             path.push_str(query);
         }
         Some(path)
+    }
+
+    /// Whether the raw downstream path arrived under the backend alias
+    /// (`/<secret>/backend-api/codex/...`) rather than the legacy `/<secret>/v1/...`
+    /// prefix. The installation secret is base64url and cannot contain `/`, so the
+    /// alias segment is unambiguous in the raw path.
+    fn is_backend_shaped_downstream_path(raw_path: &str) -> bool {
+        raw_path.contains("/backend-api/codex/")
     }
 
     async fn handle_http(
@@ -3533,7 +3553,7 @@ impl App {
                     && is_native_responses(&path)
                     && (self.config.proxy.responses_websocket_mode
                         == ResponsesWebsocketMode::Direct
-                        || req.uri().path().contains("/backend-api/codex/"));
+                        || Self::is_backend_shaped_downstream_path(req.uri().path()));
                 stats.open_upgrades.fetch_add(1, Ordering::Relaxed);
                 let upgrade_guard = OpenUpgradeGuard(stats.clone());
                 let spawned = self
@@ -6791,6 +6811,91 @@ mod tests {
     }
 
     #[test]
+    fn downstream_prefixes_normalize_to_one_stripped_path_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, _, _, _) = direct_test_app(dir.path());
+        let authorized = |raw: &str| app.authorized_path(&raw.parse::<Uri>().unwrap());
+        // `/responses`, upgrade sideband paths, call creation, and the context surface
+        // resolve identically under both prefixes, so routing, affinity, quota, and
+        // retry handling cannot diverge across the cutover.
+        for stripped in [
+            "/responses",
+            "/responses?stream=true",
+            "/live/rtc_abcdefghijkl",
+            "/realtime?call_id=rtc_abcdefghijkl",
+            "/realtime/calls",
+            "/alpha/history/v2/list_items?cursor=opaque",
+            "/alpha/notes/v2/read_file",
+        ] {
+            assert_eq!(
+                authorized(&format!("/0123456789abcdef/v1{stripped}")).as_deref(),
+                Some(stripped),
+                "v1 prefix for {stripped}"
+            );
+            assert_eq!(
+                authorized(&format!("/0123456789abcdef/backend-api/codex{stripped}")).as_deref(),
+                Some(stripped),
+                "backend prefix for {stripped}"
+            );
+        }
+        // A doubled backend prefix collapses instead of forwarding a doubled upstream
+        // path that would miss both upstream and the path-keyed affinity matchers.
+        assert_eq!(
+            authorized("/0123456789abcdef/backend-api/codex/backend-api/codex/responses")
+                .as_deref(),
+            Some("/responses")
+        );
+        assert_eq!(
+            authorized("/0123456789abcdef/v1/backend-api/codex/responses").as_deref(),
+            Some("/responses")
+        );
+        // Secret-less, wrong-secret, and wrong-prefix requests stay rejected.
+        for rejected in [
+            "/responses",
+            "/v1/responses",
+            "/backend-api/codex/responses",
+            "/wrong-secret/v1/responses",
+            "/wrong-secret/backend-api/codex/responses",
+            "/0123456789abcdef/backend-api/responses",
+            "/0123456789abcdef/backend-api/codexevil/responses",
+            "/0123456789abcdef/v1evil/responses",
+            "/0123456789abcdef/v2/responses",
+        ] {
+            assert_eq!(authorized(rejected), None, "must reject {rejected}");
+        }
+        assert!(App::is_backend_shaped_downstream_path(
+            "/0123456789abcdef/backend-api/codex/responses"
+        ));
+        assert!(!App::is_backend_shaped_downstream_path(
+            "/0123456789abcdef/v1/responses"
+        ));
+    }
+
+    #[test]
+    fn websocket_beta_tokens_follow_the_stripped_responses_path() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("openai-beta", "responses=experimental".parse().unwrap());
+        normalize_websocket_beta(&mut headers, "/responses");
+        assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "openai-beta",
+            "foo, responses_websockets=2026-02-06".parse().unwrap(),
+        );
+        normalize_websocket_beta(&mut headers, "/realtime?call_id=rtc_abcdefghijkl");
+        assert_eq!(headers["openai-beta"], "foo");
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "openai-beta",
+            "responses_websockets=2026-02-06".parse().unwrap(),
+        );
+        normalize_websocket_beta(&mut headers, "/live/rtc_abcdefghijkl");
+        assert!(!headers.contains_key("openai-beta"));
+    }
+
+    #[test]
     fn only_shared_reachability_errors_are_account_neutral() {
         for kind in [
             std::io::ErrorKind::NetworkUnreachable,
@@ -7538,6 +7643,205 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
         assert_eq!(calls[3].authorization, "Bearer token-a");
 
         proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_alias_serves_responses_exactly_like_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let seen_task = seen.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let seen = seen_task.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock()
+                                .unwrap()
+                                .push(req.uri().path_and_query().unwrap().to_string());
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            drop(body);
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#,
+                                    )))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (proxy_addr, proxy_task) = start_caller_proxy(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+            ResponsesWebsocketMode::HttpBridge,
+        )
+        .await;
+        let client: TestClient<HttpConnector, Full<Bytes>> =
+            TestClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let payload = Bytes::from_static(br#"{"input":"fresh"}"#);
+        for downstream in [
+            "/0123456789abcdef/v1/responses?test=1",
+            "/0123456789abcdef/backend-api/codex/responses?test=1",
+            // A doubled backend prefix collapses instead of doubling upstream.
+            "/0123456789abcdef/backend-api/codex/backend-api/codex/responses?test=1",
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_addr}{downstream}"))
+                .header(AUTHORIZATION, "Bearer caller-token")
+                .body(Full::new(payload.clone()))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "for {downstream}");
+            response.into_body().collect().await.unwrap();
+        }
+        // Secret-less and wrong-prefix requests never reach upstream.
+        for rejected in [
+            "/0123456789abcdef/backend-api/responses",
+            "/wrong-secret/v1/responses",
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_addr}{rejected}"))
+                .header(AUTHORIZATION, "Bearer caller-token")
+                .body(Full::new(payload.clone()))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "for {rejected}");
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["/backend-api/codex/responses?test=1".to_owned(); 3]
+        );
+
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn realtime_call_binding_accepts_every_location_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let location: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let location_task = location.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let location = location_task.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let location = location.clone();
+                        async move {
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            drop(body);
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::CREATED)
+                                    .header(LOCATION, location.lock().unwrap().clone())
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(b"{}")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let (app, listener, _, _) = direct_test_app_with_upstream(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        );
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer caller-token".parse().unwrap());
+        // Call creation arrives on the stripped path under both downstream prefixes,
+        // so every Location shape the backend may return must bind the same call.
+        for (call_id, location_value) in [
+            (
+                "rtc_aaaaaaaaaaaaaaaa",
+                "/v1/realtime/calls/rtc_aaaaaaaaaaaaaaaa",
+            ),
+            (
+                "rtc_bbbbbbbbbbbbbbbb",
+                "/backend-api/codex/realtime/calls/rtc_bbbbbbbbbbbbbbbb",
+            ),
+            (
+                "rtc_cccccccccccccccc",
+                "/realtime/calls/rtc_cccccccccccccccc",
+            ),
+            (
+                "rtc_dddddddddddddddd",
+                "https://chatgpt.com/backend-api/codex/realtime/calls/rtc_dddddddddddddddd?token=private",
+            ),
+        ] {
+            *location.lock().unwrap() = location_value.to_owned();
+            let replay = ReplayBody::from_bytes(
+                Bytes::from_static(b"{}"),
+                app.config.proxy.max_request_bytes,
+                app.config.proxy.max_spool_bytes,
+                app.stats.clone(),
+            )
+            .unwrap();
+            let response = app
+                .handle_http_replay(
+                    headers.clone(),
+                    Method::POST,
+                    &listener,
+                    "/realtime/calls".to_owned(),
+                    replay,
+                    ServingLane::Http,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CREATED,
+                "for {location_value}"
+            );
+            assert!(matches!(
+                app.live_calls.account(call_id).await.as_deref(),
+                Some("a" | "b")
+            ));
+        }
+        // An unparseable Location still fails closed instead of leaving an unbound call.
+        *location.lock().unwrap() = "/elsewhere/rtc_eeeeeeeeeeeeeeee".to_owned();
+        let replay = ReplayBody::from_bytes(
+            Bytes::from_static(b"{}"),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            app.stats.clone(),
+        )
+        .unwrap();
+        let response = app
+            .handle_http_replay(
+                headers,
+                Method::POST,
+                &listener,
+                "/realtime/calls".to_owned(),
+                replay,
+                ServingLane::Http,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(app.live_calls.account("rtc_eeeeeeeeeeeeeeee").await, None);
+
         upstream_task.abort();
     }
 

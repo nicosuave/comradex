@@ -137,7 +137,23 @@ openai_base_url = "http://127.0.0.1:10100/<installation_secret>/v1"
 
 The address belongs to the selected listener; `--listener` chooses the listener and therefore the account pool that serves the traffic. `<installation_secret>` is the random per-installation token written to `comradex.toml` by `init`.
 
-Codex treats the value as an ordinary base URL, so every request arrives with the secret as a path prefix. Comradex rejects requests without `/<installation_secret>/v1`, strips the prefix from accepted requests, selects an account from the listener's pool, substitutes that account's credentials, and forwards the path, query, and body unchanged to `proxy.upstream`. To keep bearer tokens and ChatGPT account metadata pinned to their intended destination, loaded configurations require this upstream to be exactly `https://chatgpt.com/backend-api/codex`; custom hosts, cleartext HTTP, and URL variants are rejected. The listener binds to loopback, but the secret also prevents other local software from discovering an open relay to your accounts.
+Use the `/v1` URL for older Codex clients, and this URL for Codex 0.153+ with
+`[features.context_management] experimental_mode = true`:
+
+```toml
+openai_base_url = "http://127.0.0.1:10100/<installation_secret>/backend-api/codex"
+```
+
+The client only offers its `new_context` tool when its configured base URL has the
+Codex-backend shape, so a `/v1` URL silently suppresses context management before any
+request reaches Comradex. `comradex install` chooses for you: it rewrites the value in
+place, writing the backend shape when your Codex `config.toml` already enables
+`experimental_mode` and `/v1` otherwise, and it prints both URLs on every run. There is
+no install flag for this. Switch shapes later by toggling the feature and reinstalling,
+or by editing `openai_base_url` by hand. Both shapes stay served behind the same secret,
+so old and new clients can share one daemon during the cutover.
+
+Codex treats the value as an ordinary base URL, so every request arrives with the secret as a path prefix. Comradex rejects requests without `/<installation_secret>/v1` or `/<installation_secret>/backend-api/codex`, strips the accepted prefix from accepted requests (a redundantly doubled `backend-api/codex` segment collapses to one), selects an account from the listener's pool, substitutes that account's credentials, and forwards the path, query, and body unchanged to `proxy.upstream`. Routing affinity is keyed to the conversation (thread, response, and file identifiers), not to the URL shape, so a conversation keeps its account across the cutover; conflicting continuity keys still fail closed instead of crossing accounts. To keep bearer tokens and ChatGPT account metadata pinned to their intended destination, loaded configurations require this upstream to be exactly `https://chatgpt.com/backend-api/codex`; custom hosts, cleartext HTTP, and URL variants are rejected. The listener binds to loopback, but the secret also prevents other local software from discovering an open relay to your accounts.
 
 Reinstalling updates the Comradex URL without losing the original pre-Comradex value. That value is kept in `state/install.json`; `comradex uninstall` restores it, but refuses if somebody changed the Codex configuration after installation.
 
@@ -178,6 +194,7 @@ The service manages only `com.nicosuave.comradex`; it does not inspect, stop, or
 Codex 0.153.4's native context management is opt-in. If your Codex configuration already contains
 `[features.context_management]` with `experimental_mode = true`, `comradex install` uses
 `/<installation_secret>/backend-api/codex` instead of `/v1`. Comradex does not enable the feature.
+See [Connecting Codex](#connecting-codex) for the URL-shape choice and how to switch later.
 Both authenticated URL forms remain supported. Start a new task after enabling it so Comradex can
 track its history from the first inference request.
 
@@ -242,7 +259,7 @@ HTTP bridge sessions have their own `proxy.max_bridge_sessions` limit (256 by de
 
 ### Live Voice
 
-Private Codex Live Voice call creation is account-bound. The daemon accepts only the exact successful `/v1/realtime/calls/{id}` `Location` form, stores only an immutable keyed digest in a bounded two-hour atomic snapshot, rejects ambiguous query forms, and pins every supported sideband WebSocket form to that exact healthy account across daemon restarts.
+Private Codex Live Voice call creation is account-bound. The daemon accepts only the exact successful `Location` forms `/v1/realtime/calls/{id}`, `/backend-api/codex/realtime/calls/{id}`, and `/realtime/calls/{id}` (relative or absolute URLs), stores only an immutable keyed digest in a bounded two-hour atomic snapshot, rejects ambiguous query forms, and pins every supported sideband WebSocket form to that exact healthy account across daemon restarts. Sideband WebSockets (`/responses`, `/live/*`, `/realtime`) are served under both the `/v1` and `/backend-api/codex` downstream prefixes with identical binding.
 
 Missing, malformed, stale, conflicting, or unavailable bindings fail closed. Sideband frames and call SDP are never logged or retained.
 

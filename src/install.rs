@@ -14,9 +14,44 @@ pub struct InstallRecord {
     pub previous_url: Option<String>,
 }
 
-/// The Codex configuration Comradex is currently installed into, if any.
+/// The install record belongs to a Codex configuration, if any.
 pub fn installed_record(record_path: &Path) -> Option<InstallRecord> {
     read_install_record(record_path).ok().flatten()
+}
+
+/// The other downstream URL shape for the same listener: Comradex serves both
+/// `.../<secret>/v1` (older clients) and `.../<secret>/backend-api/codex`
+/// (recommended for Codex 0.153+ with `context_management.experimental_mode`),
+/// so either value can be swapped in by hand without reinstalling.
+pub fn alternate_url(installed_url: &str) -> Option<String> {
+    if let Some(base) = installed_url.strip_suffix("/backend-api/codex") {
+        Some(format!("{base}/v1"))
+    } else {
+        installed_url
+            .strip_suffix("/v1")
+            .map(|base| format!("{base}/backend-api/codex"))
+    }
+}
+
+/// The `http://<listener>/<secret>` prefix shared by both downstream shapes;
+/// `None` when the URL is not a Comradex shape we own.
+fn owned_base(url: &str) -> Option<&str> {
+    url.strip_suffix("/backend-api/codex")
+        .or_else(|| url.strip_suffix("/v1"))
+}
+
+/// Whether `current` is the recorded Comradex URL or its hand-switched
+/// alternate shape (`.../<secret>/v1` <-> `.../<secret>/backend-api/codex`,
+/// same listener + secret). Anything else (different host/port/secret or a
+/// user-customized URL) is foreign and must still refuse.
+fn is_owned_url(current: &str, recorded: &str) -> bool {
+    if current == recorded {
+        return true;
+    }
+    match (owned_base(current), owned_base(recorded)) {
+        (Some(current_base), Some(recorded_base)) => current_base == recorded_base,
+        _ => false,
+    }
 }
 
 pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<String> {
@@ -50,7 +85,11 @@ pub fn install(codex_config: &Path, record_path: &Path, url: &str) -> Result<Str
                     destination.display()
                 )
             }
-            if current_url.as_deref() != Some(existing.installed_url.as_str()) {
+            let owned = match current_url.as_deref() {
+                Some(current) => is_owned_url(current, &existing.installed_url),
+                None => false,
+            };
+            if !owned {
                 bail!(
                     "openai_base_url changed since the previous Comradex install; refusing to replace its recovery record"
                 )
@@ -110,7 +149,11 @@ pub fn uninstall(record_path: &Path) -> Result<()> {
         fs::remove_file(record_path)?;
         return Ok(());
     }
-    if current != Some(record.installed_url.as_str()) {
+    let owned = match current {
+        Some(current) => is_owned_url(current, &record.installed_url),
+        None => false,
+    };
+    if !owned {
         bail!("openai_base_url changed since install; refusing to overwrite user configuration")
     }
     match record.previous_url {
@@ -248,6 +291,19 @@ mod tests {
     }
 
     #[test]
+    fn alternate_url_swaps_the_two_supported_downstream_shapes() {
+        assert_eq!(
+            alternate_url("http://127.0.0.1:10100/secret/v1").as_deref(),
+            Some("http://127.0.0.1:10100/secret/backend-api/codex")
+        );
+        assert_eq!(
+            alternate_url("http://127.0.0.1:10100/secret/backend-api/codex").as_deref(),
+            Some("http://127.0.0.1:10100/secret/v1")
+        );
+        assert_eq!(alternate_url("http://127.0.0.1:10100/secret/v2"), None);
+    }
+
+    #[test]
     fn repeated_install_preserves_original_pre_comradex_url() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
@@ -309,6 +365,164 @@ mod tests {
 
         assert!(error.to_string().contains("changed since"));
         assert!(fs::read_to_string(&config).unwrap().contains("9999/manual"));
+    }
+
+    #[test]
+    fn hand_switched_alternate_shape_reinstall_and_uninstall_succeed() {
+        // /v1 install, hand-switched to the backend shape.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let record = dir.path().join("install.json");
+        fs::write(
+            &config,
+            "model = \"gpt-test\"\nopenai_base_url = \"http://127.0.0.1:10100/original/v1\"\n",
+        )
+        .unwrap();
+        let installed = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+        assert_eq!(installed, "http://127.0.0.1:10100/secret/v1");
+        let alternate = alternate_url(&installed).unwrap();
+        fs::write(
+            &config,
+            fs::read_to_string(&config)
+                .unwrap()
+                .replace(&installed, &alternate),
+        )
+        .unwrap();
+
+        // Reinstall from the alternate shape works and keeps the original recovery value.
+        let reinstalled = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+        assert_eq!(reinstalled, "http://127.0.0.1:10100/secret/v1");
+        let stored: InstallRecord = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert_eq!(stored.installed_url, reinstalled);
+        assert_eq!(
+            stored.previous_url.as_deref(),
+            Some("http://127.0.0.1:10100/original/v1")
+        );
+
+        // Uninstall from the alternate shape restores the original value.
+        fs::write(
+            &config,
+            fs::read_to_string(&config)
+                .unwrap()
+                .replace(&reinstalled, &alternate),
+        )
+        .unwrap();
+        uninstall(&record).unwrap();
+        let restored = fs::read_to_string(&config).unwrap();
+        assert!(restored.contains("http://127.0.0.1:10100/original/v1"));
+        assert!(!restored.contains("secret"));
+        assert!(!record.exists());
+
+        // Backend-shape install, hand-switched to /v1.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let record = dir.path().join("install.json");
+        fs::write(
+            &config,
+            "model = \"gpt-test\"\nopenai_base_url = \"http://127.0.0.1:10100/original/v1\"\n[features.context_management]\nexperimental_mode = true\n",
+        )
+        .unwrap();
+        let installed = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+        assert_eq!(installed, "http://127.0.0.1:10100/secret/backend-api/codex");
+        let alternate = alternate_url(&installed).unwrap();
+        assert_eq!(alternate, "http://127.0.0.1:10100/secret/v1");
+        fs::write(
+            &config,
+            fs::read_to_string(&config)
+                .unwrap()
+                .replace(&installed, &alternate),
+        )
+        .unwrap();
+
+        let reinstalled = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+        assert_eq!(
+            reinstalled,
+            "http://127.0.0.1:10100/secret/backend-api/codex"
+        );
+        fs::write(
+            &config,
+            fs::read_to_string(&config)
+                .unwrap()
+                .replace(&reinstalled, &alternate),
+        )
+        .unwrap();
+        uninstall(&record).unwrap();
+        let restored = fs::read_to_string(&config).unwrap();
+        assert!(restored.contains("http://127.0.0.1:10100/original/v1"));
+        assert!(!restored.contains("secret"));
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn uninstall_from_hand_switched_shape_without_reinstall_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let record = dir.path().join("install.json");
+        fs::write(&config, "model = \"gpt-test\"\n").unwrap();
+        let installed = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+        let alternate = alternate_url(&installed).unwrap();
+        fs::write(
+            &config,
+            fs::read_to_string(&config)
+                .unwrap()
+                .replace(&installed, &alternate),
+        )
+        .unwrap();
+
+        uninstall(&record).unwrap();
+
+        let restored = fs::read_to_string(&config).unwrap();
+        assert!(restored.contains("model = \"gpt-test\""));
+        assert!(!restored.contains("openai_base_url"));
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn foreign_url_still_refuses_reinstall_and_uninstall() {
+        for foreign in [
+            "http://127.0.0.1:9999/manual/v1",
+            "http://127.0.0.1:10100/other-secret/v1",
+            "http://127.0.0.1:10100/other-secret/backend-api/codex",
+            "http://127.0.0.1:10100/secret/v2",
+            "https://api.openai.com/v1",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.toml");
+            let record = dir.path().join("install.json");
+            fs::write(&config, "model = \"gpt-test\"\n").unwrap();
+            let installed = install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap();
+            fs::write(
+                &config,
+                format!("model = \"gpt-test\"\nopenai_base_url = \"{foreign}\"\n"),
+            )
+            .unwrap();
+
+            let reinstall_error =
+                install(&config, &record, "http://127.0.0.1:10100/secret/v1").unwrap_err();
+            assert!(
+                reinstall_error.to_string().contains("changed since"),
+                "reinstall should refuse {foreign}: {reinstall_error:#}"
+            );
+            assert!(
+                fs::read_to_string(&config).unwrap().contains(foreign),
+                "failed reinstall must leave {foreign} in place"
+            );
+
+            let uninstall_error = uninstall(&record).unwrap_err();
+            assert!(
+                uninstall_error.to_string().contains("changed since"),
+                "uninstall should refuse {foreign}: {uninstall_error:#}"
+            );
+            assert!(
+                fs::read_to_string(&config).unwrap().contains(foreign),
+                "failed uninstall must leave {foreign} in place"
+            );
+            assert!(
+                record.exists(),
+                "failed uninstall must keep {foreign} record"
+            );
+            assert_ne!(foreign, installed);
+        }
     }
 
     #[cfg(unix)]

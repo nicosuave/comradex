@@ -165,7 +165,13 @@ pub fn call_id_from_location(location: &str) -> Option<String> {
         }
         &after_scheme[slash..]
     };
-    let id = path.strip_prefix("/v1/realtime/calls/")?;
+    let id = path
+        // Call creation is served under both downstream prefixes and always forwards to
+        // `<upstream>/realtime/calls`, so accept every Location shape the backend may
+        // return: the historical `/v1` form, the backend-alias form, and the bare form.
+        .strip_prefix("/backend-api/codex/realtime/calls/")
+        .or_else(|| path.strip_prefix("/v1/realtime/calls/"))
+        .or_else(|| path.strip_prefix("/realtime/calls/"))?;
     if id.contains('/') {
         return None;
     }
@@ -298,5 +304,51 @@ mod tests {
             Some("rtc_abcdef")
         );
         assert!(call_id_from_location("https://example/anything/rtc_abcdef").is_none());
+    }
+
+    #[test]
+    fn extracts_backend_alias_and_bare_location_forms() {
+        // Call creation forwards to `<upstream>/realtime/calls` under both downstream
+        // prefixes, so every Location shape must bind the same live call.
+        for location in [
+            "/v1/realtime/calls/rtc_abcdef",
+            "/backend-api/codex/realtime/calls/rtc_abcdef",
+            "/realtime/calls/rtc_abcdef",
+            "https://chatgpt.com/v1/realtime/calls/rtc_abcdef",
+            "https://chatgpt.com/backend-api/codex/realtime/calls/rtc_abcdef?token=private",
+            "http://chatgpt.com/realtime/calls/rtc_abcdef",
+        ] {
+            assert_eq!(
+                call_id_from_location(location).as_deref(),
+                Some("rtc_abcdef"),
+                "location {location} should bind"
+            );
+        }
+        for location in [
+            // Ambiguous or foreign forms still fail closed.
+            "https://example/v1/realtime/calls/rtc_abcdef/extra",
+            "https://example/backend-api/codex/realtime/calls/rtc_abcdef/extra",
+            "https://example/backend-api/codexevil/realtime/calls/rtc_abcdef",
+            "https://example/v1/realtime/calls/rtc_abcdef#fragment",
+            "/v1/realtime/calls/rtc_abcdef#fragment",
+            "ftp://example/v1/realtime/calls/rtc_abcdef",
+            "/v1/realtime/calls/",
+            "/backend-api/codex/realtime/calls/not-a-call-id!",
+        ] {
+            assert!(
+                call_id_from_location(location).is_none(),
+                "location {location} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_origin_covers_only_live_sideband_paths() {
+        assert!(uses_v1_origin("/live/rtc_abcdef"));
+        assert!(uses_v1_origin("/realtime"));
+        assert!(uses_v1_origin("/realtime?call_id=rtc_abcdef"));
+        assert!(!uses_v1_origin("/responses"));
+        assert!(!uses_v1_origin("/realtime/calls"));
+        assert!(!uses_v1_origin("/alpha/history/v2/list_items"));
     }
 }
