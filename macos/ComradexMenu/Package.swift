@@ -12,7 +12,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ComradexMenu",
-            path: "Sources/ComradexMenu"
+            path: "Sources/ComradexMenu",
+            resources: [.copy("Resources/comradex-logo.svg")]
         ),
         .testTarget(
             name: "ComradexMenuTests",

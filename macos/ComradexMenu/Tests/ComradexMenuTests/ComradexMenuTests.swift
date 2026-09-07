@@ -6,6 +6,7 @@ final class ComradexMenuTests: XCTestCase {
     func testStatusIconIsAValidTemplateImage() {
         XCTAssertTrue(StatusIcon.image.isValid)
         XCTAssertTrue(StatusIcon.image.isTemplate)
+        XCTAssertEqual(StatusIcon.image.size, NSSize(width: 19, height: 13))
     }
 
     @MainActor
@@ -42,26 +43,75 @@ final class ComradexMenuTests: XCTestCase {
         let app = try XCTUnwrap(items.first(where: { $0.title == "app" }))
         XCTAssertEqual(app.state, .on)
         XCTAssertNil(app.image)
-        XCTAssertEqual(app.subtitle, "Preferred · Codex App account")
-        let sq = try XCTUnwrap(items.first(where: { $0.title == "sq" }))
+        XCTAssertNil(app.subtitle)
+        XCTAssertEqual(app.toolTip, "Preferred · Codex App account")
+        let sq = try XCTUnwrap(items.first(where: { $0.title.hasPrefix("sq — 81% left · ") }))
+        XCTAssertFalse(sq.title.contains("resets in"))
+        XCTAssertFalse(sq.title.contains("19%"))
         XCTAssertNotNil(sq.action)
         XCTAssertEqual(sq.state, .off)
         XCTAssertTrue(sq.image?.accessibilityDescription?.contains("Last used") == true)
-        let subtitle = try XCTUnwrap(sq.subtitle)
-        XCTAssertTrue(subtitle.contains("5h 81% left"))
-        XCTAssertTrue(subtitle.contains("7d 19% left"))
-        XCTAssertTrue(subtitle.contains("resets in"))
-        XCTAssertFalse(subtitle.contains("Signed in"))
-        let badSubtitle = try XCTUnwrap(items.first(where: { $0.title == "bad" })?.subtitle)
-        XCTAssertEqual(badSubtitle, "Sign-in required")
-        XCTAssertFalse(badSubtitle.contains("%"))
-        XCTAssertNil(items.first(where: { $0.title == "bad" })?.image)
+        XCTAssertNil(sq.subtitle)
+        XCTAssertTrue(sq.toolTip?.contains("resets in") == true)
+        let bad = try XCTUnwrap(items.first(where: { $0.title == "bad — Sign-in required" }))
+        XCTAssertNil(bad.subtitle)
+        XCTAssertNil(bad.image)
         XCTAssertEqual(snapshot.accounts.first(where: { $0.name == "sq" })?.usageUpdatedAtUnix, 1788800000)
         XCTAssertEqual(snapshot.accounts.first(where: { $0.name == "sq" })?.usageWindows["secondary"]?.resetAtUnix, 4103049600)
         XCTAssertEqual(items.first(where: { $0.title == "Refresh" })?.keyEquivalent, "r")
         XCTAssertNotNil(items.first(where: { $0.title == "Refresh" })?.action)
         XCTAssertEqual(items.first(where: { $0.title == "Quit Comradex" })?.keyEquivalent, "q")
         XCTAssertNotNil(items.first(where: { $0.title == "Quit Comradex" })?.action)
+    }
+
+    @MainActor
+    @available(macOS 14.4, *)
+    func testAccountRowsStayCompactAcrossUsageAndAvailabilityStates() throws {
+        let cases: [(String, String)] = [
+            (#""usage_windows":{"primary":{"used_percent":0,"reset_at_unix":0,"limit_window_seconds":0},"secondary":{"used_percent":31,"limit_window_seconds":604800}}"#, "69% left"),
+            (#""usage_windows":{"primary":{"used_percent":32,"limit_window_seconds":604800},"secondary":{"used_percent":0,"limit_window_seconds":0}}"#, "68% left"),
+            (#""usage_windows":{"primary":{"used_percent":32},"secondary":{"used_percent":10,"limit_window_seconds":604800}}"#, "68% left"),
+            (#""usage_percent":31"#, "69% left"),
+            (#""usage_windows":{}"#, "Usage pending"),
+            (#""available":false,"unavailable_reason":"quota","retry_at_unix":4102444800"#, "Rate limited"),
+            (#""available":false,"unavailable_reason":"temporary_failure""#, "Temporarily unavailable"),
+            (#""auth_state":"login_in_progress""#, "Login in progress"),
+            (#""auth_state":"signed_out","signed_in":false"#, "Sign-in required"),
+            (#""reauth_required":true"#, "Sign-in needed for renewal"),
+            (#""available":false,"unavailable_reason":"unknown""#, "Unavailable"),
+        ]
+        for (fields, detail) in cases {
+            let account = try decodeAccount("{\"name\":\"work\",\"kind\":\"codex_home\",\(fields)}")
+            let store = ComradexStore(client: StubClient())
+            store.apply(status: UIStatusSnapshot(accounts: [account], pools: [
+                PoolSnapshot(name: "default", members: ["work"], preferred: "work", active: "work")
+            ]))
+            let controller = MenuBarController(store: store)
+            controller.rebuildMenu()
+            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "work — \(detail)" })
+            XCTAssertNil(item.subtitle)
+            XCTAssertEqual(item.state, .on)
+            XCTAssertFalse(item.toolTip?.contains("0d") == true)
+            XCTAssertFalse(item.toolTip?.contains("resets in 0s") == true)
+        }
+    }
+
+    @MainActor
+    func testMainQuotaShowsItsOwnCompactResetCountdown() throws {
+        let reset = Int64(Date().timeIntervalSince1970) + 6 * 86_400 + 4 * 3_600 + 120
+        let account = try decodeAccount("""
+        {"name":"sq","usage_windows":{
+          "primary":{"used_percent":32,"limit_window_seconds":604800,"reset_at_unix":\(reset)},
+          "secondary":{"used_percent":0,"limit_window_seconds":0,"reset_at_unix":0}
+        }}
+        """)
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: [account]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        XCTAssertTrue(controller.renderedMenu.items.contains {
+            $0.title == "sq — 68% left · 6d 4h"
+        })
     }
 
     @MainActor

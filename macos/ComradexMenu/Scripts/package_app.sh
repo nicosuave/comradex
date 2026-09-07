@@ -22,6 +22,7 @@ done
 APP="$ROOT/${APP_NAME}.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$ROOT/Sources/ComradexMenu/Resources/comradex-logo.svg" "$APP/Contents/Resources/"
 
 build_product_path() {
   echo ".build/$1-apple-macosx/$CONF/$APP_NAME"
