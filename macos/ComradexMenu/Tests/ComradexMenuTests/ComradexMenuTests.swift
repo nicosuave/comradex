@@ -9,6 +9,7 @@ final class ComradexMenuTests: XCTestCase {
     }
 
     @MainActor
+    @available(macOS 14.4, *)
     func testNativeMenuRendersAccountsAndActionableCommands() throws {
         let data = Data(#"""
         {
@@ -17,9 +18,10 @@ final class ComradexMenuTests: XCTestCase {
             "daemon_running": true,
             "accounts": [
               {"name":"app","kind":"inbound","signed_in":true,"auth_state":"inbound","pools":["default"]},
-              {"name":"sq","kind":"codex_home","signed_in":true,"auth_state":"signed_in","pools":["default"]}
+              {"name":"sq","kind":"codex_home","signed_in":true,"auth_state":"signed_in","pools":["default"],"usage_percent":81,"usage_updated_at_unix":1788800000,"usage_windows":{"primary":{"used_percent":19,"reset_at_unix":4102444800,"limit_window_seconds":18000},"secondary":{"used_percent":81,"reset_at_unix":4103049600,"limit_window_seconds":604800}}},
+              {"name":"bad","kind":"codex_home","signed_in":true,"auth_state":"signed_in","pools":["default"],"available":false,"unavailable_reason":"needs_login","usage_windows":{"primary":{"used_percent":10,"reset_at_unix":4102444800,"limit_window_seconds":18000}}}
             ],
-            "pools": [{"name":"default","members":["app","sq"],"preferred":"app","active":"app"}]
+            "pools": [{"name":"default","members":["app","sq","bad"],"preferred":"app","active":"sq"}]
           }
         }
         """#.utf8)
@@ -36,9 +38,26 @@ final class ComradexMenuTests: XCTestCase {
 
         let items = controller.renderedMenu.items
         XCTAssertFalse(controller.renderedMenu.autoenablesItems)
-        XCTAssertTrue(items.contains { $0.title == "default · Active: app" })
-        XCTAssertEqual(items.first(where: { $0.title == "app" })?.state, .on)
-        XCTAssertNotNil(items.first(where: { $0.title == "sq" })?.action)
+        XCTAssertFalse(items.contains { $0.title.contains("default") || $0.title.contains("Active:") })
+        let app = try XCTUnwrap(items.first(where: { $0.title == "app" }))
+        XCTAssertEqual(app.state, .on)
+        XCTAssertNil(app.image)
+        XCTAssertEqual(app.subtitle, "Preferred · Codex App account")
+        let sq = try XCTUnwrap(items.first(where: { $0.title == "sq" }))
+        XCTAssertNotNil(sq.action)
+        XCTAssertEqual(sq.state, .off)
+        XCTAssertTrue(sq.image?.accessibilityDescription?.contains("Last used") == true)
+        let subtitle = try XCTUnwrap(sq.subtitle)
+        XCTAssertTrue(subtitle.contains("5h 81% left"))
+        XCTAssertTrue(subtitle.contains("7d 19% left"))
+        XCTAssertTrue(subtitle.contains("resets in"))
+        XCTAssertFalse(subtitle.contains("Signed in"))
+        let badSubtitle = try XCTUnwrap(items.first(where: { $0.title == "bad" })?.subtitle)
+        XCTAssertEqual(badSubtitle, "Sign-in required")
+        XCTAssertFalse(badSubtitle.contains("%"))
+        XCTAssertNil(items.first(where: { $0.title == "bad" })?.image)
+        XCTAssertEqual(snapshot.accounts.first(where: { $0.name == "sq" })?.usageUpdatedAtUnix, 1788800000)
+        XCTAssertEqual(snapshot.accounts.first(where: { $0.name == "sq" })?.usageWindows["secondary"]?.resetAtUnix, 4103049600)
         XCTAssertEqual(items.first(where: { $0.title == "Refresh" })?.keyEquivalent, "r")
         XCTAssertNotNil(items.first(where: { $0.title == "Refresh" })?.action)
         XCTAssertEqual(items.first(where: { $0.title == "Quit Comradex" })?.keyEquivalent, "q")

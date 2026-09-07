@@ -26,6 +26,10 @@ pub struct Stats {
     pub refresh_reauth_required: AtomicU64,
     pub refresh_last_sweep_unix: AtomicU64,
     pub refresh_last_success_unix: AtomicU64,
+    pub usage_fetch_accounts_checked: AtomicU64,
+    pub usage_fetch_successes: AtomicU64,
+    pub usage_fetch_failures: AtomicU64,
+    pub usage_fetch_last_success_unix: AtomicU64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +60,14 @@ pub struct StatsSnapshot {
     pub refresh_last_sweep_unix: u64,
     #[serde(default)]
     pub refresh_last_success_unix: u64,
+    #[serde(default)]
+    pub usage_fetch_accounts_checked: u64,
+    #[serde(default)]
+    pub usage_fetch_successes: u64,
+    #[serde(default)]
+    pub usage_fetch_failures: u64,
+    #[serde(default)]
+    pub usage_fetch_last_success_unix: u64,
 }
 
 impl Stats {
@@ -81,6 +93,12 @@ impl Stats {
             refresh_reauth_required: self.refresh_reauth_required.load(Ordering::Relaxed),
             refresh_last_sweep_unix: self.refresh_last_sweep_unix.load(Ordering::Relaxed),
             refresh_last_success_unix: self.refresh_last_success_unix.load(Ordering::Relaxed),
+            usage_fetch_accounts_checked: self.usage_fetch_accounts_checked.load(Ordering::Relaxed),
+            usage_fetch_successes: self.usage_fetch_successes.load(Ordering::Relaxed),
+            usage_fetch_failures: self.usage_fetch_failures.load(Ordering::Relaxed),
+            usage_fetch_last_success_unix: self
+                .usage_fetch_last_success_unix
+                .load(Ordering::Relaxed),
         }
     }
 

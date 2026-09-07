@@ -114,6 +114,10 @@ pub struct UiAccountStatus {
     pub unavailable_reason: Option<String>,
     pub retry_at_unix: Option<i64>,
     pub usage_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_updated_at_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usage_windows: BTreeMap<String, crate::routing::QuotaWindowStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -843,6 +847,15 @@ async fn build_ui_status(
                     .account_states
                     .get(name)
                     .and_then(|state| state.usage_percent),
+                usage_updated_at_unix: routing
+                    .account_states
+                    .get(name)
+                    .and_then(|state| state.usage_updated_at_unix),
+                usage_windows: routing
+                    .account_states
+                    .get(name)
+                    .map(|state| state.usage_windows.clone())
+                    .unwrap_or_default(),
             }
         })
         .collect();
