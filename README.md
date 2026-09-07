@@ -260,7 +260,7 @@ status metadata and keeps credentials, native items, and synthetic response text
 
 Quota cooldowns recover automatically on the next selection or status request. When upstream reports several quota windows, only windows explicitly reported at 100% constrain a quota rejection; unrelated longer windows do not keep the account blocked. `comradex status` and `comradex status --json` expose each account's availability, retry deadline, usage, and blocking quota windows. Neither Comradex nor Codex needs to be restarted when a quota window resets.
 
-Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file, and all bodies have a hard cap. Responses and upgraded streams are forwarded with backpressure and are never retained.
+Requests up to 256 KiB are replayed from memory by default; larger requests use a temporary file, and all bodies have a hard cap. Responses and upgraded streams are forwarded with backpressure. The Responses WebSocket modes may briefly buffer lifecycle metadata as described below; model output is never retained for retry.
 
 ### Responses WebSocket modes
 
@@ -271,6 +271,8 @@ Select behavior with `proxy.responses_websocket_mode`:
 - `direct` keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend. If safe internal replay is unavailable, it preserves Codex's canonical `previous_response_not_found` retry classifier while removing account-scoped details.
 
 Direct mode uses the explicit refresh-then-alternate sequence above. Live Voice upgrades are separate from these modes and remain raw, call-bound relays.
+
+Both Responses WebSocket modes can use their one unused replay allowance after an explicit capacity rejection when the upstream emitted only empty `response.created`/`response.in_progress` metadata and the terminal proves zero output tokens. Missing usage, output items or deltas (including reasoning and tools), quota failures, and interrupted streams do not qualify. Eligible metadata is buffered for at most one second, 16 frames, or 64 KiB; any other event releases it immediately. A successful alternate therefore exposes one lifecycle with its original response ID and sequence numbers. When no alternate can be dispatched, the original lifecycle and rejection are preserved. File, turn-state, and nonportable context ownership restrictions still apply. Raw HTTP streaming does not use this accepted-work retry.
 
 HTTP bridge sessions have their own `proxy.max_bridge_sessions` limit (256 by default), separate from `proxy.max_upgrades`, which continues to bound raw/direct upstream upgrades and Live Voice. At bridge capacity, Comradex closes the least-recently-used idle session before admitting a replacement. Sessions with active turns are never evicted. Idle bridge sessions close after `proxy.bridge_idle_seconds` (900 by default), and admission waits up to `proxy.bridge_admission_timeout_millis` (2000 by default) for a closing session before returning a retryable `503 at_capacity` response with `Retry-After: 1`.
 

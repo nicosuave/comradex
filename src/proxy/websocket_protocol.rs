@@ -165,6 +165,7 @@ pub struct PendingTurn {
     downstream_visible: bool,
     last_visible_sequence: Option<SequenceNumber>,
     replay_count: u8,
+    accepted_capacity_replayed: bool,
     auth_refresh_replay_count: u8,
     auth_failover_replay_count: u8,
     analysis: CreateAnalysis,
@@ -313,12 +314,16 @@ pub struct ReplayContext {
     /// True when the failure event being classified carries a response ID.
     /// An assigned ID is treated as accepted work, even for quota or capacity failures.
     pub current_event_has_response_id: bool,
+    /// Set only by the bounded lifecycle buffer after inspecting an explicit
+    /// capacity terminal with affirmative zero output and zero output usage.
+    pub accepted_capacity_rejection: bool,
 }
 
 impl ReplayContext {
     pub fn from_failure(failure: &FailureClassification) -> Self {
         Self {
             current_event_has_response_id: failure.response_id.is_some(),
+            accepted_capacity_rejection: false,
         }
     }
 }
@@ -414,6 +419,7 @@ impl ProtocolState {
             downstream_visible: false,
             last_visible_sequence: None,
             replay_count: 0,
+            accepted_capacity_replayed: false,
             auth_refresh_replay_count: 0,
             auth_failover_replay_count: 0,
             analysis,
@@ -538,22 +544,31 @@ impl ProtocolState {
         if self.pending.len() != 1 {
             return Err(ReplayRefusal::MultiplePendingTurns);
         }
+        // An accepted-capacity retry is the last automatic attempt, including
+        // authentication and pre-created transport recovery on its replacement.
+        if turn.accepted_capacity_replayed {
+            return Err(ReplayRefusal::AlreadyReplayed);
+        }
+        let accepted_capacity = context.accepted_capacity_rejection
+            && failure == FailureKind::Capacity
+            && turn.response_created
+            && turn.response_id.is_some();
         if turn.last_visible_sequence.is_some() {
             return Err(ReplayRefusal::FiniteSequenceVisible);
         }
         if turn.downstream_visible {
             return Err(ReplayRefusal::DownstreamVisible);
         }
-        if turn.response_created {
+        if turn.response_created && !accepted_capacity {
             return Err(ReplayRefusal::ResponseCreated);
         }
-        if turn.response_event_count > 0 {
+        if turn.response_event_count > 0 && !accepted_capacity {
             return Err(ReplayRefusal::PriorResponseEvent);
         }
         if turn.analysis.has_file_references {
             return Err(ReplayRefusal::FileBacked);
         }
-        if context.current_event_has_response_id {
+        if context.current_event_has_response_id && !accepted_capacity {
             return Err(ReplayRefusal::ResponseIdAssigned);
         }
 
@@ -591,7 +606,11 @@ impl ProtocolState {
             if turn.replay_count >= self.limits.max_replays_per_turn {
                 return Err(ReplayRefusal::AlreadyReplayed);
             }
-            ReplayTarget::Unspecified
+            if accepted_capacity {
+                ReplayTarget::AlternateAccount
+            } else {
+                ReplayTarget::Unspecified
+            }
         };
 
         let mode = if turn.previous_response_id.is_none() {
@@ -633,12 +652,15 @@ impl ProtocolState {
             ReplayTarget::SameAccountAfterRefresh => {
                 turn.auth_refresh_replay_count = turn.auth_refresh_replay_count.saturating_add(1);
             }
-            ReplayTarget::AlternateAccount => {
+            ReplayTarget::AlternateAccount
+                if matches!(failure, FailureKind::Authentication { .. }) =>
+            {
                 turn.auth_failover_replay_count = turn.auth_failover_replay_count.saturating_add(1);
             }
-            ReplayTarget::Unspecified => {}
+            ReplayTarget::AlternateAccount | ReplayTarget::Unspecified => {}
         }
         turn.replay_count = turn.replay_count.saturating_add(1);
+        turn.accepted_capacity_replayed |= context.accepted_capacity_rejection;
         turn.response_id = None;
         turn.response_created = false;
         turn.response_event_count = 0;
@@ -1883,6 +1905,7 @@ mod tests {
                 auth,
                 ReplayContext {
                     current_event_has_response_id: true,
+                    ..ReplayContext::default()
                 },
             ),
             Err(ReplayRefusal::ResponseIdAssigned)
@@ -2210,6 +2233,83 @@ mod tests {
             protocol.replay_decision(turn, FailureKind::Capacity, ReplayContext::default()),
             ReplayDecision::Refused(_)
         ));
+    }
+
+    #[test]
+    fn accepted_capacity_uses_the_existing_budget_and_is_the_last_replay() {
+        let mut protocol = state();
+        let turn = protocol
+            .admit_response_create(&create(json!("hello")))
+            .unwrap();
+        protocol
+            .observe_upstream_event(
+                &json!({"type":"response.created","response":{"id":"resp_a"}}),
+                None,
+            )
+            .unwrap();
+        let context = ReplayContext {
+            current_event_has_response_id: true,
+            accepted_capacity_rejection: true,
+        };
+        for failure in [
+            FailureKind::Quota,
+            FailureKind::Transient,
+            FailureKind::Authentication {
+                requires_reauthentication: false,
+            },
+        ] {
+            assert!(protocol.replay_plan(turn, failure, context).is_err());
+        }
+        let plan = protocol
+            .prepare_replay_plan(turn, FailureKind::Capacity, context)
+            .unwrap();
+        assert_eq!(plan.target, ReplayTarget::AlternateAccount);
+        assert_eq!(protocol.turn(turn).unwrap().replay_count(), 1);
+        assert_eq!(protocol.turn(turn).unwrap().auth_failover_replay_count(), 0);
+        protocol
+            .reset_auth_sequence_after_account_switch(turn)
+            .unwrap();
+        for failure in [
+            FailureKind::Capacity,
+            FailureKind::Quota,
+            FailureKind::Transient,
+            FailureKind::Authentication {
+                requires_reauthentication: false,
+            },
+        ] {
+            assert_eq!(
+                protocol.replay_plan(turn, failure, ReplayContext::default()),
+                Err(ReplayRefusal::AlreadyReplayed)
+            );
+        }
+    }
+
+    #[test]
+    fn earlier_precreated_replay_cannot_grant_another_accepted_retry() {
+        let mut protocol = state();
+        let turn = protocol
+            .admit_response_create(&create(json!("hello")))
+            .unwrap();
+        protocol
+            .prepare_replay_plan(turn, FailureKind::Quota, ReplayContext::default())
+            .unwrap();
+        protocol
+            .observe_upstream_event(
+                &json!({"type":"response.created","response":{"id":"resp_b"}}),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            protocol.replay_plan(
+                turn,
+                FailureKind::Capacity,
+                ReplayContext {
+                    current_event_has_response_id: true,
+                    accepted_capacity_rejection: true,
+                }
+            ),
+            Err(ReplayRefusal::AlreadyReplayed)
+        );
     }
 
     #[test]

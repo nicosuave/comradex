@@ -1,3 +1,6 @@
+mod accepted_retry;
+#[cfg(test)]
+mod accepted_retry_tests;
 mod context;
 mod context_codec;
 mod context_store;
@@ -66,6 +69,7 @@ use crate::{
     state::Stats,
     transport::{codex_http_connector, codex_websocket_connector},
 };
+use accepted_retry::{BufferedEvent, LifecycleBuffer};
 use replay_body::{ProxyBody, ReplayBody, bytes_body, empty_body, incoming_body, json_body};
 use sse::{ProtocolEvent, SseDecoder, responses_json_events};
 use websocket_protocol::{
@@ -89,6 +93,10 @@ pub(super) const RESPONSES_MISSING_CREATED_TIMEOUT: Duration = Duration::from_se
 pub(super) const RESPONSES_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RESPONSES_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS: usize = 4_096;
+// Do not make clients wait for their own created watchdog while the upstream
+// spends a long time before its first output. A delayed rejection simply loses
+// eligibility for transparent retry once this metadata has been released.
+const LIFECYCLE_FLUSH_DELAY: Duration = Duration::from_secs(1);
 
 fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
     matches!(
@@ -155,6 +163,8 @@ struct DirectTurn {
     request: Message,
     value: serde_json::Value,
     routing_value: serde_json::Value,
+    lifecycle: LifecycleBuffer,
+    lifecycle_deadline: Option<tokio::time::Instant>,
 }
 
 struct DirectUpstream {
@@ -171,6 +181,14 @@ enum ServingLane {
 struct HttpReplayContext {
     previous_response_id: Option<String>,
     lane: ServingLane,
+    bridge_dispatch: Option<Arc<StdMutex<BridgeDispatchState>>>,
+}
+
+#[derive(Default)]
+struct BridgeDispatchState {
+    attempts: usize,
+    cross_account_safe: bool,
+    excluded_account: Option<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -398,6 +416,21 @@ struct HttpBridgeCapture {
     response_created: bool,
     progress_events: u64,
     delivery_failed: bool,
+    lifecycle: LifecycleBuffer,
+    capacity_retry: Option<HttpBridgeCapacityRetry>,
+    lifecycle_deadline: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug)]
+struct HttpBridgeCapacityRetry {
+    account: String,
+    events: Vec<BufferedEvent>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HttpBridgeRetryPolicy {
+    allowed: bool,
+    accepted_work: bool,
 }
 
 #[derive(Debug)]
@@ -406,6 +439,7 @@ struct HttpBridgePumpFailure {
     delivered_event: bool,
     liveness: Option<HttpBridgeLivenessFailure>,
     delivery_failed: bool,
+    accepted_work: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1067,6 +1101,7 @@ impl App {
             HttpReplayContext {
                 previous_response_id: None,
                 lane,
+                bridge_dispatch: None,
             },
         )
         .await
@@ -1084,6 +1119,7 @@ impl App {
         let HttpReplayContext {
             previous_response_id: routing_previous_response_id,
             lane,
+            bridge_dispatch,
         } = context;
         if path.starts_with("/alpha/history/") || path.starts_with("/alpha/notes/") {
             return self
@@ -1185,6 +1221,7 @@ impl App {
             .collect();
         let mut bound_account: Option<String> = None;
         let mut hard_owner = false;
+        let mut non_previous_hard_owner = false;
         let mut known_file_owners = 0usize;
         let mut missing_hard_owner = false;
         let soft_routing_key = affinity_keys
@@ -1228,6 +1265,7 @@ impl App {
                 ));
             }
             hard_owner = true;
+            non_previous_hard_owner |= *kind != metadata::AffinityKind::PreviousResponse;
             if *kind == metadata::AffinityKind::File {
                 known_file_owners += 1;
             }
@@ -1247,6 +1285,19 @@ impl App {
                 "request carries hard continuity state with no known account owner",
             ));
         }
+        let excluded_account = bridge_dispatch.as_ref().and_then(|dispatch| {
+            dispatch
+                .lock()
+                .expect("bridge dispatch")
+                .excluded_account
+                .clone()
+        });
+        if bound_account
+            .as_ref()
+            .is_some_and(|account| Some(account) == excluded_account.as_ref())
+        {
+            anyhow::bail!("accepted retry cannot leave its continuity owner")
+        }
         let first = if let Some(account) = &bound_account {
             match self.router.select_exact(pool, account).await {
                 Some(selection) => selection,
@@ -1260,14 +1311,36 @@ impl App {
             }
         } else {
             self.router
-                .select(&listener.pool, pool, soft_routing_key, None)
+                .select(
+                    &listener.pool,
+                    pool,
+                    soft_routing_key,
+                    excluded_account.as_deref(),
+                )
                 .await
                 .context("no eligible account")?
         };
+        if excluded_account.as_deref() == Some(first.account_id.as_str()) {
+            anyhow::bail!("no alternate account for accepted capacity retry")
+        }
         let mut selected = first;
         let nonportable_payload = replay.has_nonportable_state();
         let mut payload_dispatch_owner: Option<String> = None;
-        for attempt in 0..2 {
+        let first_attempt = if let Some(dispatch) = &bridge_dispatch {
+            let mut dispatch = dispatch.lock().expect("bridge dispatch");
+            dispatch.cross_account_safe &=
+                !non_previous_hard_owner && !nonportable_payload && file_ids.is_empty();
+            dispatch.attempts
+        } else {
+            0
+        };
+        if first_attempt >= 2 {
+            anyhow::bail!("Responses bridge replay budget exhausted")
+        }
+        for attempt in first_attempt..2 {
+            if let Some(dispatch) = &bridge_dispatch {
+                dispatch.lock().expect("bridge dispatch").attempts = attempt + 1;
+            }
             let account = selected.account_id.clone();
             // Dispatch-boundary fence (fix1): `select` above ran before this await. Credential
             // resolution holds a file lock + HomeAuthLock + OAuth I/O for up to 15s, during
@@ -2035,6 +2108,12 @@ impl App {
                         .and_then(serde_json::Value::as_array)
                         .cloned()
                         .unwrap_or_default();
+                    let mut retry_frame = frame.clone();
+                    retry_frame["type"] = serde_json::Value::String("response.create".into());
+                    if let Some(anchor) = &routing_previous_response_id {
+                        retry_frame["previous_response_id"] =
+                            serde_json::Value::String(anchor.clone());
+                    }
                     let body = match serde_json::to_vec(&frame) {
                         Ok(body) => bytes::Bytes::from(body),
                         Err(error) => {
@@ -2058,126 +2137,19 @@ impl App {
                     active_turn = self
                         .spawn_tracked_task(async move {
                             let _turn_guard = turn_guard;
-                            let dispatch_deadline =
-                                tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT;
-                            let replay = match ReplayBody::from_bytes(
+                            app.run_http_bridge_turn(
+                                headers,
+                                &listener,
+                                path,
                                 body,
-                                app.config.proxy.max_request_bytes,
-                                app.config.proxy.max_spool_bytes,
-                                app.stats.clone(),
-                            ) {
-                                Ok(replay) => replay,
-                                Err(error) => {
-                                    send_ws_error(
-                                        &outbound,
-                                        "invalid_request_error",
-                                        &error.to_string(),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            };
-                            match tokio::time::timeout_at(
-                                dispatch_deadline,
-                                app.handle_http_replay_with_routing_anchor(
-                                    headers,
-                                    Method::POST,
-                                    &listener,
-                                    path,
-                                    replay,
-                                    HttpReplayContext {
-                                        previous_response_id: routing_previous_response_id,
-                                        lane: ServingLane::Bridge,
-                                    },
-                                ),
+                                routing_previous_response_id,
+                                request_input,
+                                retry_frame,
+                                &outbound,
+                                &continuation,
+                                &fatal,
                             )
-                            .await
-                            {
-                                Ok(Ok(response)) => {
-                                    let close_for_inbound_auth = response.status()
-                                        == StatusCode::UNAUTHORIZED
-                                        && response
-                                            .extensions()
-                                            .get::<SelectedAccount>()
-                                            .is_some_and(|selected| {
-                                                matches!(
-                                                    app.config.accounts.get(&selected.account),
-                                                    Some(crate::config::AccountConfig::Inbound)
-                                                )
-                                            });
-                                    let pump_result = pump_http_response_to_websocket(
-                                        response,
-                                        &outbound,
-                                        &app,
-                                        request_input,
-                                        &continuation,
-                                        dispatch_deadline,
-                                        RESPONSES_UPSTREAM_IDLE_TIMEOUT,
-                                    )
-                                    .await;
-                                    if close_for_inbound_auth {
-                                        let _ = outbound
-                                            .send(Message::Close(Some(
-                                                tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                                                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
-                                                    reason: "inbound credentials rejected; reconnect required".into(),
-                                                },
-                                            )))
-                                            .await;
-                                        let _ = fatal.send(
-                                            "inbound credentials rejected; downstream reconnect required"
-                                                .into(),
-                                        );
-                                        return;
-                                    }
-                                    if let Err(failure) = pump_result {
-                                        if let Some(liveness) = failure.liveness {
-                                            send_ws_nonretryable_liveness_error(
-                                                &outbound,
-                                                liveness,
-                                            )
-                                            .await;
-                                            return;
-                                        }
-                                        if failure.delivery_failed {
-                                            let _ = fatal.send(failure.error.to_string());
-                                            return;
-                                        }
-                                        if failure.delivered_event {
-                                            let _ = outbound
-                                                .send(Message::Close(Some(
-                                                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                                                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error,
-                                                        reason: "upstream stream incomplete".into(),
-                                                    },
-                                                )))
-                                                .await;
-                                            let _ = fatal.send(format!(
-                                                "upstream stream ended after visible output: {}",
-                                                failure.error
-                                            ));
-                                        } else {
-                                            send_ws_error(
-                                                &outbound,
-                                                "websocket_protocol_error",
-                                                &failure.error.to_string(),
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
-                                Ok(Err(error)) => {
-                                    send_ws_error(&outbound, "proxy_error", &error.to_string())
-                                        .await;
-                                }
-                                Err(_) => {
-                                    send_ws_nonretryable_liveness_error(
-                                        &outbound,
-                                        HttpBridgeLivenessFailure::MissingResponseCreated,
-                                    )
-                                    .await;
-                                }
-                            }
+                            .await;
                         })
                         .await;
                     if active_turn.is_none() {
@@ -2206,6 +2178,203 @@ impl App {
         match read_error {
             Some(error) => anyhow::bail!("Responses WebSocket bridge failed: {error}"),
             None => Ok(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_http_bridge_turn(
+        self: &Arc<Self>,
+        mut headers: hyper::HeaderMap,
+        listener: &ListenerConfig,
+        path: String,
+        body: bytes::Bytes,
+        mut routing_previous_response_id: Option<String>,
+        request_input: Vec<serde_json::Value>,
+        retry_frame: serde_json::Value,
+        outbound: &BridgeSender,
+        continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
+        fatal: &mpsc::UnboundedSender<String>,
+    ) {
+        // Context validation can read storage or refresh credentials. Keep it
+        // inside the cancellable turn and its original dispatch deadline.
+        let mut dispatch_deadline = tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT;
+        let retry_view = match tokio::time::timeout_at(
+            dispatch_deadline,
+            self.context_routing_view(&retry_frame, listener, &headers),
+        )
+        .await
+        {
+            Ok(Ok(view)) => view,
+            Ok(Err(_)) => {
+                send_ws_error(outbound, "context_result_invalid", "invalid context result").await;
+                return;
+            }
+            Err(_) => {
+                send_ws_nonretryable_liveness_error(
+                    outbound,
+                    HttpBridgeLivenessFailure::MissingResponseCreated,
+                )
+                .await;
+                return;
+            }
+        };
+        let bridge_replayable = analyze_response_create(&retry_view, ProtocolLimits::default())
+            .is_ok_and(|analysis| {
+                !analysis.has_file_references
+                    && !analysis.has_nonportable_state
+                    && (analysis.previous_response_id.is_none()
+                        || analysis.full_resend == websocket_protocol::FullResendSafety::Eligible)
+            });
+        let dispatch = Arc::new(StdMutex::new(BridgeDispatchState {
+            cross_account_safe: bridge_replayable,
+            ..BridgeDispatchState::default()
+        }));
+        let mut fallback: Option<HttpBridgeCapacityRetry> = None;
+        let mut accepted_retry = false;
+        loop {
+            let replay = match ReplayBody::from_bytes(
+                body.clone(),
+                self.config.proxy.max_request_bytes,
+                self.config.proxy.max_spool_bytes,
+                self.stats.clone(),
+            ) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    if let Some(fallback) = fallback {
+                        send_bridge_capacity_fallback(outbound, fallback).await;
+                    } else {
+                        send_ws_error(outbound, "invalid_request_error", &error.to_string()).await;
+                    }
+                    return;
+                }
+            };
+            let response = match tokio::time::timeout_at(
+                dispatch_deadline,
+                self.handle_http_replay_with_routing_anchor(
+                    headers.clone(),
+                    Method::POST,
+                    listener,
+                    path.clone(),
+                    replay,
+                    HttpReplayContext {
+                        previous_response_id: routing_previous_response_id.clone(),
+                        lane: ServingLane::Bridge,
+                        bridge_dispatch: Some(dispatch.clone()),
+                    },
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                failure => {
+                    if let Some(fallback) = fallback {
+                        send_bridge_capacity_fallback(outbound, fallback).await;
+                    } else if let Ok(Err(error)) = failure {
+                        send_ws_error(outbound, "proxy_error", &error.to_string()).await;
+                    } else {
+                        send_ws_nonretryable_liveness_error(
+                            outbound,
+                            HttpBridgeLivenessFailure::MissingResponseCreated,
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            };
+            if let Some(original) = fallback.take()
+                && (!response.status().is_success()
+                    || response
+                        .extensions()
+                        .get::<SelectedAccount>()
+                        .is_none_or(|selected| selected.account == original.account))
+            {
+                // No replacement stream was established. Preserve the original
+                // accepted rejection, including its original ID and sequence.
+                send_bridge_capacity_fallback(outbound, original).await;
+                return;
+            }
+            let close_for_inbound_auth = response.status() == StatusCode::UNAUTHORIZED
+                && response
+                    .extensions()
+                    .get::<SelectedAccount>()
+                    .is_some_and(|selected| {
+                        matches!(
+                            self.config.accounts.get(&selected.account),
+                            Some(crate::config::AccountConfig::Inbound)
+                        )
+                    });
+            let retry_policy = {
+                let dispatch = dispatch.lock().expect("bridge dispatch");
+                HttpBridgeRetryPolicy {
+                    allowed: !accepted_retry
+                        && dispatch.attempts < 2
+                        && dispatch.cross_account_safe,
+                    accepted_work: accepted_retry,
+                }
+            };
+            let pump_result = pump_http_response_to_websocket(
+                response,
+                outbound,
+                self,
+                request_input.clone(),
+                continuation,
+                dispatch_deadline,
+                RESPONSES_UPSTREAM_IDLE_TIMEOUT,
+                retry_policy,
+            )
+            .await;
+            if close_for_inbound_auth {
+                let _ = outbound.send(Message::Close(Some(
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                        reason: "inbound credentials rejected; reconnect required".into(),
+                    },
+                ))).await;
+                let _ = fatal
+                    .send("inbound credentials rejected; downstream reconnect required".into());
+                return;
+            }
+            match pump_result {
+                Ok(Some(retry)) => {
+                    dispatch.lock().expect("bridge dispatch").excluded_account =
+                        Some(retry.account.clone());
+                    fallback = Some(retry);
+                    accepted_retry = true;
+                    // The bridge already materialized this response anchor, and
+                    // the gate proved that no independent hard owner remains.
+                    routing_previous_response_id = None;
+                    strip_direct_session_headers(&mut headers);
+                    dispatch_deadline =
+                        tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT;
+                }
+                Ok(None) => return,
+                Err(failure) => {
+                    if let Some(liveness) = failure.liveness {
+                        send_ws_nonretryable_liveness_error(outbound, liveness).await;
+                    } else if failure.delivery_failed {
+                        let _ = fatal.send(failure.error.to_string());
+                    } else if failure.delivered_event || failure.accepted_work {
+                        let _ = outbound.send(Message::Close(Some(
+                            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error,
+                                reason: "upstream stream incomplete".into(),
+                            },
+                        ))).await;
+                        let _ = fatal.send(format!(
+                            "upstream stream ended after acceptance: {}",
+                            failure.error
+                        ));
+                    } else {
+                        send_ws_error(
+                            outbound,
+                            "websocket_protocol_error",
+                            &failure.error.to_string(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            }
         }
     }
 
@@ -2532,13 +2701,29 @@ impl App {
         let mut queued_creates = VecDeque::<Message>::new();
         loop {
             let earliest_idle_deadline = earliest_turn_deadline(&upstream_idle_deadlines);
+            let lifecycle_deadline = turns
+                .values()
+                .filter_map(|turn| turn.lifecycle_deadline)
+                .min();
             let queued_message = if awaiting_response_created.is_none() {
-                queued_creates.pop_front()
+                queued_creates.front().cloned()
             } else {
                 None
             };
+            let from_queue = queued_message.is_some();
             tokio::select! {
                 biased;
+                _ = wait_for_optional_deadline(lifecycle_deadline) => {
+                    let now = tokio::time::Instant::now();
+                    let ready: Vec<_> = turns.iter().filter_map(|(id, turn)| {
+                        turn.lifecycle_deadline.filter(|deadline| *deadline <= now).map(|_| *id)
+                    }).collect();
+                    for id in ready {
+                        self.flush_direct_lifecycle(
+                            &mut protocol, &mut turns, &mut client, &account, Some(id), true,
+                        ).await?;
+                    }
+                }
                 _ = wait_for_optional_deadline(missing_created_deadline) => {
                     let close_downstream = self
                         .recover_or_settle_direct_end(
@@ -2588,6 +2773,9 @@ impl App {
                     }
                 } => {
                     let Some(client_message) = client_message else { break };
+                    if from_queue {
+                        queued_creates.pop_front();
+                    }
                     let client_message = client_message.context("read downstream Responses frame")?;
                     if let Message::Text(text) = &client_message {
                         let parsed = serde_json::from_str::<serde_json::Value>(text.as_str()).ok();
@@ -2694,6 +2882,11 @@ impl App {
                                     continue;
                                 }
                             };
+                            // Once turns overlap they cannot move accounts together. Release
+                            // earlier metadata before admitting the next turn, preserving wire order.
+                            self.flush_direct_lifecycle(
+                                &mut protocol, &mut turns, &mut client, &account, None, true,
+                            ).await?;
                             let turn_id = match protocol.admit_response_create(&routing_value) {
                                 Ok(turn_id) => turn_id,
                                 Err(error) => {
@@ -2717,11 +2910,18 @@ impl App {
                             missing_created_deadline = Some(
                                 tokio::time::Instant::now() + RESPONSES_MISSING_CREATED_TIMEOUT,
                             );
+                            let buffer_lifecycle = !analysis.has_file_references
+                                && !analysis.has_nonportable_state
+                                && !route.non_previous_hard_owner
+                                && (analysis.previous_response_id.is_none()
+                                    || analysis.full_resend == websocket_protocol::FullResendSafety::Eligible);
                             turns.insert(turn_id, DirectTurn {
                                 route,
                                 request: client_message,
                                 value,
                                 routing_value,
+                                lifecycle: LifecycleBuffer::new(buffer_lifecycle),
+                                lifecycle_deadline: None,
                             });
                             continue;
                         }
@@ -2777,6 +2977,11 @@ impl App {
                                 _ => None,
                             };
                             let Some(event) = parsed else {
+                                if matches!(message, Message::Text(_) | Message::Binary(_)) {
+                                    self.flush_direct_lifecycle(
+                                        &mut protocol, &mut turns, &mut client, &account, None, true,
+                                    ).await?;
+                                }
                                 client.send(message).await?;
                                 continue;
                             };
@@ -2800,13 +3005,17 @@ impl App {
                             );
                             if failure.kind != FailureKind::None && failure_turns.len() == 1 {
                                 let turn_id = failure_turns[0];
+                                let mut replay_context = ReplayContext::from_failure(&failure);
+                                replay_context.accepted_capacity_rejection = turns
+                                    .get(&turn_id)
+                                    .is_some_and(|turn| turn.lifecycle.permits_capacity_retry(&event));
                                 if let Some((replacement, replacement_account)) = self
                                     .try_replay_direct_turn(
                                         &mut protocol,
                                         &mut turns,
                                         turn_id,
                                         failure.kind,
-                                        ReplayContext::from_failure(&failure),
+                                        replay_context,
                                         &listener,
                                         &path,
                                         &headers,
@@ -2824,6 +3033,7 @@ impl App {
                                     lease.replace(account.clone()).await;
                                     upstream = replacement.socket;
                                     upstream_credentials = replacement.credentials;
+                                    awaiting_response_created = Some(turn_id);
                                     missing_created_deadline = Some(
                                         tokio::time::Instant::now()
                                             + RESPONSES_MISSING_CREATED_TIMEOUT,
@@ -2853,6 +3063,44 @@ impl App {
                             let association = protocol
                                 .observe_upstream_event(&event, anchor_hint.as_deref())
                                 .map_err(|error| anyhow::anyhow!("associate upstream event: {error:?}"))?;
+                            if association.event_type.as_deref() == Some("response.created") {
+                                for turn_id in &association.turn_ids {
+                                    if awaiting_response_created == Some(*turn_id) {
+                                        awaiting_response_created = None;
+                                        missing_created_deadline = None;
+                                        upstream_idle_deadlines.insert(
+                                            *turn_id,
+                                            tokio::time::Instant::now() + RESPONSES_UPSTREAM_IDLE_TIMEOUT,
+                                        );
+                                    }
+                                }
+                            }
+                            refresh_turn_deadlines(
+                                &mut upstream_idle_deadlines,
+                                &association.turn_ids,
+                                RESPONSES_UPSTREAM_IDLE_TIMEOUT,
+                            );
+                            if association.turn_ids.len() == 1
+                                && let Message::Text(payload) = &message
+                                && turns.get_mut(&association.turn_ids[0]).is_some_and(|turn| {
+                                    if turn.lifecycle.retain(&event, payload.as_str()) {
+                                        turn.lifecycle_deadline.get_or_insert(
+                                            tokio::time::Instant::now() + LIFECYCLE_FLUSH_DELAY,
+                                        );
+                                        true
+                                    } else { false }
+                                })
+                            {
+                                continue;
+                            }
+                            self.flush_direct_lifecycle(
+                                &mut protocol, &mut turns, &mut client, &account,
+                                match association.turn_ids.as_slice() {
+                                    [id] => Some(*id),
+                                    _ => None,
+                                },
+                                terminal_permits_affinity(&failure),
+                            ).await?;
                             if association.failure.kind == FailureKind::PreviousResponseNotFound
                                 && !association.turn_ids.is_empty()
                             {
@@ -2891,15 +3139,6 @@ impl App {
                             }
                             if association.event_type.as_deref() == Some("response.created") {
                                 for turn_id in &association.turn_ids {
-                                    if awaiting_response_created == Some(*turn_id) {
-                                        awaiting_response_created = None;
-                                        missing_created_deadline = None;
-                                        upstream_idle_deadlines.insert(
-                                            *turn_id,
-                                            tokio::time::Instant::now()
-                                                + RESPONSES_UPSTREAM_IDLE_TIMEOUT,
-                                        );
-                                    }
                                     if let Some(turn) = turns.get(turn_id) {
                                         for key in &turn.route.soft_keys {
                                             self.router.bind(key.clone(), &account).await;
@@ -2921,11 +3160,6 @@ impl App {
                                     }
                                 }
                             }
-                            refresh_turn_deadlines(
-                                &mut upstream_idle_deadlines,
-                                &association.turn_ids,
-                                RESPONSES_UPSTREAM_IDLE_TIMEOUT,
-                            );
                             client.send(message).await?;
                             for turn_id in &association.turn_ids {
                                 protocol
@@ -3011,6 +3245,50 @@ impl App {
                                 break;
                             }
                         },
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Release only after the attempt can no longer be hidden. Capacity terminals
+    /// and interrupted streams release metadata without granting success affinity.
+    async fn flush_direct_lifecycle(
+        &self,
+        protocol: &mut ProtocolState,
+        turns: &mut HashMap<TurnId, DirectTurn>,
+        client: &mut UpgradedWebSocket,
+        account: &str,
+        only: Option<TurnId>,
+        bind_affinity: bool,
+    ) -> Result<()> {
+        let ids: Vec<_> = protocol.pending().map(|turn| turn.id()).collect();
+        for id in ids {
+            if only.is_some_and(|only| only != id) {
+                continue;
+            }
+            let Some(turn) = turns.get_mut(&id) else {
+                continue;
+            };
+            let events = turn.lifecycle.release();
+            turn.lifecycle_deadline = None;
+            let keys = turn.route.soft_keys.clone();
+            for event in events {
+                client.send(Message::Text(event.payload.into())).await?;
+                protocol
+                    .mark_downstream_delivered(id, &event.value)
+                    .map_err(|error| anyhow::anyhow!("mark buffered direct event: {error:?}"))?;
+                if bind_affinity {
+                    if let Some(response_id) = websocket_protocol::response_id(&event.value) {
+                        let key = self
+                            .router
+                            .affinity
+                            .key(&format!("previous-response:{response_id}"));
+                        self.router.bind(key, account).await;
+                    }
+                    for key in &keys {
+                        self.router.bind(key.clone(), account).await;
                     }
                 }
             }
@@ -3196,28 +3474,58 @@ impl App {
                 Message::Text(serde_json::to_string(&replay_value)?.into())
             }
         };
-        let committed = protocol
-            .prepare_replay_plan(turn_id, failure, context)
-            .map_err(|error| anyhow::anyhow!("commit direct replay plan: {error:?}"))?;
-        if committed != plan {
-            anyhow::bail!("direct replay plan changed before commit")
+        // Accepted retry keeps the old attempt intact until the new request is
+        // sent. A reconnect/send failure must still expose its original terminal.
+        if !context.accepted_capacity_rejection {
+            let committed = protocol
+                .prepare_replay_plan(turn_id, failure, context)
+                .map_err(|error| anyhow::anyhow!("commit direct replay plan: {error:?}"))?;
+            if committed != plan {
+                anyhow::bail!("direct replay plan changed before commit")
+            }
         }
-        self.record_context_dispatch(
-            &replay_value,
-            &listener.pool,
-            &replacement_account,
-            &replacement.credentials,
-        )
-        .await?;
-        self.auth.ensure_bearer_usable(
+        if let Err(error) = self
+            .record_context_dispatch(
+                &replay_value,
+                &listener.pool,
+                &replacement_account,
+                &replacement.credentials,
+            )
+            .await
+        {
+            if context.accepted_capacity_rejection {
+                warn!(%error, account = replacement_account, "accepted replay context dispatch refused");
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.auth.ensure_bearer_usable(
             &self.config.accounts[&replacement_account],
             &replacement.credentials,
-        )?;
+        ) {
+            if context.accepted_capacity_rejection {
+                warn!(%error, account = replacement_account, "accepted replay bearer rejected before dispatch");
+                return Ok(None);
+            }
+            return Err(error);
+        }
         if let Err(error) = replacement.socket.send(replay_message.clone()).await {
             warn!(%error, account = replacement_account, "safe direct replay send failed");
             return Ok(None);
         }
+        if context.accepted_capacity_rejection {
+            let committed = protocol
+                .prepare_replay_plan(turn_id, failure, context)
+                .map_err(|error| anyhow::anyhow!("commit accepted direct replay: {error:?}"))?;
+            if committed != plan {
+                anyhow::bail!("direct replay plan changed before commit")
+            }
+        }
         if let Some(turn) = turns.get_mut(&turn_id) {
+            // Every replay consumes the allowance for hiding lifecycle metadata,
+            // even when the first failure happened before upstream acceptance.
+            turn.lifecycle = LifecycleBuffer::new(false);
+            turn.lifecycle_deadline = None;
             turn.request = replay_message;
             turn.value = replay_value;
             turn.route.account_id = replacement_account.clone();
@@ -3225,6 +3533,17 @@ impl App {
                 turn.route.account_generation = generation;
             }
             if mode == ReplayMode::FreshRequestWithoutPreviousResponse {
+                if let Some(previous) = turn
+                    .routing_value
+                    .get("previous_response_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let old_key = self
+                        .router
+                        .affinity
+                        .key(&format!("previous-response:{previous}"));
+                    turn.route.soft_keys.retain(|key| key != &old_key);
+                }
                 turn.routing_value
                     .as_object_mut()
                     .expect("validated response.create")
@@ -3256,6 +3575,8 @@ impl App {
         lease: &mut DirectAccountLease,
         end: UpstreamEnd,
     ) -> Result<bool> {
+        self.flush_direct_lifecycle(protocol, turns, client, account, None, false)
+            .await?;
         let watchdog = matches!(
             end,
             UpstreamEnd::MissingResponseCreatedTimeout | UpstreamEnd::UpstreamIdleTimeout
@@ -4847,6 +5168,14 @@ async fn send_ws_error(outbound: &BridgeSender, kind: &str, message: &str) {
     let _ = outbound.send(Message::Text(payload.into())).await;
 }
 
+async fn send_bridge_capacity_fallback(outbound: &BridgeSender, fallback: HttpBridgeCapacityRetry) {
+    for event in fallback.events {
+        if !outbound.send(Message::Text(event.payload.into())).await {
+            return;
+        }
+    }
+}
+
 async fn send_ws_nonretryable_liveness_error(
     outbound: &BridgeSender,
     failure: HttpBridgeLivenessFailure,
@@ -5067,6 +5396,7 @@ fn enrich_bridge_quota_payload(
     serde_json::to_string(&rewritten).unwrap_or_else(|_| payload.to_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_http_response_to_websocket(
     response: Response<ProxyBody>,
     outbound: &BridgeSender,
@@ -5075,7 +5405,8 @@ async fn pump_http_response_to_websocket(
     continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
     response_created_deadline: tokio::time::Instant,
     upstream_idle_timeout: Duration,
-) -> std::result::Result<(), HttpBridgePumpFailure> {
+    retry_policy: HttpBridgeRetryPolicy,
+) -> std::result::Result<Option<HttpBridgeCapacityRetry>, HttpBridgePumpFailure> {
     let mut capture = HttpBridgeCapture {
         capacity_observation: response
             .extensions()
@@ -5089,9 +5420,12 @@ async fn pump_http_response_to_websocket(
         response_created: false,
         progress_events: 0,
         delivery_failed: false,
+        lifecycle: LifecycleBuffer::new(retry_policy.allowed),
+        capacity_retry: None,
+        lifecycle_deadline: None,
     };
     let mut liveness = None;
-    let result: Result<()> = async {
+    let mut result: Result<()> = async {
     let status = response.status();
     let response_headers = response.headers().clone();
     let content_type = response
@@ -5217,14 +5551,22 @@ async fn pump_http_response_to_websocket(
             .response_created
             .then(|| tokio::time::Instant::now() + upstream_idle_timeout);
         loop {
-            let next_frame = if capture.response_created {
-                tokio::time::timeout_at(
-                    upstream_idle_deadline.expect("created response has idle deadline"),
-                    body.frame(),
-                )
-                .await
-            } else {
-                tokio::time::timeout_at(response_created_deadline, body.frame()).await
+            let next_frame = tokio::select! {
+                _ = wait_for_optional_deadline(capture.lifecycle_deadline) => {
+                    flush_bridge_lifecycle(outbound, app, selected_account.as_deref(),
+                        &mut capture, continuation, &response_headers, true).await?;
+                    continue;
+                }
+                frame = async {
+                    if capture.response_created {
+                        tokio::time::timeout_at(
+                            upstream_idle_deadline.expect("created response has idle deadline"),
+                            body.frame(),
+                        ).await
+                    } else {
+                        tokio::time::timeout_at(response_created_deadline, body.frame()).await
+                    }
+                } => frame,
             };
             let frame = match next_frame {
                 Ok(Some(frame)) => frame,
@@ -5326,12 +5668,27 @@ async fn pump_http_response_to_websocket(
     Ok(())
     }
     .await;
-    result.map_err(|error| HttpBridgePumpFailure {
-        error,
-        delivered_event: capture.delivered_event,
-        liveness,
-        delivery_failed: capture.delivery_failed,
-    })
+    if result.is_err() {
+        // Buffered acceptance is still accepted work. Release it before the
+        // caller chooses the nonretryable interrupted-stream settlement.
+        for buffered in capture.lifecycle.release() {
+            if !outbound.send(Message::Text(buffered.payload.into())).await {
+                capture.delivery_failed = true;
+                result = Err(anyhow::anyhow!("downstream WebSocket writer stopped"));
+                break;
+            }
+            capture.delivered_event = true;
+        }
+    }
+    result
+        .map(|()| capture.capacity_retry.take())
+        .map_err(|error| HttpBridgePumpFailure {
+            error,
+            delivered_event: capture.delivered_event,
+            liveness,
+            delivery_failed: capture.delivery_failed,
+            accepted_work: retry_policy.accepted_work || capture.response_created,
+        })
 }
 
 async fn send_protocol_events(
@@ -5358,53 +5715,128 @@ async fn send_protocol_events(
                     app.router.capacity_failure(account).await;
                 }
             }
-            // Never bind previous-response affinity nor cache a continuation
-            // for quota terminals; the account is cooling down.
-            let previous_response_id = capture.response_id.clone();
-            capture.observe(&event.value);
-            capture.response_id = previous_response_id;
-            let payload = if is_quota {
-                enrich_bridge_quota_payload(&event.payload, &event.value, response_headers)
-            } else {
-                event.payload.clone()
-            };
-            if !outbound.send(Message::Text(payload.into())).await {
-                capture.delivery_failed = true;
-                anyhow::bail!("downstream WebSocket writer stopped before event delivery")
-            }
-            capture.delivered_event = true;
-            if event.terminal.is_some() {
+            if let Some(account) = account
+                && capture.lifecycle.permits_capacity_retry(&event.value)
+            {
+                let mut events = capture.lifecycle.release();
+                events.push(BufferedEvent {
+                    payload: event.payload,
+                    value: event.value,
+                });
+                capture.capacity_retry = Some(HttpBridgeCapacityRetry {
+                    account: account.to_owned(),
+                    events,
+                });
                 return Ok(true);
             }
+        }
+        // Watchdogs and output capture observe upstream progress immediately;
+        // downstream acceptance can be delayed until this attempt commits.
+        capture.observe(&event.value);
+        if capture.lifecycle.retain(&event.value, &event.payload) {
+            capture
+                .lifecycle_deadline
+                .get_or_insert(tokio::time::Instant::now() + LIFECYCLE_FLUSH_DELAY);
             continue;
         }
-        capture.observe(&event.value);
-        if let Some(account) = account
-            && terminal_permits_affinity(&classification)
-        {
-            bind_response_id_from_event(app, &event.payload, account).await;
-        }
+        let permits_affinity = terminal_permits_affinity(&classification);
+        flush_bridge_lifecycle(
+            outbound,
+            app,
+            account,
+            capture,
+            continuation,
+            response_headers,
+            permits_affinity,
+        )
+        .await?;
         let terminal = event.terminal.is_some();
-        if event.terminal == Some(sse::TerminalStatus::Completed)
-            && terminal_permits_affinity(&classification)
-            && let Some(response_id) = capture.response_id.clone()
-        {
-            *continuation.lock().expect("bridge continuation") = Some(HttpBridgeContinuation {
-                response_id,
-                input: capture.input.clone(),
-                output: capture.output.clone(),
-            });
-        }
-        if !outbound.send(Message::Text(event.payload.into())).await {
-            capture.delivery_failed = true;
-            anyhow::bail!("downstream WebSocket writer stopped before event delivery")
-        }
-        capture.delivered_event = true;
+        deliver_bridge_event(
+            event,
+            outbound,
+            app,
+            account,
+            capture,
+            continuation,
+            response_headers,
+            permits_affinity,
+        )
+        .await?;
         if terminal {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+async fn flush_bridge_lifecycle(
+    outbound: &BridgeSender,
+    app: &Arc<App>,
+    account: Option<&str>,
+    capture: &mut HttpBridgeCapture,
+    continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
+    response_headers: &hyper::HeaderMap,
+    permits_affinity: bool,
+) -> Result<()> {
+    capture.lifecycle_deadline = None;
+    for buffered in capture.lifecycle.release() {
+        let mut event = ProtocolEvent::from_value(buffered.value)?;
+        event.payload = buffered.payload;
+        deliver_bridge_event(
+            event,
+            outbound,
+            app,
+            account,
+            capture,
+            continuation,
+            response_headers,
+            permits_affinity,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_bridge_event(
+    event: ProtocolEvent,
+    outbound: &BridgeSender,
+    app: &Arc<App>,
+    account: Option<&str>,
+    capture: &mut HttpBridgeCapture,
+    continuation: &Arc<StdMutex<Option<HttpBridgeContinuation>>>,
+    response_headers: &hyper::HeaderMap,
+    permits_affinity: bool,
+) -> Result<()> {
+    let classification = classify_terminal_event(&event.value);
+    let payload = if classification.kind == FailureKind::Quota {
+        enrich_bridge_quota_payload(&event.payload, &event.value, response_headers)
+    } else {
+        event.payload.clone()
+    };
+    // Publish continuation before queueing its terminal: the downstream can
+    // immediately send a dependent create and cancel this turn task.
+    if event.terminal == Some(sse::TerminalStatus::Completed)
+        && permits_affinity
+        && let Some(response_id) = capture.response_id.clone()
+    {
+        *continuation.lock().expect("bridge continuation") = Some(HttpBridgeContinuation {
+            response_id,
+            input: capture.input.clone(),
+            output: capture.output.clone(),
+        });
+    }
+    if !outbound.send(Message::Text(payload.into())).await {
+        capture.delivery_failed = true;
+        anyhow::bail!("downstream WebSocket writer stopped before event delivery")
+    }
+    capture.delivered_event = true;
+    if let Some(account) = account
+        && permits_affinity
+    {
+        bind_response_id_from_event(app, &event.payload, account).await;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6648,6 +7080,7 @@ mod tests {
             &continuation,
             tokio::time::Instant::now() + created_after,
             idle_for,
+            HttpBridgeRetryPolicy::default(),
         )
         .await
         .unwrap_err();
@@ -7320,6 +7753,8 @@ mod tests {
                 request: Message::Text(value.to_string().into()),
                 routing_value: value.clone(),
                 value,
+                lifecycle: LifecycleBuffer::new(true),
+                lifecycle_deadline: None,
             },
         )]);
         let failure =
@@ -7484,6 +7919,8 @@ mod tests {
                 request: Message::Text(value.to_string().into()),
                 routing_value: value.clone(),
                 value,
+                lifecycle: LifecycleBuffer::new(true),
+                lifecycle_deadline: None,
             },
         )]);
         let replayed = app
