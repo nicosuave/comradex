@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::routing::QuotaWindowStatus;
 
 pub const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const REFRESH_INTERVAL_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageSnapshot {

@@ -324,7 +324,20 @@ async fn serve(path: &Path) -> Result<()> {
                 .unwrap_or_default()
                 .as_secs();
             refresh_app.refresh_managed_accounts_at(now).await;
-            refresh_app.refresh_managed_usage_at(now).await;
+        }
+    });
+    let usage_refresh_app = app.clone();
+    let usage_refresh_background = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            comradex::usage::REFRESH_INTERVAL_SECONDS,
+        ));
+        loop {
+            interval.tick().await;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            usage_refresh_app.refresh_managed_usage_at(now).await;
         }
     });
     let listener_error = tokio::select! {
@@ -357,6 +370,8 @@ async fn serve(path: &Path) -> Result<()> {
     }
     refresh_background.abort();
     let _ = refresh_background.await;
+    usage_refresh_background.abort();
+    let _ = usage_refresh_background.await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     app.shutdown_connections().await;
