@@ -44,6 +44,8 @@ enum KeyKind {
     PromptCacheKey,
     FileId,
     Type,
+    Input,
+    EncryptedContent,
     Other,
 }
 
@@ -52,6 +54,12 @@ struct Container {
     expect_key: bool,
     file_id: Option<String>,
     account_scoped_file: bool,
+    input_array: bool,
+    native_input_item: bool,
+    reasoning: bool,
+    type_keys: usize,
+    encrypted_content: bool,
+    encrypted_content_string: bool,
 }
 
 #[derive(Default)]
@@ -78,6 +86,12 @@ struct MetadataScanner {
 }
 
 impl MetadataScanner {
+    fn finish(&mut self) {
+        // An unfinished item has not established that its encrypted payload is native
+        // reasoning; do not relax ownership for a truncated or malformed request.
+        self.nonportable_state |= self.in_string || !self.containers.is_empty();
+    }
+
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             if self.disabled {
@@ -127,6 +141,7 @@ impl MetadataScanner {
                                 | KeyKind::PromptCacheKey
                                 | KeyKind::FileId
                                 | KeyKind::Type
+                                | KeyKind::EncryptedContent
                         )
                     });
                     self.string_is_key = self.capture_value.is_none()
@@ -145,12 +160,19 @@ impl MetadataScanner {
                         continue;
                     }
                     let is_client = self.pending_value == Some(KeyKind::ClientMetadata);
+                    let native_input_item = self.containers.last().is_some_and(|v| v.input_array);
                     self.pending_value = None;
                     self.containers.push(Container {
                         object: true,
                         expect_key: true,
                         file_id: None,
                         account_scoped_file: false,
+                        input_array: false,
+                        native_input_item,
+                        reasoning: false,
+                        type_keys: 0,
+                        encrypted_content: false,
+                        encrypted_content_string: false,
                     });
                     if is_client {
                         self.client_depth = Some(self.containers.len());
@@ -162,28 +184,45 @@ impl MetadataScanner {
                         self.disabled = true;
                         continue;
                     }
+                    let input_array =
+                        self.containers.len() == 1 && self.pending_value == Some(KeyKind::Input);
                     self.pending_value = None;
                     self.containers.push(Container {
                         object: false,
                         expect_key: false,
                         file_id: None,
                         account_scoped_file: false,
+                        input_array,
+                        native_input_item: false,
+                        reasoning: false,
+                        type_keys: 0,
+                        encrypted_content: false,
+                        encrypted_content_string: false,
                     });
                 }
                 b'}' | b']' => {
                     if self.client_depth == Some(self.containers.len()) {
                         self.client_depth = None;
                     }
-                    if let Some(container) = self.containers.pop()
-                        && container.account_scoped_file
-                        && let Some(file_id) = container.file_id
-                        && !self.file_ids.contains(&file_id)
-                    {
-                        if self.file_ids.len() < 32 {
-                            self.file_ids.push(file_id);
-                        } else {
-                            self.file_ids_overflow = true;
-                            self.disabled = true;
+                    if let Some(container) = self.containers.pop() {
+                        // Only a self-contained native reasoning item directly in input may
+                        // carry portable ciphertext. Other encrypted payloads retain ownership.
+                        if container.reasoning || container.encrypted_content {
+                            self.nonportable_state |= !(container.native_input_item
+                                && container.reasoning
+                                && container.type_keys == 1
+                                && container.encrypted_content_string);
+                        }
+                        if container.account_scoped_file
+                            && let Some(file_id) = container.file_id
+                            && !self.file_ids.contains(&file_id)
+                        {
+                            if self.file_ids.len() < 32 {
+                                self.file_ids.push(file_id);
+                            } else {
+                                self.file_ids_overflow = true;
+                                self.disabled = true;
+                            }
                         }
                     }
                     self.pending_value = None;
@@ -214,6 +253,12 @@ impl MetadataScanner {
         // Also inspect an all-turns request without session metadata so it fails closed.
         self.context_envelope |= !self.string_is_key && self.token == b"all_turns";
         if let Some(kind) = self.capture_value {
+            if kind == KeyKind::EncryptedContent
+                && !self.token.is_empty()
+                && let Some(container) = self.containers.last_mut()
+            {
+                container.encrypted_content_string = true;
+            }
             if !self.token_overflow && !self.token.is_empty() {
                 let value = String::from_utf8(self.token.clone()).ok();
                 match kind {
@@ -231,9 +276,10 @@ impl MetadataScanner {
                         {
                             container.account_scoped_file =
                                 matches!(value.as_str(), "input_file" | "input_image");
+                            container.reasoning = value == "reasoning";
                             self.nonportable_state |= matches!(
                                 value.as_str(),
-                                "reasoning"
+                                "compaction"
                                     | "item_reference"
                                     | "code_interpreter_call"
                                     | "computer_call"
@@ -246,7 +292,10 @@ impl MetadataScanner {
                             );
                         }
                     }
-                    KeyKind::ClientMetadata | KeyKind::Other => {}
+                    KeyKind::ClientMetadata
+                    | KeyKind::Other
+                    | KeyKind::Input
+                    | KeyKind::EncryptedContent => {}
                 }
             }
         } else if self.string_is_key {
@@ -255,8 +304,7 @@ impl MetadataScanner {
             if !self.token_overflow
                 && (matches!(
                     self.token.as_slice(),
-                    b"encrypted_content"
-                        | b"operation_id"
+                    b"operation_id"
                         | b"codex_operation_id"
                         | b"internal_chat_message_metadata_passthrough"
                 ) || (at_root
@@ -280,7 +328,19 @@ impl MetadataScanner {
             } else if !self.token_overflow && self.token == b"file_id" {
                 Some(KeyKind::FileId)
             } else if !self.token_overflow && self.token == b"type" {
+                if let Some(container) = self.containers.last_mut() {
+                    container.type_keys += 1;
+                }
                 Some(KeyKind::Type)
+            } else if at_root && !self.token_overflow && self.token == b"input" {
+                Some(KeyKind::Input)
+            } else if !self.token_overflow && self.token == b"encrypted_content" {
+                if let Some(container) = self.containers.last_mut() {
+                    // Duplicate ciphertext properties are ambiguous to downstream parsers.
+                    self.nonportable_state |= container.encrypted_content;
+                    container.encrypted_content = true;
+                }
+                Some(KeyKind::EncryptedContent)
             } else {
                 Some(KeyKind::Other)
             };
@@ -349,6 +409,7 @@ impl ReplayBody {
         }
         let mut metadata = MetadataScanner::default();
         metadata.feed(&bytes);
+        metadata.finish();
         Ok(Self {
             len: bytes.len(),
             storage: Storage::Memory(bytes),
@@ -417,6 +478,7 @@ impl ReplayBody {
                     .await?;
             }
         }
+        metadata.finish();
         let storage = if let Some((file, path)) = temp {
             file.sync_data().await?;
             drop(file);
@@ -607,7 +669,7 @@ mod tests {
         scanner.feed(br#"{"input":[{"type":"reas"#);
         scanner.feed(br#"oning","encrypted_con"#);
         scanner.feed(br#"tent":"ciphertext"}]}"#);
-        assert!(scanner.nonportable_state);
+        assert!(!scanner.nonportable_state);
 
         let mut operation = MetadataScanner::default();
         operation
@@ -628,5 +690,52 @@ mod tests {
             br#"{"input":[{"type":"message","role":"user","content":"hello\nworld"}],"reasoning":{"effort":"high"}}"#,
         );
         assert!(!portable.nonportable_state);
+    }
+
+    #[test]
+    fn native_reasoning_exception_is_item_scoped_and_chunk_independent() {
+        let native = serde_json::json!({"type":"reasoning","id":"rs_native","summary":[{"type":"summary_text","text":"synthetic summary"}],"encrypted_content":"x".repeat(2000)});
+        for body in [
+            serde_json::json!({"input":[native.clone()]}),
+            serde_json::json!({"input":[{"encrypted_content":"opaque","summary":[],"type":"reasoning","id":"rs_last"}]}),
+        ] {
+            let bytes = serde_json::to_vec(&body).unwrap();
+            for size in [1, 7, bytes.len()] {
+                let mut scanner = MetadataScanner::default();
+                for chunk in bytes.chunks(size) {
+                    scanner.feed(chunk);
+                }
+                assert!(!scanner.nonportable_state);
+            }
+        }
+        for body in [
+            serde_json::json!({"input":[{"type":"compaction","encrypted_content":"opaque"}]}),
+            serde_json::json!({"input":[{"type":"reasoning","id":"rs_incomplete"}]}),
+            serde_json::json!({"input":[{"type":"reasoning","encrypted_content":null}]}),
+            serde_json::json!({"input":[{"type":"reasoning","encrypted_content":""}]}),
+            serde_json::json!({"input":[{"type":"function_call_output","output":[native.clone()]}]}),
+            serde_json::json!({"input":[{"type":"reasoning","encrypted_content":"opaque","extra":{"encrypted_content":"owned"}}]}),
+            serde_json::json!({"input":[{"type":"reasoning","encrypted_content":"opaque","operation_id":"op"}]}),
+            serde_json::json!({"input":[[native.clone()]]}),
+            serde_json::json!({"extra":native}),
+        ] {
+            let mut scanner = MetadataScanner::default();
+            for chunk in serde_json::to_vec(&body).unwrap().chunks(3) {
+                scanner.feed(chunk);
+            }
+            assert!(scanner.nonportable_state, "{body}");
+        }
+        for body in [
+            br#"{"input":[{"type":"compaction","type":"reasoning","encrypted_content":"opaque"}]}"#.as_slice(),
+            br#"{"input":[{"type":"reasoning","encrypted_content":"first","encrypted_content":"last"}]}"#,
+        ] {
+            let mut scanner = MetadataScanner::default();
+            scanner.feed(body);
+            assert!(scanner.nonportable_state);
+        }
+        let mut unfinished = MetadataScanner::default();
+        unfinished.feed(br#"{"input":[{"type":"reasoning","encrypted_content":"opaque""#);
+        unfinished.finish();
+        assert!(unfinished.nonportable_state);
     }
 }
