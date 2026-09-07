@@ -103,6 +103,8 @@ pub struct UiStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UiAccountStatus {
+    #[serde(default)]
+    pub reauth_required: bool,
     pub name: String,
     pub kind: UiAccountKind,
     pub signed_in: bool,
@@ -816,6 +818,10 @@ async fn build_ui_status(
                 ),
             };
             UiAccountStatus {
+                reauth_required: routing
+                    .account_states
+                    .get(name)
+                    .is_some_and(|state| state.reauth_required),
                 name: name.clone(),
                 kind,
                 signed_in,
@@ -1296,6 +1302,45 @@ path = "accounts/work"
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn ui_status_keeps_valid_bearer_signed_in_while_renewal_needs_login() {
+        use crate::auth::tests::{jwt, serve_refresh_response, test_resolver, write_managed_auth};
+        let (_dir, config, router) = managed_login_fixture();
+        let home = managed_account_home(&config, "work").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_managed_auth(home, &jwt(now + 120, "valid"));
+        let mut resolver = test_resolver(
+            &[home],
+            serve_refresh_response(
+                "401 Unauthorized",
+                serde_json::json!({"error": "refresh_token_expired"}),
+            )
+            .await,
+        );
+        resolver.health = router.auth_health.clone();
+        assert!(
+            resolver
+                .proactive_refresh_at(&config.accounts["work"], now)
+                .await
+                .is_err()
+        );
+        let manager = LoginManager::new(Arc::new(SystemLoginRunner), router.clone());
+        let status = build_ui_status(&config, &router, &Stats::default(), &manager).await;
+        let work = status
+            .accounts
+            .iter()
+            .find(|account| account.name == "work")
+            .unwrap();
+        assert!(work.signed_in);
+        assert_eq!(work.auth_state, UiAccountAuthState::SignedIn);
+        assert!(work.available);
+        assert!(work.reauth_required);
+        assert!(work.unavailable_reason.is_none());
     }
 
     #[tokio::test]

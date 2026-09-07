@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     error::Error as StdError,
     fmt, fs,
     io::Write,
@@ -45,6 +45,9 @@ const DEFAULT_OAUTH_EXPIRES_IN_SECONDS: u64 = 60 * 60;
 const MAX_OAUTH_EXPIRES_IN_SECONDS: u64 = 24 * 60 * 60;
 const ACCESS_TOKEN_EXPIRES_AT_KEY: &str = "comradex_access_token_expires_at";
 const REQUEST_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+// Retain recent rejected generations for already-resolved requests and open sockets. The
+// current rejected bearer has its own slot and cannot be evicted by late failures of old tokens.
+const RECENT_REJECTED_BEARERS_PER_HOME: usize = 16;
 
 type AuthClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -86,6 +89,95 @@ pub struct Resolver {
     client: AuthClient,
     locks: HashMap<PathBuf, Arc<Mutex<()>>>,
     refresh_url: hyper::Uri,
+    pub health: ManagedAuthHealth,
+}
+
+/// Failures belong to the credential that produced them, not to a configured alias. Comparing
+/// fingerprints with the current file also makes an external login supersede an old failure.
+#[derive(Clone, Default)]
+pub struct ManagedAuthHealth {
+    failures: Arc<std::sync::Mutex<HashMap<PathBuf, CredentialFailures>>>,
+}
+
+#[derive(Clone, Default)]
+struct CredentialFailures {
+    refresh_grant: Option<(blake3::Hash, String)>,
+    bearer: Option<blake3::Hash>,
+    recent_bearers: VecDeque<blake3::Hash>,
+}
+
+#[derive(Default)]
+pub struct ManagedAuthStatus {
+    pub reauth_required: bool,
+    pub bearer_unusable: bool,
+}
+
+fn bearer_fingerprint(credentials: &Credentials) -> blake3::Hash {
+    blake3::hash(credentials.authorization.as_bytes())
+}
+
+fn grant_fingerprint(value: &Value) -> Option<blake3::Hash> {
+    lookup(value, &["tokens", "refresh_token"]).map(|token| blake3::hash(token.as_bytes()))
+}
+
+impl ManagedAuthHealth {
+    fn failures(&self, home: &Path) -> CredentialFailures {
+        self.failures
+            .lock()
+            .unwrap()
+            .get(home)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn grant_error(&self, home: &Path, document: &AuthDocument) -> Option<anyhow::Error> {
+        self.failures(home).refresh_grant.and_then(|(grant, code)| {
+            (Some(grant) == grant_fingerprint(&document.value))
+                .then(|| ReauthRequired { code }.into())
+        })
+    }
+
+    fn rejected(&self, home: &Path, credentials: &Credentials) -> bool {
+        let fingerprint = bearer_fingerprint(credentials);
+        self.failures
+            .lock()
+            .unwrap()
+            .get(home)
+            .is_some_and(|failure| {
+                failure.bearer == Some(fingerprint) || failure.recent_bearers.contains(&fingerprint)
+            })
+    }
+
+    #[cfg(test)]
+    pub fn status(&self, home: &Path, now: u64) -> ManagedAuthStatus {
+        let Ok(home) = normalize_codex_home(home) else {
+            return ManagedAuthStatus::default();
+        };
+        self.status_normalized(&home, now)
+    }
+
+    pub fn status_normalized(&self, home: &Path, now: u64) -> ManagedAuthStatus {
+        // Healthy accounts need no filesystem reads on the routing hot path.
+        let failure = self.failures(home);
+        if failure.refresh_grant.is_none()
+            && failure.bearer.is_none()
+            && failure.recent_bearers.is_empty()
+        {
+            return ManagedAuthStatus::default();
+        }
+        let Ok(document) = read_auth(&home.join("auth.json")) else {
+            return ManagedAuthStatus {
+                reauth_required: true,
+                bearer_unusable: true,
+            };
+        };
+        let reauth_required = self.grant_error(home, &document).is_some();
+        ManagedAuthStatus {
+            reauth_required,
+            bearer_unusable: self.rejected(home, &document.credentials)
+                || (reauth_required && !access_token_unexpired_at(&document.value, now)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +244,7 @@ impl Resolver {
             client: Client::builder(TokioExecutor::new()).build(https),
             locks,
             refresh_url: REFRESH_URL.parse().expect("static refresh URL is valid"),
+            health: ManagedAuthHealth::default(),
         }
     }
 
@@ -190,14 +283,30 @@ impl Resolver {
         match account {
             AccountConfig::Inbound => inbound_credentials(inbound),
             AccountConfig::CodexHome { path } => {
+                let path = &normalize_codex_home(path)?;
                 let document = read_auth(&path.join("auth.json"))?;
-                if access_token_needs_refresh(&document.value) {
+                if access_token_needs_refresh(&document.value)
+                    || self.health.rejected(path, &document.credentials)
+                {
                     let lock = self.lock(path)?;
                     let _guard = lock.lock().await;
                     let _home_guard = HomeAuthLock::acquire_async(path).await?;
                     let current = read_auth(&path.join("auth.json"))?;
-                    if access_token_needs_refresh(&current.value) {
-                        return self.refresh(path, current, unix_now()).await;
+                    if access_token_needs_refresh(&current.value)
+                        || self.health.rejected(path, &current.credentials)
+                    {
+                        let fallback = current.credentials.clone();
+                        let expiration = access_token_expiration(&current.value, unix_now());
+                        return match self.refresh(path, current, unix_now()).await {
+                            Err(error)
+                                if is_reauth_required(&error)
+                                    && expiration.is_some_and(|expires| expires > unix_now())
+                                    && !self.health.rejected(path, &fallback) =>
+                            {
+                                Ok(fallback)
+                            }
+                            result => result,
+                        };
                     }
                     return Ok(current.credentials);
                 }
@@ -234,6 +343,9 @@ impl Resolver {
         let AccountConfig::CodexHome { path } = account else {
             return Ok(None);
         };
+        // Endpoint evidence must survive even a timeout waiting for the refresh/login lock.
+        self.reject_bearer(account, previous).await?;
+        let path = &normalize_codex_home(path)?;
         let lock = self.lock(path)?;
         let _guard = lock.lock().await;
         let _home_guard = HomeAuthLock::acquire_async(path).await?;
@@ -241,9 +353,55 @@ impl Resolver {
         if auth_failure_recovery(&current.credentials, previous)
             == AuthFailureRecovery::ReuseCurrent
         {
+            anyhow::ensure!(
+                !self.health.rejected(path, &current.credentials),
+                "current bearer was rejected by upstream"
+            );
             return Ok(Some(current.credentials));
         }
         self.refresh(path, current, unix_now()).await.map(Some)
+    }
+
+    pub async fn reject_bearer(&self, account: &AccountConfig, failed: &Credentials) -> Result<()> {
+        let AccountConfig::CodexHome { path } = account else {
+            return Ok(());
+        };
+        let path = normalize_codex_home(path)?;
+        // This records an observation, without changing auth.json or waiting for its writer.
+        // Serialize the read and fingerprint update against other rejection observations. If a
+        // login replaces the file during this read, the stored old fingerprint cannot match it.
+        let mut failures = self.health.failures.lock().unwrap();
+        let failure = failures.entry(path.clone()).or_default();
+        let fingerprint = bearer_fingerprint(failed);
+        if !failure.recent_bearers.contains(&fingerprint) {
+            failure.recent_bearers.push_back(fingerprint);
+            if failure.recent_bearers.len() > RECENT_REJECTED_BEARERS_PER_HOME {
+                failure.recent_bearers.pop_front();
+            }
+        }
+        let current = read_auth(&path.join("auth.json"))?;
+        if auth_failure_recovery(&current.credentials, failed)
+            == AuthFailureRecovery::RefreshCurrent
+        {
+            failure.bearer = Some(fingerprint);
+        }
+        Ok(())
+    }
+
+    pub fn ensure_bearer_usable(
+        &self,
+        account: &AccountConfig,
+        credentials: &Credentials,
+    ) -> Result<()> {
+        if let AccountConfig::CodexHome { path } = account {
+            anyhow::ensure!(
+                !self
+                    .health
+                    .rejected(&normalize_codex_home(path)?, credentials),
+                "access bearer was rejected by upstream"
+            );
+        }
+        Ok(())
     }
 
     /// Refresh a managed account only when its access-token JWT is within the documented safety
@@ -257,11 +415,17 @@ impl Resolver {
         let AccountConfig::CodexHome { path } = account else {
             return Ok(None);
         };
+        let path = &normalize_codex_home(path)?;
         let lock = self.lock(path)?;
         let _guard = lock.lock().await;
         let _home_guard = HomeAuthLock::acquire_async(path).await?;
         let current = read_auth(&path.join("auth.json"))?;
-        if !access_token_needs_refresh_at(&current.value, now) {
+        if let Some(error) = self.health.grant_error(path, &current) {
+            return Err(error);
+        }
+        if !access_token_needs_refresh_at(&current.value, now)
+            && !self.health.rejected(path, &current.credentials)
+        {
             return Ok(Some(ProactiveRefresh::Fresh));
         }
         self.refresh(path, current, now)
@@ -328,6 +492,9 @@ impl Resolver {
         mut document: AuthDocument,
         now: u64,
     ) -> Result<Credentials> {
+        if let Some(error) = self.health.grant_error(home, &document) {
+            return Err(error);
+        }
         let refresh_token = lookup(&document.value, &["tokens", "refresh_token"])
             .filter(|value| !value.is_empty())
             .context("Codex auth has no refresh token")?
@@ -363,9 +530,20 @@ impl Resolver {
             if status == StatusCode::UNAUTHORIZED
                 || matches!(
                     code,
-                    "refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated"
+                    "invalid_grant"
+                        | "refresh_token_expired"
+                        | "refresh_token_reused"
+                        | "refresh_token_invalidated"
                 )
             {
+                self.health
+                    .failures
+                    .lock()
+                    .unwrap()
+                    .entry(home.to_owned())
+                    .or_default()
+                    .refresh_grant =
+                    grant_fingerprint(&document.value).map(|grant| (grant, code.to_owned()));
                 return Err(ReauthRequired {
                     code: code.to_owned(),
                 }
@@ -413,7 +591,12 @@ impl Resolver {
             &home.join("auth.json"),
             &serde_json::to_vec_pretty(&document.value)?,
         )?;
-        credentials_from_value(&document.value)
+        let credentials = credentials_from_value(&document.value)?;
+        anyhow::ensure!(
+            !self.health.rejected(home, &credentials),
+            "OAuth refresh returned a rejected bearer"
+        );
+        Ok(credentials)
     }
 }
 
@@ -483,11 +666,20 @@ fn access_token_needs_refresh(value: &Value) -> bool {
 }
 
 fn access_token_needs_refresh_at(value: &Value, now: u64) -> bool {
+    access_token_expiration(value, now)
+        .is_some_and(|expiration| expiration <= now.saturating_add(REFRESH_WINDOW_SECONDS))
+}
+
+fn access_token_unexpired_at(value: &Value, now: u64) -> bool {
+    access_token_expiration(value, now).is_some_and(|expiration| expiration > now)
+}
+
+fn access_token_expiration(value: &Value, now: u64) -> Option<u64> {
     let token = lookup(value, &["tokens", "access_token"])
         .or_else(|| lookup(value, &["tokens", "accessToken"]));
     let Some(token) = token else {
         // Top-level API keys and legacy non-managed credential shapes are not refresh candidates.
-        return false;
+        return None;
     };
     let jwt_expiration = jwt_expiration(token);
     let fallback_value = value
@@ -501,12 +693,12 @@ fn access_token_needs_refresh_at(value: &Value, now: u64) -> bool {
         (Some(jwt), None) => jwt,
         (None, Some(fallback)) => fallback,
         // A persisted but malformed fallback came from a Comradex refresh and must fail closed.
-        (None, None) if fallback_value.is_some() => return true,
+        (None, None) if fallback_value.is_some() => return Some(0),
         // Preserve compatibility with existing opaque managed credentials. Every successful
         // Comradex refresh writes the bounded fallback, so only legacy/external tokens reach here.
-        (None, None) => return false,
+        (None, None) => return None,
     };
-    expiration <= now.saturating_add(REFRESH_WINDOW_SECONDS)
+    Some(expiration)
 }
 
 fn validated_expires_in(response: &Value) -> u64 {
@@ -580,16 +772,16 @@ fn lookup<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn jwt(expiration: u64, marker: &str) -> String {
+    pub(crate) fn jwt(expiration: u64, marker: &str) -> String {
         let payload = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&json!({ "exp": expiration, "marker": marker })).unwrap());
         format!("e30.{payload}.sig")
     }
 
-    fn write_managed_auth(home: &Path, access_token: &str) {
+    pub(crate) fn write_managed_auth(home: &Path, access_token: &str) {
         fs::create_dir_all(home).unwrap();
         fs::write(
             home.join("auth.json"),
@@ -604,7 +796,7 @@ mod tests {
         .unwrap();
     }
 
-    fn test_resolver(homes: &[&Path], refresh_url: hyper::Uri) -> Resolver {
+    pub(crate) fn test_resolver(homes: &[&Path], refresh_url: hyper::Uri) -> Resolver {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -623,10 +815,11 @@ mod tests {
             client: Client::builder(TokioExecutor::new()).build(https),
             locks,
             refresh_url,
+            health: ManagedAuthHealth::default(),
         }
     }
 
-    async fn serve_refresh_response(status: &str, body: Value) -> hyper::Uri {
+    pub(crate) async fn serve_refresh_response(status: &str, body: Value) -> hyper::Uri {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1048,5 +1241,274 @@ mod tests {
             lookup(&written, &["tokens", "refresh_token"]),
             Some("replacement-refresh-token")
         );
+    }
+    #[tokio::test]
+    async fn permanent_preflight_failure_keeps_unexpired_bearer_until_exact_expiry() {
+        let now = unix_now();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        let token = jwt(now + 60, "usable");
+        write_managed_auth(&home, &token);
+        let resolver = test_resolver(
+            &[&home],
+            serve_refresh_response(
+                "401 Unauthorized",
+                json!({"error": {"code": "refresh_token_expired"}}),
+            )
+            .await,
+        );
+        let account = AccountConfig::CodexHome { path: home.clone() };
+
+        // This is the request-time preflight, not just the scheduler's classifier.
+        let resolved = resolver.resolve(&account, &HeaderMap::new()).await.unwrap();
+        assert_eq!(resolved.authorization, format!("Bearer {token}"));
+        assert!(resolver.health.status(&home, now).reauth_required);
+        assert!(!resolver.health.status(&home, now + 59).bearer_unusable);
+        assert!(resolver.health.status(&home, now + 60).bearer_unusable);
+        // The one-shot OAuth server is gone. A repeated resolve must reuse the still-valid bearer.
+        assert_eq!(
+            resolver
+                .resolve(&account, &HeaderMap::new())
+                .await
+                .unwrap()
+                .authorization,
+            resolved.authorization
+        );
+        assert!(is_reauth_required(
+            &resolver
+                .proactive_refresh_at(&account, now)
+                .await
+                .unwrap_err()
+        ));
+
+        write_managed_auth(&home, &jwt(now - 1, "expired"));
+        assert!(is_reauth_required(
+            &resolver
+                .resolve(&account, &HeaderMap::new())
+                .await
+                .unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_forced_refresh_quarantines_bearer_and_replacement_supersedes_failure() {
+        for status in ["401 Unauthorized", "503 Service Unavailable"] {
+            let now = unix_now();
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("managed");
+            let token = jwt(now + 3_600, "rejected");
+            write_managed_auth(&home, &token);
+            let resolver = test_resolver(
+                &[&home],
+                serve_refresh_response(status, json!({"error": {"code": "test_failure"}})).await,
+            );
+            let account = AccountConfig::CodexHome { path: home.clone() };
+            let failed = credentials(&token);
+            assert!(resolver.force_refresh(&account, &failed).await.is_err());
+            assert!(resolver.health.status(&home, now).bearer_unusable);
+            assert!(resolver.resolve(&account, &HeaderMap::new()).await.is_err());
+
+            let replacement = jwt(now + 7_200, "new-login");
+            write_managed_auth(&home, &replacement);
+            let mut value = read_auth(&home.join("auth.json")).unwrap().value;
+            value["tokens"]["refresh_token"] = json!("replacement-grant");
+            atomic_write_auth(
+                &home.join("auth.json"),
+                &serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            // A late terminal path after that login must not disable the new credential.
+            resolver.reject_bearer(&account, &failed).await.unwrap();
+            let health = resolver.health.status(&home, now);
+            assert!(!health.bearer_unusable);
+            assert!(!health.reauth_required);
+            assert_eq!(
+                resolver
+                    .force_refresh(&account, &failed)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .authorization,
+                format!("Bearer {replacement}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_timeout_keeps_exact_bearer_quarantined() {
+        let now = unix_now();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        let token = jwt(now + 3_600, "rejected");
+        write_managed_auth(&home, &token);
+        let resolver = test_resolver(&[&home], serve_paused_refresh_response().await);
+        let account = AccountConfig::CodexHome { path: home.clone() };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                resolver.force_refresh_unbounded(&account, &credentials(&token))
+            )
+            .await
+            .is_err()
+        );
+        assert!(resolver.health.status(&home, now).bearer_unusable);
+        assert!(HomeAuthLock::try_acquire(&home).unwrap().is_some());
+        assert!(resolver.lock(&home).unwrap().try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_reuses_login_that_won_the_home_lock() {
+        let now = unix_now();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        let token = jwt(now + 3_600, "old");
+        write_managed_auth(&home, &token);
+        let resolver = test_resolver(
+            &[&home],
+            serve_refresh_response(
+                "401 Unauthorized",
+                json!({"error": "refresh_token_expired"}),
+            )
+            .await,
+        );
+        let account = AccountConfig::CodexHome { path: home.clone() };
+        // Login owns the same cross-process lock the force-refresh path must acquire.
+        let login_guard = HomeAuthLock::acquire(&home).unwrap();
+        let recovery = {
+            let resolver = resolver.clone();
+            let account = account.clone();
+            let failed = credentials(&token);
+            tokio::spawn(async move { resolver.force_refresh(&account, &failed).await })
+        };
+        let mut recovery = Box::pin(recovery);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut recovery)
+                .await
+                .is_err()
+        );
+        let replacement = jwt(now + 7_200, "replacement");
+        write_managed_auth(&home, &replacement);
+        drop(login_guard);
+        let result = recovery.await.unwrap().unwrap().unwrap();
+        assert_eq!(result.authorization, format!("Bearer {replacement}"));
+        assert!(!resolver.health.status(&home, now).bearer_unusable);
+        assert!(!resolver.health.status(&home, now).reauth_required);
+    }
+    #[tokio::test]
+    async fn login_after_failed_forced_exchange_is_not_disabled_by_late_failure_handling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let now = unix_now();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        let token = jwt(now + 3_600, "old");
+        write_managed_auth(&home, &token);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let oauth = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            let body = br#"{"error":"invalid_grant"}"#;
+            stream.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let resolver = test_resolver(
+            &[&home],
+            format!("http://{address}/oauth/token").parse().unwrap(),
+        );
+        let account = AccountConfig::CodexHome { path: home.clone() };
+        let failed = credentials(&token);
+        let recovery = {
+            let resolver = resolver.clone();
+            let account = account.clone();
+            let failed = failed.clone();
+            tokio::spawn(async move { resolver.force_refresh(&account, &failed).await })
+        };
+        started_rx.await.unwrap();
+        let login = {
+            let home = home.clone();
+            tokio::spawn(async move {
+                let _guard = HomeAuthLock::acquire_async(&home).await.unwrap();
+                atomic_write_auth(
+                    &home.join("auth.json"),
+                    &serde_json::to_vec(&json!({"tokens": {
+                        "access_token": jwt(now + 7200, "new-login"), "refresh_token": "new-grant"
+                    }}))
+                    .unwrap(),
+                )
+                .unwrap();
+            })
+        };
+        let mut login = Box::pin(login);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut login)
+                .await
+                .is_err()
+        );
+        finish_tx.send(()).unwrap();
+        assert!(is_reauth_required(&recovery.await.unwrap().unwrap_err()));
+        login.await.unwrap();
+        oauth.await.unwrap();
+        resolver.reject_bearer(&account, &failed).await.unwrap();
+        let health = resolver.health.status(&home, now);
+        assert!(!health.bearer_unusable);
+        assert!(!health.reauth_required);
+        assert_eq!(
+            resolver
+                .resolve(&account, &HeaderMap::new())
+                .await
+                .unwrap()
+                .authorization,
+            format!("Bearer {}", jwt(now + 7200, "new-login"))
+        );
+    }
+    #[tokio::test]
+    async fn forced_refresh_lock_timeout_quarantines_without_waiting_on_login() {
+        let now = unix_now();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("managed");
+        let token = jwt(now + 3_600, "rejected");
+        write_managed_auth(&home, &token);
+        let resolver = test_resolver(&[&home], "http://127.0.0.1:9/oauth/token".parse().unwrap());
+        let account = AccountConfig::CodexHome {
+            path: home.join("."),
+        };
+        let failed = credentials(&token);
+        let login_guard = HomeAuthLock::acquire(&home).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                resolver.force_refresh_unbounded(&account, &failed)
+            )
+            .await
+            .is_err()
+        );
+        assert!(resolver.health.status(&home, now).bearer_unusable);
+        // The terminal rejection path cannot depend on that same still-held home lock.
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            resolver.reject_bearer(&account, &failed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let replacement = jwt(now + 7200, "replacement");
+        write_managed_auth(&home, &replacement);
+        assert!(!resolver.health.status(&home, now).bearer_unusable);
+        let replacement = credentials(&replacement);
+        resolver
+            .reject_bearer(&account, &replacement)
+            .await
+            .unwrap();
+        resolver.reject_bearer(&account, &failed).await.unwrap();
+        assert!(
+            resolver.health.status(&home, now).bearer_unusable,
+            "late old rejection must not overwrite quarantine of a newer rejected bearer"
+        );
+        drop(login_guard);
     }
 }

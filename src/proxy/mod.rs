@@ -734,6 +734,8 @@ impl App {
             &config.proxy.affinity_key,
             Duration::from_secs(config.proxy.affinity_idle_days * 86_400),
         )?);
+        let mut auth = auth::Resolver::new(&config);
+        auth.health = router.auth_health.clone();
         Ok(Arc::new(Self {
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
@@ -755,7 +757,7 @@ impl App {
                     .unwrap_or_else(|| ".".into())
                     .join("live-calls.json"),
             ),
-            auth: auth::Resolver::new(&config),
+            auth,
             file_owners,
             context_store: context_store::ContextStore::open(
                 &state_dir.join("context.sqlite3"),
@@ -793,15 +795,13 @@ impl App {
             .fetch_add(results.len() as u64, Ordering::Relaxed);
         for (account_id, result) in results {
             match result {
-                Ok(auth::ProactiveRefresh::Fresh) => {
-                    self.router.proactive_auth_ready(&account_id).await;
-                }
+                Ok(auth::ProactiveRefresh::Fresh) => {}
                 Ok(auth::ProactiveRefresh::Refreshed) => {
                     self.stats.refresh_successes.fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .refresh_last_success_unix
                         .store(now, Ordering::Relaxed);
-                    self.router.proactive_auth_ready(&account_id).await;
+
                     info!(account = account_id, "managed credential refreshed");
                 }
                 Err(error) => {
@@ -810,7 +810,7 @@ impl App {
                         self.stats
                             .refresh_reauth_required
                             .fetch_add(1, Ordering::Relaxed);
-                        self.router.reauth_required(&account_id).await;
+
                         warn!(
                             account = account_id,
                             "managed credential requires device login"
@@ -818,6 +818,17 @@ impl App {
                     } else {
                         warn!(account = account_id, %error, "proactive credential refresh failed");
                     }
+                }
+            }
+        }
+    }
+
+    async fn reject_account_bearer(&self, account: &str, credentials: &Credentials) {
+        match &self.config.accounts[account] {
+            crate::config::AccountConfig::Inbound => self.router.auth_failure(account).await,
+            managed => {
+                if let Err(error) = self.auth.reject_bearer(managed, credentials).await {
+                    warn!(account, %error, "could not record rejected managed bearer");
                 }
             }
         }
@@ -1358,7 +1369,14 @@ impl App {
                 DirectAccountLease::new_for_selection(self.router.clone(), &selected);
             let (body, upload_progress) = progress_body(replay.body(attempt)?);
             let result = await_upstream_headers(
-                self.send_http(&method, &path, &inbound_headers, credentials.clone(), body),
+                self.send_http(
+                    &account,
+                    &method,
+                    &path,
+                    &inbound_headers,
+                    credentials.clone(),
+                    body,
+                ),
                 upload_progress,
                 HTTP_UPSTREAM_UPLOAD_IDLE_TIMEOUT,
                 HTTP_UPSTREAM_HEADERS_TIMEOUT,
@@ -1453,7 +1471,7 @@ impl App {
                             self.config.accounts[&account],
                             crate::config::AccountConfig::CodexHome { .. }
                         ) {
-                            self.router.auth_failure(&account).await;
+                            self.reject_account_bearer(&account, &credentials).await;
                         }
                         request_lease.disarm();
                         return Ok(map_http_response_leased(
@@ -1583,6 +1601,7 @@ impl App {
 
     async fn send_http(
         &self,
+        account: &str,
         method: &Method,
         path: &str,
         inbound: &hyper::HeaderMap,
@@ -1599,6 +1618,8 @@ impl App {
         headers::strip_hop_by_hop(headers);
         headers.remove(CONTENT_LENGTH);
         let _ = inbound;
+        self.auth
+            .ensure_bearer_usable(&self.config.accounts[account], &credentials)?;
         apply_credentials(headers, credentials)?;
         Ok(self.client.request(builder.body(body)?).await?)
     }
@@ -2377,6 +2398,13 @@ impl App {
             normalize_websocket_beta(upstream_req.headers_mut(), path);
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(account).await;
+            if let Err(error) = self
+                .auth
+                .ensure_bearer_usable(&self.config.accounts[account], &credentials)
+            {
+                self.router.end(account).await;
+                return Err(error);
+            }
             let connect_deadline = tokio::time::Instant::now() + connect_timeout;
             let mut response = match tokio::time::timeout_at(
                 connect_deadline,
@@ -2474,7 +2502,7 @@ impl App {
                     crate::config::AccountConfig::CodexHome { .. }
                 )
             {
-                self.router.auth_failure(account).await;
+                self.reject_account_bearer(account, &credentials).await;
             }
             anyhow::bail!("upstream WebSocket handshake failed with {status}")
         }
@@ -2612,7 +2640,9 @@ impl App {
                                     continue;
                                 }
                             };
-                            if protocol.pending_len() > 0 && route.account_id != account {
+                            let rejected_socket = self.auth.ensure_bearer_usable(
+                                &self.config.accounts[&account], &upstream_credentials).is_err();
+                            if protocol.pending_len() > 0 && (route.account_id != account || rejected_socket) {
                                 send_direct_error(
                                     &mut client,
                                     "continuity_owner_conflict",
@@ -2621,7 +2651,7 @@ impl App {
                                 .await?;
                                 continue;
                             }
-                            if protocol.pending_len() == 0 && route.account_id != account {
+                            if protocol.pending_len() == 0 && (route.account_id != account || rejected_socket) {
                                 let clear_session = route.account_id != account;
                                 let replacement = match self
                                     .connect_direct_upstream_with_selection(
@@ -2677,6 +2707,7 @@ impl App {
                                 }
                             };
                             self.record_context_dispatch(&value, &listener.pool, &account, &upstream_credentials).await?;
+                            self.auth.ensure_bearer_usable(&self.config.accounts[&account], &upstream_credentials)?;
                             upstream.send(client_message.clone()).await?;
                             if analysis.has_nonportable_state {
                                 route.hard_owner = true;
@@ -2811,7 +2842,7 @@ impl App {
                                         self.router.capacity_failure(&account).await;
                                     }
                                     FailureKind::Authentication { .. } => {
-                                        self.router.auth_failure(&account).await;
+                                        self.reject_account_bearer(&account, &upstream_credentials).await;
                                     }
                                     FailureKind::Transient => {
                                         self.router.soft_failure(&account).await;
@@ -3008,6 +3039,12 @@ impl App {
                     .await;
             }
             FailureKind::Capacity => self.router.capacity_failure(account).await,
+            FailureKind::Authentication { .. } => {
+                // Rejection evidence applies even when ownership or replay gates forbid recovery.
+                self.auth
+                    .reject_bearer(&self.config.accounts[account], failed_credentials)
+                    .await?;
+            }
             FailureKind::Transient => self.router.soft_failure(account).await,
             _ => {}
         }
@@ -3023,7 +3060,8 @@ impl App {
             Ok(plan) => plan,
             Err(_) => {
                 if matches!(failure, FailureKind::Authentication { .. }) {
-                    self.router.auth_failure(account).await;
+                    self.reject_account_bearer(account, failed_credentials)
+                        .await;
                 }
                 return Ok(None);
             }
@@ -3075,7 +3113,8 @@ impl App {
         }
         if plan.target == ReplayTarget::AlternateAccount || replacement_account.is_empty() {
             if matches!(failure, FailureKind::Authentication { .. }) {
-                self.router.auth_failure(account).await;
+                self.reject_account_bearer(account, failed_credentials)
+                    .await;
             }
             if turn_hard_owner && plan.mode == ReplayMode::OriginalRequest {
                 return Ok(None);
@@ -3170,6 +3209,10 @@ impl App {
             &replacement.credentials,
         )
         .await?;
+        self.auth.ensure_bearer_usable(
+            &self.config.accounts[&replacement_account],
+            &replacement.credentials,
+        )?;
         if let Err(error) = replacement.socket.send(replay_message.clone()).await {
             warn!(%error, account = replacement_account, "safe direct replay send failed");
             return Ok(None);
@@ -3533,6 +3576,13 @@ impl App {
             normalize_websocket_beta(upstream_req.headers_mut(), &path);
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(&selection.account_id).await;
+            if let Err(error) = self
+                .auth
+                .ensure_bearer_usable(&self.config.accounts[&selection.account_id], &credentials)
+            {
+                self.router.end(&selection.account_id).await;
+                return Err(error);
+            }
             let mut response = match self.upgrade_client.request(upstream_req).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -3673,15 +3723,18 @@ impl App {
                         }
                     }
                     Ok(None) => {
-                        self.router.auth_failure(&selection.account_id).await;
+                        self.reject_account_bearer(&selection.account_id, &credentials)
+                            .await;
                     }
                     Err(error) => {
                         warn!(account = selection.account_id, %error, "websocket credential refresh failed");
-                        self.router.auth_failure(&selection.account_id).await;
+                        self.reject_account_bearer(&selection.account_id, &credentials)
+                            .await;
                     }
                 }
             } else if !capacity && response.status() == StatusCode::UNAUTHORIZED {
-                self.router.auth_failure(&selection.account_id).await;
+                self.reject_account_bearer(&selection.account_id, &credentials)
+                    .await;
             }
             let retry = is_quota_status(response.status())
                 || is_selected_gateway_failure(response.status());
@@ -3723,7 +3776,8 @@ impl App {
                     crate::config::AccountConfig::CodexHome { .. }
                 )
             {
-                self.router.auth_failure(&selection.account_id).await;
+                self.reject_account_bearer(&selection.account_id, &credentials)
+                    .await;
             }
             return Ok(response);
         }
@@ -7209,6 +7263,187 @@ mod tests {
         assert!(!route.hard_owner);
     }
 
+    fn managed_direct_test_app(
+        dir: &std::path::Path,
+        home: &std::path::Path,
+    ) -> (Arc<App>, ListenerConfig, Arc<Router>) {
+        let (template, listener, _, _) = direct_test_app(dir);
+        let mut config = (*template.config).clone();
+        config.accounts.insert(
+            "a".into(),
+            AccountConfig::CodexHome {
+                path: home.to_owned(),
+            },
+        );
+        let config = Arc::new(config);
+        let router = Arc::new(Router::new(&config, template.router.affinity.clone()));
+        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default())).unwrap();
+        (app, listener, router)
+    }
+
+    #[tokio::test]
+    async fn direct_hard_owner_authentication_error_quarantines_without_owner_migration() {
+        use crate::auth::tests::{jwt, write_managed_auth};
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("managed");
+        let now = chrono::Utc::now().timestamp() as u64;
+        write_managed_auth(&home, &jwt(now + 3600, "rejected"));
+        let (app, listener, router) = managed_direct_test_app(dir.path(), &home);
+        let owner = router.affinity.key("turn-state:owned");
+        assert!(router.bind(owner.clone(), "a").await);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-codex-turn-state", "owned".parse().unwrap());
+        let value = serde_json::json!({"type":"response.create","input":[]});
+        let replay = ReplayBody::from_bytes(
+            Bytes::from(value.to_string()),
+            app.config.proxy.max_request_bytes,
+            app.config.proxy.max_spool_bytes,
+            app.stats.clone(),
+        )
+        .unwrap();
+        let route = app
+            .route_websocket_frame(&listener, &headers, &replay, Some("a"))
+            .await
+            .unwrap();
+        assert!(route.hard_owner && route.non_previous_hard_owner);
+        let credentials = app
+            .auth
+            .resolve(&app.config.accounts["a"], &headers)
+            .await
+            .unwrap();
+        let mut protocol = ProtocolState::new(ProtocolLimits::default()).unwrap();
+        let turn_id = protocol.admit_response_create(&value).unwrap();
+        let mut turns = HashMap::from([(
+            turn_id,
+            DirectTurn {
+                route,
+                request: Message::Text(value.to_string().into()),
+                routing_value: value.clone(),
+                value,
+            },
+        )]);
+        let failure =
+            websocket_protocol::classify_failure(&serde_json::json!({"type":"error", "error": {
+                "type":"authentication_error", "message":"Please sign in again"
+            }}));
+        assert!(matches!(
+            failure.kind,
+            FailureKind::Authentication {
+                requires_reauthentication: true
+            }
+        ));
+        let replayed = app
+            .try_replay_direct_turn(
+                &mut protocol,
+                &mut turns,
+                turn_id,
+                failure.kind,
+                ReplayContext::default(),
+                &listener,
+                "/v1/responses",
+                &headers,
+                "a",
+                &credentials,
+            )
+            .await
+            .unwrap();
+        assert!(replayed.is_none());
+        assert_eq!(turns[&turn_id].route.account_id, "a");
+        assert_eq!(router.affinity.get(&owner).await.unwrap().account_id, "a");
+        assert!(
+            router
+                .select_exact(&app.config.pools["default"], "a")
+                .await
+                .is_none()
+        );
+        assert!(
+            app.auth
+                .ensure_bearer_usable(&app.config.accounts["a"], &credentials)
+                .is_err()
+        );
+        assert_eq!(
+            router
+                .select("default", &app.config.pools["default"], None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_transient_forced_refresh_failure_recovers_on_later_sweep() {
+        use crate::auth::tests::{jwt, serve_refresh_response, test_resolver, write_managed_auth};
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("managed");
+        let now = chrono::Utc::now().timestamp() as u64;
+        write_managed_auth(&home, &jwt(now + 3600, "rejected"));
+        let (mut app, _, router) = managed_direct_test_app(dir.path(), &home);
+        let mut resolver = test_resolver(
+            &[&home],
+            serve_refresh_response(
+                "503 Service Unavailable",
+                serde_json::json!({"error":"temporarily_unavailable"}),
+            )
+            .await,
+        );
+        resolver.health = router.auth_health.clone();
+        Arc::get_mut(&mut app).unwrap().auth = resolver;
+        let failed = app
+            .auth
+            .resolve(&app.config.accounts["a"], &hyper::HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(
+            app.auth
+                .force_refresh(&app.config.accounts["a"], &failed)
+                .await
+                .is_err()
+        );
+        let state = router.routing_snapshot().await.account_states["a"].clone();
+        assert!(!state.available);
+        assert!(!state.reauth_required);
+        assert_eq!(
+            state.unavailable_reason.as_deref(),
+            Some("access_token_rejected")
+        );
+        let replacement = jwt(now + 7200, "refreshed");
+        let mut resolver = test_resolver(
+            &[&home],
+            serve_refresh_response(
+                "200 OK",
+                serde_json::json!({"access_token": replacement, "refresh_token": "new-grant"}),
+            )
+            .await,
+        );
+        resolver.health = router.auth_health.clone();
+        Arc::get_mut(&mut app).unwrap().auth = resolver;
+        app.refresh_managed_accounts_at(now).await;
+        assert_eq!(app.stats.refresh_successes.load(Ordering::Relaxed), 1);
+        let state = router.routing_snapshot().await.account_states["a"].clone();
+        assert!(state.available);
+        assert!(!state.reauth_required);
+        assert!(
+            router
+                .select_exact(&app.config.pools["default"], "a")
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            app.auth
+                .resolve(&app.config.accounts["a"], &hyper::HeaderMap::new())
+                .await
+                .unwrap()
+                .authorization,
+            format!("Bearer {replacement}")
+        );
+        assert!(
+            app.auth
+                .ensure_bearer_usable(&app.config.accounts["a"], &failed)
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn direct_hard_owner_quota_marks_account_without_cross_account_replay() {
         let dir = tempfile::tempdir().unwrap();
@@ -8707,6 +8942,181 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             *seen.lock().unwrap(),
             ["Bearer stale-token", "Bearer fresh-token"]
         );
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_preflight_failure_routes_valid_bearer_then_quarantines_real_401() {
+        use crate::auth::tests::{jwt, serve_refresh_response, test_resolver, write_managed_auth};
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let home = dir.path().join("managed");
+        write_managed_auth(&home, &jwt(now + 120, "valid"));
+        let reject = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicU64::new(0));
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = {
+            let reject = reject.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = upstream.accept().await.unwrap();
+                    let reject = reject.clone();
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |_request: Request<Incoming>| {
+                            seen.fetch_add(1, Ordering::Relaxed);
+                            let status = if reject.load(Ordering::Relaxed) {
+                                StatusCode::UNAUTHORIZED
+                            } else {
+                                StatusCode::OK
+                            };
+                            async move {
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(status)
+                                        .body(Full::new(Bytes::from_static(b"{}")))
+                                        .unwrap(),
+                                )
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            })
+        };
+        let (template, mut listener, _, _) = direct_test_app_with_upstream(
+            dir.path(),
+            format!("http://{upstream_addr}/backend-api/codex"),
+        );
+        let mut config = (*template.config).clone();
+        config.accounts =
+            BTreeMap::from([("a".into(), AccountConfig::CodexHome { path: home.clone() })]);
+        config.pools.get_mut("default").unwrap().members = vec!["a".into()];
+        let config = Arc::new(config);
+        let router = Arc::new(Router::new(&config, template.router.affinity.clone()));
+        let mut app =
+            App::new_unvalidated(config.clone(), router.clone(), Arc::new(Stats::default()))
+                .unwrap();
+        let mut resolver = test_resolver(
+            &[&home],
+            serve_refresh_response(
+                "401 Unauthorized",
+                serde_json::json!({"error": "refresh_token_expired"}),
+            )
+            .await,
+        );
+        resolver.health = router.auth_health.clone();
+        Arc::get_mut(&mut app).unwrap().auth = resolver;
+        let key = router.affinity.key("owned-thread");
+        assert!(router.bind(key.clone(), "a").await);
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = proxy_tcp.local_addr().unwrap();
+        listener.address = address;
+        let proxy_task = tokio::spawn(app.clone().serve_tcp("default".into(), listener, proxy_tcp));
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/0123456789abcdef/v1/models");
+
+        // The OAuth preflight really fails, while the bearer succeeds at the product endpoint.
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        app.refresh_managed_accounts_at(now).await;
+        let snapshot = router.routing_snapshot().await;
+        assert!(snapshot.account_states["a"].available);
+        assert!(snapshot.account_states["a"].reauth_required);
+        assert!(!router.accounts_needing_login().await.contains("a"));
+        let selected = router
+            .select_exact(&config.pools["default"], "a")
+            .await
+            .unwrap();
+        assert!(
+            router
+                .validate_selection(&selected, "default", &config.pools["default"])
+                .await
+                .is_ok()
+        );
+        assert!(
+            router
+                .context_account_available(&config.pools["default"], "a")
+                .await
+        );
+
+        reject.store(true, Ordering::Relaxed);
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(!router.routing_snapshot().await.account_states["a"].available);
+        assert!(
+            router
+                .select_exact(&config.pools["default"], "a")
+                .await
+                .is_none()
+        );
+        assert!(
+            router
+                .validate_selection(&selected, "default", &config.pools["default"])
+                .await
+                .is_err()
+        );
+        assert!(
+            !router
+                .context_account_available(&config.pools["default"], "a")
+                .await
+        );
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        assert_eq!(router.affinity.get(&key).await.unwrap().account_id, "a");
+
+        // A replacement login recovers immediately; a stale terminal rejection cannot disable it.
+        let old = crate::auth::Credentials {
+            authorization: format!("Bearer {}", jwt(now + 120, "valid")),
+            account_id: None,
+        };
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec(&serde_json::json!({"tokens": {
+                "access_token": jwt(now + 3600, "replacement"), "refresh_token": "new-grant"
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        app.reject_account_bearer("a", &old).await;
+        let snapshot = router.routing_snapshot().await;
+        assert!(snapshot.account_states["a"].available);
+        assert!(!snapshot.account_states["a"].reauth_required);
+        assert!(
+            app.send_http(
+                "a",
+                &Method::GET,
+                "/v1/models",
+                &hyper::HeaderMap::new(),
+                old,
+                empty_body()
+            )
+            .await
+            .is_err(),
+            "an already-resolved rejected bearer must not reach upstream after login"
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        reject.store(false, Ordering::Relaxed);
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 3);
         proxy_task.abort();
         upstream_task.abort();
     }

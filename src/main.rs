@@ -613,7 +613,11 @@ fn stderr_timestamp_suffix(timestamp: Option<u64>) -> String {
 
 fn account_availability(status: &comradex::routing::AccountRoutingStatus) -> String {
     if status.available {
-        return String::new();
+        return if status.reauth_required {
+            "; sign-in needed for renewal (current access still usable)".to_owned()
+        } else {
+            String::new()
+        };
     }
     let reason = match status
         .unavailable_reason
@@ -624,6 +628,7 @@ fn account_availability(status: &comradex::routing::AccountRoutingStatus) -> Str
         "temporary_failure" => "temporarily unavailable",
         "login_in_progress" => "login in progress",
         "needs_login" => "sign-in required",
+        "access_token_rejected" => "access token rejected",
         reason => reason,
     };
     let retry = status.retry_at_unix.and_then(|deadline| {
@@ -908,6 +913,19 @@ fn state_dir(config: &Config) -> PathBuf {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn available_bearer_reports_renewal_login_separately() {
+        let status = comradex::routing::AccountRoutingStatus {
+            available: true,
+            reauth_required: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            account_availability(&status),
+            "; sign-in needed for renewal (current access still usable)"
+        );
+    }
 
     #[test]
     fn managed_login_holds_auth_lock_for_entire_child_action() {
