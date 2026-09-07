@@ -138,6 +138,7 @@ impl App {
         for attempt in 0..2 {
             let response = self
                 .send_http(
+                    &owner.alias,
                     &Method::POST,
                     path,
                     headers,
@@ -145,21 +146,25 @@ impl App {
                     bytes_body(bytes.clone()),
                 )
                 .await?;
-            if response.status() == StatusCode::UNAUTHORIZED
-                && attempt == 0
-                && let Some(refreshed) = self
-                    .auth
-                    .force_refresh(&self.config.accounts[&owner.alias], &credentials)
-                    .await?
-            {
-                anyhow::ensure!(
-                    self.context_store
-                        .physical_key(&refreshed.context_identity()?)
-                        == owner.physical_id,
-                    "context owner unavailable"
-                );
-                credentials = refreshed;
-                continue;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                if attempt == 0
+                    && let Some(refreshed) = self
+                        .auth
+                        .force_refresh(&self.config.accounts[&owner.alias], &credentials)
+                        .await?
+                {
+                    anyhow::ensure!(
+                        self.context_store
+                            .physical_key(&refreshed.context_identity()?)
+                            == owner.physical_id,
+                        "context owner unavailable"
+                    );
+                    credentials = refreshed;
+                    continue;
+                }
+                self.auth
+                    .reject_bearer(&self.config.accounts[&owner.alias], &credentials)
+                    .await?;
             }
             return Ok(response);
         }

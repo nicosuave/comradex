@@ -13,7 +13,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::{
-    config::{Config, PoolConfig},
+    auth::{ManagedAuthHealth, ManagedAuthStatus},
+    config::{AccountConfig, Config, PoolConfig, normalize_codex_home},
     routing::{AffinityStore, ThreadKey},
 };
 
@@ -85,6 +86,8 @@ pub struct RoutingSnapshot {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRoutingStatus {
+    #[serde(default)]
+    pub reauth_required: bool,
     pub available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
@@ -110,6 +113,8 @@ pub struct QuotaWindowStatus {
 
 #[derive(Debug, Default)]
 struct AccountRuntime {
+    reauth_required: bool,
+    bearer_unusable: bool,
     usage: Option<u8>,
     inflight: u64,
     last_assigned: u64,
@@ -188,6 +193,8 @@ struct WindowEvidence {
 type QuotaEvidence = HashMap<QuotaWindow, WindowEvidence>;
 
 pub struct Router {
+    pub auth_health: ManagedAuthHealth,
+    managed_homes: HashMap<String, std::path::PathBuf>,
     pub affinity: Arc<AffinityStore>,
     accounts: Mutex<HashMap<String, AccountRuntime>>,
     preferred: Mutex<HashMap<String, String>>,
@@ -197,9 +204,44 @@ pub struct Router {
     switch_at: u8,
 }
 
+impl AccountRuntime {
+    fn auth_unavailable(&self) -> bool {
+        self.needs_login || self.bearer_unusable
+    }
+}
+
 impl Router {
+    async fn account_runtimes(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<String, AccountRuntime>> {
+        let mut accounts = self.accounts.lock().await;
+        let now = Utc::now().timestamp().max(0) as u64;
+        for (name, runtime) in accounts.iter_mut() {
+            let status = match self.managed_homes.get(name) {
+                Some(path) => self.auth_health.status_normalized(path, now),
+                _ => ManagedAuthStatus::default(),
+            };
+            runtime.reauth_required = status.reauth_required;
+            runtime.bearer_unusable = status.bearer_unusable;
+        }
+        accounts
+    }
+
     pub fn new(config: &Config, affinity: Arc<AffinityStore>) -> Self {
         Self {
+            auth_health: ManagedAuthHealth::default(),
+            managed_homes: config
+                .accounts
+                .iter()
+                .filter_map(|(name, account)| {
+                    let AccountConfig::CodexHome { path } = account else {
+                        return None;
+                    };
+                    normalize_codex_home(path)
+                        .ok()
+                        .map(|home| (name.clone(), home))
+                })
+                .collect(),
             affinity,
             accounts: Mutex::new(
                 config
@@ -268,7 +310,7 @@ impl Router {
             Some(binding) => Some(self.affinity.account_epoch(&binding.account_id).await),
             None => None,
         };
-        let mut accounts = self.accounts.lock().await;
+        let mut accounts = self.account_runtimes().await;
         for runtime in accounts.values_mut() {
             if runtime.needs_login
                 && runtime
@@ -285,7 +327,7 @@ impl Router {
                 && pool.members.contains(&binding.account_id)
                 && accounts.get(&binding.account_id).is_some_and(|a| {
                     binding_epoch == Some(binding.account_generation)
-                        && !a.needs_login
+                        && !a.auth_unavailable()
                         && !a.login_in_progress
                         && a.quota_until.is_none_or(|v| v <= now)
                 });
@@ -306,7 +348,7 @@ impl Router {
         let eligible = |id: &str| {
             exclude != Some(id)
                 && accounts.get(id).is_some_and(|a| {
-                    !a.needs_login
+                    !a.auth_unavailable()
                         && !a.login_in_progress
                         && a.quota_until.is_none_or(|v| v <= now)
                         && a.avoid_until.is_none_or(|v| v <= now)
@@ -409,7 +451,7 @@ impl Router {
     pub async fn routing_snapshot(&self) -> RoutingSnapshot {
         let now = Instant::now();
         let wall_now = Utc::now();
-        let mut accounts = self.accounts.lock().await;
+        let mut accounts = self.account_runtimes().await;
         for runtime in accounts.values_mut() {
             reconcile_runtime(runtime, now, wall_now);
         }
@@ -484,7 +526,7 @@ impl Router {
             avoid_blocked: bool,
         }
         let probe = {
-            let mut accounts = self.accounts.lock().await;
+            let mut accounts = self.account_runtimes().await;
             let wall_now = Utc::now();
             for runtime in accounts.values_mut() {
                 reconcile_runtime(runtime, now, wall_now);
@@ -492,7 +534,7 @@ impl Router {
             match accounts.get(&selection.account_id) {
                 Some(runtime) => RuntimeProbe {
                     known: true,
-                    needs_login: runtime.needs_login,
+                    needs_login: runtime.auth_unavailable(),
                     login_in_progress: runtime.login_in_progress,
                     quota_blocked: runtime.quota_until.is_some_and(|until| until > now),
                     avoid_blocked: runtime.avoid_until.is_some_and(|until| until > now),
@@ -569,9 +611,9 @@ impl Router {
                 && pool.members.contains(&preferred_id)
             {
                 let preferred_eligible = {
-                    let accounts = self.accounts.lock().await;
+                    let accounts = self.account_runtimes().await;
                     accounts.get(&preferred_id).is_some_and(|runtime| {
-                        !runtime.needs_login
+                        !runtime.auth_unavailable()
                             && !runtime.login_in_progress
                             && runtime.quota_until.is_none_or(|until| until <= now)
                             && runtime.avoid_until.is_none_or(|until| until <= now)
@@ -583,7 +625,7 @@ impl Router {
                 };
                 if preferred_eligible {
                     let usage_ok = {
-                        let accounts = self.accounts.lock().await;
+                        let accounts = self.account_runtimes().await;
                         accounts
                             .get(&preferred_id)
                             .and_then(|runtime| runtime.usage)
@@ -615,14 +657,14 @@ impl Router {
     ) -> Result<(), SelectionStaleReason> {
         let now = Instant::now();
         let probe = {
-            let mut accounts = self.accounts.lock().await;
+            let mut accounts = self.account_runtimes().await;
             let wall_now = Utc::now();
             for runtime in accounts.values_mut() {
                 reconcile_runtime(runtime, now, wall_now);
             }
             accounts.get(account).map(|runtime| {
                 (
-                    runtime.needs_login,
+                    runtime.auth_unavailable(),
                     runtime.login_in_progress,
                     runtime.quota_until.is_some_and(|until| until > now),
                     runtime.avoid_until.is_some_and(|until| until > now),
@@ -661,11 +703,10 @@ impl Router {
 
     /// Accounts the router currently excludes because their credentials need repair.
     pub async fn accounts_needing_login(&self) -> BTreeSet<String> {
-        self.accounts
-            .lock()
+        self.account_runtimes()
             .await
             .iter()
-            .filter(|(_, runtime)| runtime.needs_login)
+            .filter(|(_, runtime)| runtime.auth_unavailable())
             .map(|(account, _)| account.clone())
             .collect()
     }
@@ -674,11 +715,10 @@ impl Router {
     pub async fn context_account_available(&self, pool: &PoolConfig, account: &str) -> bool {
         pool.members.iter().any(|member| member == account)
             && self
-                .accounts
-                .lock()
+                .account_runtimes()
                 .await
                 .get(account)
-                .is_some_and(|runtime| !runtime.needs_login && !runtime.login_in_progress)
+                .is_some_and(|runtime| !runtime.auth_unavailable() && !runtime.login_in_progress)
     }
 
     pub async fn begin(&self, account: &str) {
@@ -698,13 +738,13 @@ impl Router {
     pub async fn select_exact(&self, pool: &PoolConfig, account: &str) -> Option<Selection> {
         let now = Instant::now();
         let wall_now = Utc::now();
-        let mut accounts = self.accounts.lock().await;
+        let mut accounts = self.account_runtimes().await;
         if let Some(runtime) = accounts.get_mut(account) {
             reconcile_expired_quota(runtime, now, wall_now);
         }
         let eligible = pool.members.iter().any(|v| v == account)
             && accounts.get(account).is_some_and(|a| {
-                !a.needs_login
+                !a.auth_unavailable()
                     && !a.login_in_progress
                     && a.quota_until.is_none_or(|v| v <= now)
                     && a.avoid_until.is_none_or(|v| v <= now)
@@ -890,8 +930,10 @@ fn account_routing_status(
 ) -> AccountRoutingStatus {
     let (unavailable_reason, retry_at) = if runtime.login_in_progress {
         (Some("login_in_progress".to_owned()), None)
-    } else if runtime.needs_login {
+    } else if runtime.needs_login || (runtime.bearer_unusable && runtime.reauth_required) {
         (Some("needs_login".to_owned()), runtime.needs_login_retry_at)
+    } else if runtime.bearer_unusable {
+        (Some("access_token_rejected".to_owned()), None)
     } else if runtime.quota_until.is_some_and(|until| until > now) {
         (Some("quota".to_owned()), runtime.quota_until)
     } else if runtime.avoid_until.is_some_and(|until| until > now) {
@@ -921,6 +963,7 @@ fn account_routing_status(
         })
         .collect();
     AccountRoutingStatus {
+        reauth_required: runtime.reauth_required,
         available: unavailable_reason.is_none(),
         unavailable_reason,
         retry_at_unix,
