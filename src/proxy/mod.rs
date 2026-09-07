@@ -7753,6 +7753,8 @@ mod tests {
                 request: Message::Text(value.to_string().into()),
                 routing_value: value.clone(),
                 value,
+                lifecycle: LifecycleBuffer::new(true),
+                lifecycle_deadline: None,
             },
         )]);
         let failure =
