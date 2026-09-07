@@ -326,6 +326,20 @@ async fn serve(path: &Path) -> Result<()> {
             refresh_app.refresh_managed_accounts_at(now).await;
         }
     });
+    let usage_refresh_app = app.clone();
+    let usage_refresh_background = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            comradex::usage::REFRESH_INTERVAL_SECONDS,
+        ));
+        loop {
+            interval.tick().await;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            usage_refresh_app.refresh_managed_usage_at(now).await;
+        }
+    });
     let listener_error = tokio::select! {
         signal = shutdown_signal() => {
             signal?;
@@ -356,6 +370,8 @@ async fn serve(path: &Path) -> Result<()> {
     }
     refresh_background.abort();
     let _ = refresh_background.await;
+    usage_refresh_background.abort();
+    let _ = usage_refresh_background.await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     app.shutdown_connections().await;
@@ -539,14 +555,9 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         } else {
             format!("pool {}", pools.join(", "))
         };
-        let availability = routing
-            .and_then(|routing| routing.account_states.get(name))
-            .map(account_availability)
-            .unwrap_or_default();
-        println!(
-            "  {name:width$}  {:24}  {pools}{availability}",
-            account_state(account)
-        );
+        let routing_status = routing.and_then(|routing| routing.account_states.get(name));
+        let state = account_status_state(account, routing_status);
+        println!("  {name:width$}  {:36}  {pools}", state);
     }
 
     println!("\npools");
@@ -593,10 +604,22 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
                 stats.refresh_failures,
                 stats.refresh_reauth_required,
             );
+            println!(
+                "  usage fetcher: {} account check(s), {} succeeded, {} failure(s)",
+                stats.usage_fetch_accounts_checked,
+                stats.usage_fetch_successes,
+                stats.usage_fetch_failures,
+            );
             if stats.refresh_last_sweep_unix > 0 {
                 println!(
                     "  last refresh sweep unix {}, last successful refresh unix {}",
                     stats.refresh_last_sweep_unix, stats.refresh_last_success_unix
+                );
+            }
+            if stats.usage_fetch_last_success_unix > 0 {
+                println!(
+                    "  last successful usage fetch unix {}",
+                    stats.usage_fetch_last_success_unix
                 );
             }
         }
@@ -639,6 +662,93 @@ fn account_availability(status: &comradex::routing::AccountRoutingStatus) -> Str
     match retry {
         Some(retry) => format!("; {reason}, retry in {retry}"),
         None => format!("; {reason}"),
+    }
+}
+
+fn account_status_state(
+    account: &comradex::config::AccountConfig,
+    status: Option<&comradex::routing::AccountRoutingStatus>,
+) -> String {
+    if matches!(account, comradex::config::AccountConfig::Inbound) {
+        return "Codex App login".to_owned();
+    }
+    let Some(status) = status else {
+        return match account {
+            comradex::config::AccountConfig::CodexHome { path }
+                if path.join("auth.json").exists() =>
+            {
+                "usage unavailable".to_owned()
+            }
+            _ => "sign-in required".to_owned(),
+        };
+    };
+    let availability = account_availability(status);
+    if !availability.is_empty() {
+        return availability
+            .strip_prefix("; ")
+            .unwrap_or(&availability)
+            .to_owned();
+    }
+    usage_remaining_summary(status).unwrap_or_else(|| "usage pending".to_owned())
+}
+
+fn usage_remaining_summary(status: &comradex::routing::AccountRoutingStatus) -> Option<String> {
+    let mut windows = status
+        .usage_windows
+        .iter()
+        .filter_map(|(name, window)| window.used_percent.map(|used| (name, window, used)))
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|(name, window, _)| {
+        (
+            window.limit_window_seconds.unwrap_or(u64::MAX),
+            name.as_str(),
+        )
+    });
+    if windows.is_empty() {
+        return status
+            .usage_percent
+            .map(|used| format!("{}% left", 100_u8.saturating_sub(used)));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Some(
+        windows
+            .into_iter()
+            .map(|(name, window, used)| {
+                let label = usage_window_label(name, window.limit_window_seconds);
+                let remaining = 100_u8.saturating_sub(used);
+                match window
+                    .reset_at_unix
+                    .and_then(|reset| u64::try_from(reset).ok())
+                {
+                    Some(reset) if reset > now => format!(
+                        "{label} {remaining}% left (resets in {})",
+                        compact_duration(reset - now)
+                    ),
+                    _ => format!("{label} {remaining}% left"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+fn usage_window_label(name: &str, seconds: Option<u64>) -> String {
+    match seconds {
+        Some(seconds) if seconds % 86_400 == 0 => format!("{}d", seconds / 86_400),
+        Some(seconds) if seconds % 3_600 == 0 => format!("{}h", seconds / 3_600),
+        _ => name.to_owned(),
+    }
+}
+
+fn compact_duration(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86_400 => format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60),
+        _ => format!("{}d {}h", seconds / 86_400, (seconds % 86_400) / 3600),
     }
 }
 
@@ -912,6 +1022,7 @@ fn state_dir(config: &Config) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
 
     #[test]
@@ -924,6 +1035,58 @@ mod tests {
         assert_eq!(
             account_availability(&status),
             "; sign-in needed for renewal (current access still usable)"
+        );
+    }
+
+    #[test]
+    fn account_status_shows_remaining_quota_instead_of_signed_in() {
+        let account = comradex::config::AccountConfig::CodexHome {
+            path: PathBuf::from("managed"),
+        };
+        let status = comradex::routing::AccountRoutingStatus {
+            available: true,
+            usage_windows: BTreeMap::from([
+                (
+                    "primary".to_owned(),
+                    comradex::routing::QuotaWindowStatus {
+                        used_percent: Some(19),
+                        limit_window_seconds: Some(18_000),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "secondary".to_owned(),
+                    comradex::routing::QuotaWindowStatus {
+                        used_percent: Some(81),
+                        limit_window_seconds: Some(604_800),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            account_status_state(&account, Some(&status)),
+            "5h 81% left; 7d 19% left"
+        );
+    }
+
+    #[test]
+    fn account_status_authentication_error_hides_stale_usage() {
+        let account = comradex::config::AccountConfig::CodexHome {
+            path: PathBuf::from("managed"),
+        };
+        let status = comradex::routing::AccountRoutingStatus {
+            available: false,
+            unavailable_reason: Some("needs_login".to_owned()),
+            usage_percent: Some(12),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            account_status_state(&account, Some(&status)),
+            "sign-in required"
         );
     }
 

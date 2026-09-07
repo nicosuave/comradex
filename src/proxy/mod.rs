@@ -28,14 +28,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
     body::{Body, Frame, Incoming, SizeHint},
     header::{
-        AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION,
+        ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION,
         SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
     },
     service::service_fn,
@@ -68,6 +68,7 @@ use crate::{
     },
     state::Stats,
     transport::{codex_http_connector, codex_websocket_connector},
+    usage,
 };
 use accepted_retry::{BufferedEvent, LifecycleBuffer};
 use replay_body::{ProxyBody, ReplayBody, bytes_body, empty_body, incoming_body, json_body};
@@ -97,6 +98,10 @@ const HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS: usize = 4_096;
 // spends a long time before its first output. A delayed rejection simply loses
 // eligibility for transparent retry once this metadata has been released.
 const LIFECYCLE_FLUSH_DELAY: Duration = Duration::from_secs(1);
+const USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+const USAGE_FETCH_ACCOUNT_TIMEOUT: Duration = Duration::from_secs(40);
+const MAX_USAGE_RESPONSE_BYTES: usize = 1024 * 1024;
+const USAGE_FETCH_CONCURRENCY: usize = 4;
 
 fn is_direct_hard_continuity(kind: metadata::AffinityKind) -> bool {
     matches!(
@@ -732,6 +737,7 @@ pub struct App {
     next_bridge_session_id: AtomicU64,
     live_calls: LiveCallStore,
     auth: auth::Resolver,
+    usage_url: Uri,
     file_owners: Arc<AffinityStore>,
     context_store: context_store::ContextStore,
     context_codec: context_codec::ContextCodec,
@@ -792,6 +798,7 @@ impl App {
                     .join("live-calls.json"),
             ),
             auth,
+            usage_url: usage::USAGE_URL.parse().expect("static usage URL is valid"),
             file_owners,
             context_store: context_store::ContextStore::open(
                 &state_dir.join("context.sqlite3"),
@@ -855,6 +862,122 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Fetch authoritative quota windows independently of inference traffic. A bounded amount of
+    /// parallelism prevents one slow identity from delaying every other account while avoiding an
+    /// unbounded burst for large configurations.
+    pub async fn refresh_managed_usage_at(&self, now: u64) {
+        let accounts = self
+            .config
+            .accounts
+            .iter()
+            .filter(|(_, account)| {
+                matches!(account, crate::config::AccountConfig::CodexHome { .. })
+            })
+            .map(|(account_id, account)| (account_id.clone(), account.clone()))
+            .collect::<Vec<_>>();
+        self.stats
+            .usage_fetch_accounts_checked
+            .fetch_add(accounts.len() as u64, Ordering::Relaxed);
+
+        let results = futures_util::stream::iter(accounts)
+            .map(|(account_id, account)| async move {
+                let result = tokio::time::timeout(
+                    USAGE_FETCH_ACCOUNT_TIMEOUT,
+                    self.fetch_managed_usage_account(&account_id, &account, now),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "usage fetch timed out after {} ms",
+                        USAGE_FETCH_ACCOUNT_TIMEOUT.as_millis()
+                    ))
+                });
+                (account_id, result)
+            })
+            .buffer_unordered(USAGE_FETCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (account_id, result) in results {
+            match result {
+                Ok(()) => {
+                    self.stats
+                        .usage_fetch_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .usage_fetch_last_success_unix
+                        .store(now, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    self.stats
+                        .usage_fetch_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(account = account_id, %error, "managed account usage fetch failed");
+                }
+            }
+        }
+    }
+
+    async fn fetch_managed_usage_account(
+        &self,
+        account_id: &str,
+        account: &crate::config::AccountConfig,
+        now: u64,
+    ) -> Result<()> {
+        let inbound = hyper::HeaderMap::new();
+        let mut credentials = self.auth.resolve(account, &inbound).await?;
+        let (mut status, mut bytes) = self.fetch_usage_once(&credentials).await?;
+        if status == StatusCode::UNAUTHORIZED {
+            credentials = self
+                .auth
+                .force_refresh(account, &credentials)
+                .await?
+                .context("managed account did not provide refreshable credentials")?;
+            (status, bytes) = self.fetch_usage_once(&credentials).await?;
+        }
+        if !status.is_success() {
+            bail!("Codex usage endpoint returned HTTP {status}")
+        }
+        let observed_at_unix = i64::try_from(now).unwrap_or(i64::MAX);
+        let snapshot = usage::parse_usage_response(&bytes, observed_at_unix)?;
+        self.router
+            .observe_usage_snapshot(account_id, snapshot)
+            .await;
+        Ok(())
+    }
+
+    async fn fetch_usage_once(&self, credentials: &Credentials) -> Result<(StatusCode, Vec<u8>)> {
+        let mut request = Request::get(self.usage_url.clone())
+            .header(AUTHORIZATION, credentials.authorization.as_str())
+            .header(ACCEPT, "application/json");
+        if let Some(account_id) = credentials.account_id.as_deref() {
+            request = request.header("chatgpt-account-id", account_id);
+        }
+        let response = tokio::time::timeout(
+            USAGE_FETCH_TIMEOUT,
+            self.client.request(request.body(empty_body())?),
+        )
+        .await
+        .context("Codex usage request timed out")??;
+        let status = response.status();
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(frame) = tokio::time::timeout(USAGE_FETCH_TIMEOUT, body.frame())
+            .await
+            .context("Codex usage response body timed out")?
+        {
+            let frame = frame?;
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            if bytes.len().saturating_add(data.len()) > MAX_USAGE_RESPONSE_BYTES {
+                bail!("Codex usage response exceeds configured safety limit")
+            }
+            bytes.extend_from_slice(&data);
+        }
+        Ok((status, bytes))
     }
 
     async fn reject_account_bearer(&self, account: &str, credentials: &Credentials) {
@@ -6012,7 +6135,10 @@ mod tests {
     use http_body_util::{BodyExt, Full};
     use hyper_util::client::legacy::{Client as TestClient, connect::HttpConnector};
     use std::{collections::BTreeMap, fs, path::PathBuf, sync::Mutex, time::Duration};
-    use tokio::{io::AsyncWriteExt, net::TcpStream};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     #[derive(Clone, Debug)]
@@ -7712,6 +7838,278 @@ mod tests {
         let router = Arc::new(Router::new(&config, template.router.affinity.clone()));
         let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default())).unwrap();
         (app, listener, router)
+    }
+
+    #[tokio::test]
+    async fn managed_usage_fetches_each_account_and_isolates_failures() {
+        use crate::auth::tests::jwt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let home_a = dir.path().join("managed-a");
+        let home_b = dir.path().join("managed-b");
+        for (home, token, account_id) in [
+            (&home_a, jwt(now + 3_600, "usage-a"), "workspace-a"),
+            (&home_b, jwt(now + 3_600, "usage-b"), "workspace-b"),
+        ] {
+            fs::create_dir_all(home).unwrap();
+            fs::write(
+                home.join("auth.json"),
+                serde_json::to_vec(&serde_json::json!({"tokens": {
+                    "access_token": token,
+                    "refresh_token": "test-refresh-token",
+                    "account_id": account_id
+                }}))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let (template, _, _, _) = direct_test_app(dir.path());
+        let mut config = (*template.config).clone();
+        config.accounts = BTreeMap::from([
+            ("a".into(), AccountConfig::CodexHome { path: home_a }),
+            ("b".into(), AccountConfig::CodexHome { path: home_b }),
+        ]);
+        let config = Arc::new(config);
+        let router = Arc::new(Router::new(&config, template.router.affinity.clone()));
+        let stats = Arc::new(Stats::default());
+        let (usage_url, server) = serve_usage_responses(2).await;
+        let mut app = App::new_unvalidated(config, router.clone(), stats.clone()).unwrap();
+        Arc::get_mut(&mut app).unwrap().usage_url = usage_url;
+
+        let mut prior = hyper::HeaderMap::new();
+        prior.insert("x-codex-primary-used-percent", "42".parse().unwrap());
+        router.observe_headers("b", &prior).await;
+
+        app.refresh_managed_usage_at(now).await;
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| { request.starts_with("GET /backend-api/wham/usage HTTP/1.1\r\n") })
+        );
+        assert!(requests.iter().any(|request| {
+            request
+                .to_ascii_lowercase()
+                .contains("chatgpt-account-id: workspace-a")
+        }));
+        assert!(requests.iter().any(|request| {
+            request
+                .to_ascii_lowercase()
+                .contains("chatgpt-account-id: workspace-b")
+        }));
+        assert!(requests.iter().all(|request| {
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer e30.")
+        }));
+
+        let snapshot = router.routing_snapshot().await;
+        let account_a = &snapshot.account_states["a"];
+        assert_eq!(account_a.usage_percent, Some(81));
+        assert_eq!(account_a.usage_updated_at_unix, Some(now as i64));
+        assert_eq!(account_a.usage_windows["primary"].used_percent, Some(19));
+        assert_eq!(
+            account_a.usage_windows["primary"].reset_at_unix,
+            Some(1_789_000_000)
+        );
+        assert_eq!(
+            account_a.usage_windows["primary"].limit_window_seconds,
+            Some(18_000)
+        );
+        assert_eq!(account_a.usage_windows["secondary"].used_percent, Some(81));
+        assert!(account_a.quota_windows.is_empty());
+        assert_eq!(snapshot.account_states["b"].usage_percent, Some(42));
+        assert_eq!(
+            stats.usage_fetch_accounts_checked.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(stats.usage_fetch_successes.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.usage_fetch_failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_usage_retries_unauthorized_with_refreshed_credentials() {
+        use crate::auth::tests::{jwt, serve_refresh_response, test_resolver};
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let home = dir.path().join("managed");
+        let old_token = jwt(now + 3_600, "old-usage-token");
+        let new_token = jwt(now + 7_200, "new-usage-token");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec(&serde_json::json!({"tokens": {
+                "access_token": old_token,
+                "refresh_token": "test-refresh-token",
+                "account_id": "workspace"
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let refresh_url = serve_refresh_response(
+            "200 OK",
+            serde_json::json!({
+                "access_token": new_token,
+                "refresh_token": "replacement-refresh-token",
+                "expires_in": 7_200
+            }),
+        )
+        .await;
+        let (usage_url, server) = serve_usage_sequence().await;
+        let (template, _, _, _) = direct_test_app(dir.path());
+        let mut config = (*template.config).clone();
+        config.accounts = BTreeMap::from([(
+            "managed".into(),
+            AccountConfig::CodexHome { path: home.clone() },
+        )]);
+        let config = Arc::new(config);
+        let router = Arc::new(Router::new(&config, template.router.affinity.clone()));
+        let stats = Arc::new(Stats::default());
+        let mut app = App::new_unvalidated(config, router.clone(), stats.clone()).unwrap();
+        let app_mut = Arc::get_mut(&mut app).unwrap();
+        app_mut.auth = test_resolver(&[&home], refresh_url);
+        app_mut.usage_url = usage_url;
+
+        app.refresh_managed_usage_at(now).await;
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {old_token}").to_ascii_lowercase())
+        );
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {new_token}").to_ascii_lowercase())
+        );
+        assert_eq!(
+            router.routing_snapshot().await.account_states["managed"].usage_percent,
+            Some(27)
+        );
+        assert_eq!(stats.usage_fetch_successes.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.usage_fetch_failures.load(Ordering::Relaxed), 0);
+    }
+
+    async fn serve_usage_sequence() -> (Uri, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while bytes.len() < 16 * 1024 {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                let (status, body) = if attempt == 0 {
+                    ("401 Unauthorized", "{}".to_owned())
+                } else {
+                    (
+                        "200 OK",
+                        serde_json::json!({"rate_limit": {
+                            "primary_window": {
+                                "used_percent": 27,
+                                "reset_at": 1_789_000_000,
+                                "limit_window_seconds": 18_000
+                            }
+                        }})
+                        .to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (
+            format!("http://{address}/backend-api/wham/usage")
+                .parse()
+                .unwrap(),
+            server,
+        )
+    }
+
+    async fn serve_usage_responses(
+        expected_requests: usize,
+    ) -> (Uri, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while bytes.len() < 16 * 1024 {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let successful = request
+                    .to_ascii_lowercase()
+                    .contains("chatgpt-account-id: workspace-a");
+                let (status, body) = if successful {
+                    (
+                        "200 OK",
+                        serde_json::json!({"rate_limit": {
+                            "primary_window": {
+                                "used_percent": 19,
+                                "reset_at": 1_789_000_000,
+                                "limit_window_seconds": 18_000
+                            },
+                            "secondary_window": {
+                                "used_percent": 81,
+                                "reset_at": 1_789_500_000,
+                                "limit_window_seconds": 604_800
+                            },
+                            "tertiary_window": null
+                        }})
+                        .to_string(),
+                    )
+                } else {
+                    ("503 Service Unavailable", "{}".to_owned())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        (
+            format!("http://{address}/backend-api/wham/usage")
+                .parse()
+                .unwrap(),
+            server,
+        )
     }
 
     #[tokio::test]

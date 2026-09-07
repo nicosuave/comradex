@@ -48,6 +48,7 @@ enum JSONValue: Codable, Equatable, Sendable {
 }
 
 struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
+    let reauthRequired: Bool
     let name: String
     let kind: String
     let signedIn: Bool?
@@ -57,6 +58,8 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     let unavailableReason: String?
     let retryAtUnix: Int64?
     let usagePercent: Int?
+    let usageUpdatedAtUnix: Int64?
+    let usageWindows: [String: UsageWindowSnapshot]
 
     var id: String { name }
     var isSignedIn: Bool {
@@ -73,15 +76,19 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case name, kind, pools, available
+        case reauthRequired = "reauth_required"
         case signedIn = "signed_in"
         case authState = "auth_state"
         case unavailableReason = "unavailable_reason"
         case retryAtUnix = "retry_at_unix"
         case usagePercent = "usage_percent"
+        case usageUpdatedAtUnix = "usage_updated_at_unix"
+        case usageWindows = "usage_windows"
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        reauthRequired = try container.decodeIfPresent(Bool.self, forKey: .reauthRequired) ?? false
         name = try container.decode(String.self, forKey: .name)
         kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? ""
         signedIn = try container.decodeIfPresent(Bool.self, forKey: .signedIn)
@@ -91,6 +98,20 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         unavailableReason = try container.decodeIfPresent(String.self, forKey: .unavailableReason)
         retryAtUnix = try container.decodeIfPresent(Int64.self, forKey: .retryAtUnix)
         usagePercent = try container.decodeIfPresent(Int.self, forKey: .usagePercent)
+        usageUpdatedAtUnix = try container.decodeIfPresent(Int64.self, forKey: .usageUpdatedAtUnix)
+        usageWindows = try container.decodeIfPresent([String: UsageWindowSnapshot].self, forKey: .usageWindows) ?? [:]
+    }
+}
+
+struct UsageWindowSnapshot: Codable, Equatable, Sendable {
+    let usedPercent: Int?
+    let resetAtUnix: Int64?
+    let limitWindowSeconds: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case usedPercent = "used_percent"
+        case resetAtUnix = "reset_at_unix"
+        case limitWindowSeconds = "limit_window_seconds"
     }
 }
 

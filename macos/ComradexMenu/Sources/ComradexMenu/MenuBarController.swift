@@ -108,8 +108,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             return
         }
 
+        let showsPoolHeaders = snapshot.pools.count > 1
         for pool in snapshot.pools {
-            menu.addItem(.sectionHeader(title: "\(pool.name) · Active: \(pool.active ?? "None")"))
+            if showsPoolHeaders {
+                menu.addItem(.sectionHeader(title: pool.name))
+            }
             for member in pool.members {
                 guard let account = snapshot.accounts.first(where: { $0.name == member }) else {
                     addInformationalItem("\(member) — Unavailable", icon: "questionmark.circle")
@@ -131,18 +134,24 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private func addAccount(_ account: AccountSnapshot, pool: PoolSnapshot?) {
         let isPreferred = pool?.preferred == account.name
+        let isLastUsed = pool?.active == account.name
         let item = NSMenuItem(
             title: account.name,
             action: pool == nil ? nil : #selector(preferredAccountSelected(_:)),
             keyEquivalent: ""
         )
         item.target = self
-        item.image = NSImage(systemSymbolName: accountIcon(account), accessibilityDescription: nil)
-        let detail = isPreferred ? "Preferred · \(accountState(account))" : accountState(account)
+        let detail = accountDetail(account)
+        if isLastUsed && !isPreferred {
+            item.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Last used · \(detail)")
+        }
+        let detailParts = [isPreferred ? "Preferred" : nil, detail]
+            .compactMap { $0 }
+        let subtitle = detailParts.joined(separator: " · ")
         if #available(macOS 14.4, *) {
-            item.subtitle = detail
+            item.subtitle = subtitle
         } else {
-            item.title = "\(account.name) — \(detail)"
+            item.title = "\(account.name) — \(subtitle)"
         }
         item.state = isPreferred ? .on : .off
         item.isEnabled = pool != nil && store.updatingPool == nil
@@ -273,24 +282,61 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         switch account.authState?.lowercased() {
         case "login_in_progress": return "Login in progress"
-        case "inbound": return "Inbound"
+        case "inbound": return "Codex App account"
         case "signed_in": return "Signed in"
         case "signed_out": return "Sign-in required"
         default: return account.isSignedIn ? "Signed in" : "Sign-in required"
         }
     }
 
-    private func accountIcon(_ account: AccountSnapshot) -> String {
-        if !account.available {
-            return account.unavailableReason?.lowercased() == "quota"
-                ? "clock.arrow.circlepath"
-                : "exclamationmark.circle.fill"
+    private func accountDetail(_ account: AccountSnapshot) -> String {
+        if account.reauthRequired { return "Sign-in needed for renewal" }
+        if !account.available
+            || account.authState?.lowercased() == "login_in_progress"
+            || account.authState?.lowercased() == "signed_out"
+        {
+            return accountState(account)
         }
-        switch account.authState?.lowercased() {
-        case "login_in_progress": return "clock.fill"
-        case "inbound": return "arrow.down.circle.fill"
-        default: return account.isSignedIn ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+        if account.isInbound { return "Codex App account" }
+        return usageDescription(account) ?? "Usage pending"
+    }
+
+    private func usageDescription(_ account: AccountSnapshot) -> String? {
+        let windows = account.usageWindows
+            .filter { $0.value.usedPercent != nil }
+            .sorted { left, right in
+                let leftDuration = left.value.limitWindowSeconds ?? UInt64.max
+                let rightDuration = right.value.limitWindowSeconds ?? UInt64.max
+                if leftDuration != rightDuration { return leftDuration < rightDuration }
+                return windowOrder(left.key) < windowOrder(right.key)
+            }
+        if windows.isEmpty {
+            return account.usagePercent.map { "\(max(0, 100 - $0))% left" }
         }
+        return windows.map { name, window in
+            let remaining = max(0, 100 - window.usedPercent!)
+            var detail = "\(windowLabel(name, seconds: window.limitWindowSeconds)) \(remaining)% left"
+            if let reset = retryDescription(window.resetAtUnix) {
+                detail += " (resets in \(reset))"
+            }
+            return detail
+        }.joined(separator: " · ")
+    }
+
+    private func windowOrder(_ name: String) -> Int {
+        switch name.lowercased() {
+        case "primary": return 0
+        case "secondary": return 1
+        case "tertiary": return 2
+        default: return 3
+        }
+    }
+
+    private func windowLabel(_ name: String, seconds: UInt64?) -> String {
+        guard let seconds else { return name.capitalized }
+        if seconds.isMultiple(of: 86_400) { return "\(seconds / 86_400)d" }
+        if seconds.isMultiple(of: 3_600) { return "\(seconds / 3_600)h" }
+        return name.capitalized
     }
 
     private func retryDescription(_ retryAtUnix: Int64?) -> String? {

@@ -16,6 +16,7 @@ use crate::{
     auth::{ManagedAuthHealth, ManagedAuthStatus},
     config::{AccountConfig, Config, PoolConfig, normalize_codex_home},
     routing::{AffinityStore, ThreadKey},
+    usage::UsageSnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -95,9 +96,13 @@ pub struct AccountRoutingStatus {
     pub retry_at_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_updated_at_unix: Option<i64>,
     pub inflight: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub quota_windows: BTreeMap<String, QuotaWindowStatus>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usage_windows: BTreeMap<String, QuotaWindowStatus>,
     /// Soft preference for fresh admissions only; the account remains available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_backoff_until_unix: Option<i64>,
@@ -109,6 +114,8 @@ pub struct QuotaWindowStatus {
     pub used_percent: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_window_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +123,8 @@ struct AccountRuntime {
     reauth_required: bool,
     bearer_unusable: bool,
     usage: Option<u8>,
+    usage_updated_at_unix: Option<i64>,
+    usage_windows: BTreeMap<String, QuotaWindowStatus>,
     inflight: u64,
     last_assigned: u64,
     needs_login: bool,
@@ -881,6 +890,20 @@ impl Router {
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             if let Some(usage) = usage {
                 a.usage = Some(usage);
+                a.usage_updated_at_unix = Some(Utc::now().timestamp());
+            }
+            for (window, evidence) in &observed_evidence {
+                a.usage_windows.insert(
+                    window.name().to_owned(),
+                    QuotaWindowStatus {
+                        used_percent: evidence
+                            .used_percent
+                            .map(|percent| percent.clamp(0.0, 100.0).round() as u8),
+                        reset_at_unix: evidence.reset_at.map(|reset_at| reset_at.timestamp()),
+                        limit_window_seconds: window_minutes(headers, *window)
+                            .and_then(|minutes| minutes.checked_mul(60)),
+                    },
+                );
             }
             if a.quota_evidence
                 .as_ref()
@@ -889,6 +912,31 @@ impl Router {
                 a.quota_until = None;
                 a.quota_reset_at = None;
                 a.quota_evidence = None;
+            }
+        }
+    }
+
+    /// Replace the last observed usage view with an authoritative WHAM snapshot. This updates
+    /// fresh-work admission scores and status metadata without turning a reported 100% window
+    /// into a hard quota cooldown before upstream actually rejects a request.
+    pub async fn observe_usage_snapshot(&self, account: &str, snapshot: UsageSnapshot) {
+        let observed_evidence = usage_snapshot_evidence(&snapshot);
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account) {
+            runtime.usage = snapshot
+                .windows
+                .values()
+                .filter_map(|window| window.used_percent)
+                .max();
+            runtime.usage_updated_at_unix = Some(snapshot.observed_at_unix);
+            runtime.usage_windows = snapshot.windows;
+            if runtime
+                .quota_evidence
+                .as_ref()
+                .is_some_and(|blocked| quota_reset_confirmed(blocked, &observed_evidence))
+            {
+                runtime.quota_until = None;
+                runtime.quota_reset_at = None;
+                runtime.quota_evidence = None;
             }
         }
     }
@@ -958,6 +1006,7 @@ fn account_routing_status(
                         .used_percent
                         .map(|percent| percent.clamp(0.0, 100.0).round() as u8),
                     reset_at_unix: evidence.reset_at.map(|reset_at| reset_at.timestamp()),
+                    limit_window_seconds: None,
                 },
             )
         })
@@ -968,8 +1017,10 @@ fn account_routing_status(
         unavailable_reason,
         retry_at_unix,
         usage_percent: runtime.usage,
+        usage_updated_at_unix: runtime.usage_updated_at_unix,
         inflight: runtime.inflight,
         quota_windows,
+        usage_windows: runtime.usage_windows.clone(),
         capacity_backoff_until_unix: runtime.capacity.until.filter(|until| *until > now).map(
             |until| {
                 wall_now.timestamp()
@@ -978,6 +1029,46 @@ fn account_routing_status(
             },
         ),
     }
+}
+
+fn usage_snapshot_evidence(snapshot: &UsageSnapshot) -> QuotaEvidence {
+    snapshot
+        .windows
+        .iter()
+        .filter_map(|(name, window)| {
+            let quota_window = match name.as_str() {
+                "primary" => QuotaWindow::Primary,
+                "secondary" => QuotaWindow::Secondary,
+                "tertiary" => QuotaWindow::Tertiary,
+                _ => return None,
+            };
+            Some((
+                quota_window,
+                WindowEvidence {
+                    used_percent: window.used_percent.map(f32::from),
+                    reset_at: window
+                        .reset_at_unix
+                        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0)),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn window_minutes(headers: &hyper::HeaderMap, window: QuotaWindow) -> Option<u64> {
+    let name = window.name();
+    [
+        format!("x-codex-{name}-window-minutes"),
+        format!("x-ratelimit-{name}-window-minutes"),
+    ]
+    .into_iter()
+    .filter_map(|header| {
+        headers
+            .get(&header)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
+    .max()
 }
 
 fn quota_evidence(headers: &hyper::HeaderMap, now: DateTime<Utc>) -> QuotaEvidence {
