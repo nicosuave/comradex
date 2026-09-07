@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,7 +10,7 @@ use std::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
     config::{Config, PoolConfig},
@@ -27,6 +27,8 @@ pub struct Selection {
     pub account_generation: u64,
     /// Monotonic selection id for `selected vs wired` post-hoc log correlation.
     pub seq: u64,
+    /// A retry's excluded account must not supersede its alternate during validation.
+    excluded_account: Option<String>,
 }
 
 /// How long credential resolution may take before a fresh (unbound) selection is treated as
@@ -93,6 +95,9 @@ pub struct AccountRoutingStatus {
     pub inflight: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub quota_windows: BTreeMap<String, QuotaWindowStatus>,
+    /// Soft preference for fresh admissions only; the account remains available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_backoff_until_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +120,56 @@ struct AccountRuntime {
     quota_reset_at: Option<DateTime<Utc>>,
     quota_evidence: Option<QuotaEvidence>,
     avoid_until: Option<Instant>,
+    capacity: CapacityBackoff,
+}
+
+const CAPACITY_REJECTION_WINDOW: Duration = Duration::from_secs(120);
+const CAPACITY_BACKOFF_DECAY: Duration = Duration::from_secs(30 * 60);
+const CAPACITY_REJECTION_THRESHOLD: usize = 3;
+
+/// Bounded, process-local admission evidence. Successful warm sessions do not erase
+/// repeated fresh-admission failures, and capacity never changes quota or auth health.
+#[derive(Debug, Default)]
+struct CapacityBackoff {
+    rejections: VecDeque<Instant>,
+    until: Option<Instant>,
+    last_trip: Option<Instant>,
+    level: u32,
+}
+
+impl CapacityBackoff {
+    fn active(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| until > now)
+    }
+
+    fn record(&mut self, now: Instant) -> Option<Duration> {
+        while self
+            .rejections
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= CAPACITY_REJECTION_WINDOW)
+        {
+            self.rejections.pop_front();
+        }
+        self.rejections.push_back(now);
+        if self.rejections.len() < CAPACITY_REJECTION_THRESHOLD {
+            return None;
+        }
+        self.rejections.clear();
+        if self
+            .last_trip
+            .is_some_and(|at| now.saturating_duration_since(at) >= CAPACITY_BACKOFF_DECAY)
+        {
+            self.level = 0;
+        }
+        let delay = Duration::from_secs((60_u64 << self.level).min(600));
+        self.until = Some(
+            self.until
+                .map_or(now + delay, |until| until.max(now + delay)),
+        );
+        self.last_trip = Some(now);
+        self.level = (self.level + 1).min(4);
+        Some(delay)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -242,6 +297,7 @@ impl Router {
                     thread,
                     account_generation: binding_epoch.unwrap_or(binding.account_generation),
                     seq,
+                    excluded_account: exclude.map(str::to_owned),
                 });
             }
         }
@@ -256,6 +312,15 @@ impl Router {
                         && a.avoid_until.is_none_or(|v| v <= now)
                 })
         };
+        // Apply the soft capacity preference only after normal eligibility. An
+        // unavailable sibling must never turn this preference into an empty pool.
+        let has_capacity_alternative = pool
+            .members
+            .iter()
+            .any(|id| eligible(id) && !accounts[id].capacity.active(now));
+        let preferred_for_capacity =
+            |id: &str| !has_capacity_alternative || !accounts[id].capacity.active(now);
+        let eligible = |id: &str| eligible(id) && preferred_for_capacity(id);
         let below_switch_at = |id: &str| {
             accounts
                 .get(id)
@@ -313,6 +378,7 @@ impl Router {
                 thread,
                 account_generation: generation,
                 seq,
+                excluded_account: exclude.map(str::to_owned),
             });
         }
         let account_generation = self.affinity.account_epoch(&selected).await;
@@ -322,6 +388,7 @@ impl Router {
             thread,
             account_generation,
             seq,
+            excluded_account: exclude.map(str::to_owned),
         })
     }
 
@@ -498,6 +565,7 @@ impl Router {
             let configured = self.preferred.lock().await.get(pool_name).cloned();
             if let Some(preferred_id) = configured
                 && preferred_id != selection.account_id
+                && selection.excluded_account.as_deref() != Some(preferred_id.as_str())
                 && pool.members.contains(&preferred_id)
             {
                 let preferred_eligible = {
@@ -507,6 +575,10 @@ impl Router {
                             && !runtime.login_in_progress
                             && runtime.quota_until.is_none_or(|until| until <= now)
                             && runtime.avoid_until.is_none_or(|until| until <= now)
+                            && (!runtime.capacity.active(now)
+                                || accounts
+                                    .get(&selection.account_id)
+                                    .is_some_and(|selected| selected.capacity.active(now)))
                     })
                 };
                 if preferred_eligible {
@@ -649,6 +721,7 @@ impl Router {
             thread: None,
             account_generation,
             seq,
+            excluded_account: None,
         })
     }
     pub async fn end(&self, account: &str) {
@@ -677,6 +750,17 @@ impl Router {
     pub async fn soft_failure(&self, account: &str) {
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
             a.avoid_until = Some(Instant::now() + Duration::from_secs(5));
+        }
+    }
+    pub async fn capacity_failure(&self, account: &str) {
+        if let Some(runtime) = self.accounts.lock().await.get_mut(account)
+            && let Some(delay) = runtime.capacity.record(Instant::now())
+        {
+            info!(
+                account,
+                backoff_seconds = delay.as_secs(),
+                "upstream capacity backoff for fresh work"
+            );
         }
     }
     pub async fn auth_failure(&self, account: &str) {
@@ -843,6 +927,13 @@ fn account_routing_status(
         usage_percent: runtime.usage,
         inflight: runtime.inflight,
         quota_windows,
+        capacity_backoff_until_unix: runtime.capacity.until.filter(|until| *until > now).map(
+            |until| {
+                wall_now.timestamp()
+                    + i64::try_from(until.saturating_duration_since(now).as_secs())
+                        .unwrap_or(i64::MAX)
+            },
+        ),
     }
 }
 
@@ -1683,6 +1774,192 @@ mod tests {
         let pool = cfg.pools["default"].clone();
         let router = Router::new(&cfg, affinity.clone());
         (cfg, affinity, router, pool)
+    }
+
+    #[test]
+    fn capacity_window_is_bounded_and_backoff_caps_and_decays() {
+        let now = Instant::now();
+        let mut capacity = CapacityBackoff::default();
+        assert_eq!(capacity.record(now), None);
+        assert_eq!(capacity.record(now + Duration::from_secs(1)), None);
+        assert!(!capacity.active(now));
+        // Old observations do not combine with a new burst.
+        let later = now + CAPACITY_REJECTION_WINDOW + Duration::from_secs(1);
+        assert_eq!(capacity.record(later), None);
+        assert_eq!(capacity.record(later), None);
+        assert_eq!(capacity.record(later), Some(Duration::from_secs(60)));
+        assert!(capacity.active(later + Duration::from_secs(59)));
+        assert!(!capacity.active(later + Duration::from_secs(60)));
+
+        for seconds in [120, 240, 480, 600, 600, 600] {
+            let previous = capacity.until;
+            assert_eq!(capacity.record(later), None);
+            assert_eq!(capacity.record(later), None);
+            assert_eq!(capacity.record(later), Some(Duration::from_secs(seconds)));
+            assert!(capacity.until >= previous);
+            assert!(capacity.rejections.is_empty());
+        }
+        let quiet = later + CAPACITY_BACKOFF_DECAY;
+        assert_eq!(capacity.record(quiet), None);
+        assert_eq!(capacity.record(quiet), None);
+        assert_eq!(capacity.record(quiet), Some(Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn capacity_backoff_changes_fresh_admissions_but_preserves_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, affinity, router, pool) = stale_test_router(dir.path());
+        router.set_preferred("default", Some("a".into())).await;
+        let owner_key = affinity.key("warm-owner");
+        assert!(router.bind(owner_key.clone(), "a").await);
+        for _ in 0..CAPACITY_REJECTION_THRESHOLD {
+            router.capacity_failure("a").await;
+        }
+        // A successful warm session does not erase fresh admission pressure.
+        let mut usage = HeaderMap::new();
+        usage.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("1"),
+        );
+        router.observe_headers("a", &usage).await;
+        let snapshot = router.routing_snapshot().await;
+        let status = &snapshot.account_states["a"];
+        assert!(status.available);
+        assert!(status.unavailable_reason.is_none());
+        assert!(status.retry_at_unix.is_none());
+        assert!(status.capacity_backoff_until_unix.is_some());
+        assert!(status.quota_windows.is_empty());
+        assert!(router.accounts_needing_login().await.is_empty());
+
+        let owner = router
+            .select("default", &pool, Some(owner_key), None)
+            .await
+            .unwrap();
+        assert!(owner.bound);
+        assert_eq!(owner.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&owner, "default", &pool)
+                .await
+                .is_ok()
+        );
+        let exact = router.select_exact(&pool, "a").await.unwrap();
+        assert!(
+            router
+                .validate_selection(&exact, "default", &pool)
+                .await
+                .is_ok()
+        );
+        assert!(
+            router
+                .validate_account_wirable("a", Some(exact.account_generation))
+                .await
+                .is_ok()
+        );
+
+        let fresh = router
+            .select("default", &pool, Some(affinity.key("new-thread")), None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.account_id, "b");
+        assert!(
+            router
+                .validate_selection(&fresh, "default", &pool)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            router
+                .select_preferred("default", &pool, "a")
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+
+        // Once the soft deadline elapses, the configured preference applies again.
+        router
+            .accounts
+            .lock()
+            .await
+            .get_mut("a")
+            .unwrap()
+            .capacity
+            .until = Some(Instant::now());
+        assert_eq!(
+            router
+                .select("default", &pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_preference_never_excludes_the_only_eligible_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        router.set_preferred("default", Some("a".into())).await;
+        for account in ["a", "b"] {
+            for _ in 0..CAPACITY_REJECTION_THRESHOLD {
+                router.capacity_failure(account).await;
+            }
+        }
+        let fallback = router.select("default", &pool, None, None).await.unwrap();
+        assert_eq!(fallback.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&fallback, "default", &pool)
+                .await
+                .is_ok()
+        );
+
+        // Even a capacity-free sibling cannot suppress A when that sibling is
+        // actually unavailable through quota, auth or a transport failure.
+        router.accounts.lock().await.get_mut("b").unwrap().capacity = CapacityBackoff::default();
+        for failure in ["quota", "auth", "transport"] {
+            router
+                .accounts
+                .lock()
+                .await
+                .insert("b".into(), AccountRuntime::default());
+            match failure {
+                "quota" => router.quota_failure("b", &HeaderMap::new()).await,
+                "auth" => router.reauth_required("b").await,
+                _ => router.soft_failure("b").await,
+            }
+            let fallback = router.select("default", &pool, None, None).await.unwrap();
+            assert_eq!(fallback.account_id, "a", "{failure}");
+            assert!(
+                router
+                    .validate_selection(&fallback, "default", &pool)
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_preferred_account_cannot_cancel_capacity_failover() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, _affinity, router, pool) = stale_test_router(dir.path());
+        router.set_preferred("default", Some("a".into())).await;
+        // Before the soft-backoff threshold, an explicit one-turn retry may
+        // already select B. Validation must honor that selection's exclusion.
+        router.capacity_failure("a").await;
+        let alternate = router
+            .select("default", &pool, None, Some("a"))
+            .await
+            .unwrap();
+        assert_eq!(alternate.account_id, "b");
+        assert!(
+            router
+                .validate_selection(&alternate, "default", &pool)
+                .await
+                .is_ok()
+        );
+        assert!(router.select_exact(&pool, "a").await.is_some());
     }
 
     #[tokio::test]

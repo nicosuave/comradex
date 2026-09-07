@@ -386,7 +386,11 @@ fn materialize_http_bridge_continuation(
     Ok(materialized)
 }
 
+#[derive(Clone, Default)]
+struct CapacityObservation(Arc<AtomicBool>);
+
 struct HttpBridgeCapture {
+    capacity_observation: CapacityObservation,
     input: Vec<serde_json::Value>,
     response_id: Option<String>,
     output: Vec<serde_json::Value>,
@@ -1364,6 +1368,14 @@ impl App {
             // collectors below. Streaming responses release it when this function returns.
             match result {
                 Ok(response) => {
+                    let (mut response, body_failure) = inspect_rejection_body(response).await?;
+                    let capacity = body_failure == Some(FailureKind::Capacity);
+                    if capacity {
+                        self.router.capacity_failure(&account).await;
+                        response
+                            .extensions_mut()
+                            .insert(CapacityObservation(Arc::new(AtomicBool::new(true))));
+                    }
                     if nonportable_payload {
                         payload_dispatch_owner.get_or_insert_with(|| account.clone());
                     }
@@ -1395,7 +1407,7 @@ impl App {
                             self.router.bind(alias, &account).await;
                         }
                     }
-                    if status == StatusCode::UNAUTHORIZED {
+                    if status == StatusCode::UNAUTHORIZED && !capacity {
                         if attempt == 0 {
                             match self
                                 .auth
@@ -1503,7 +1515,7 @@ impl App {
                             .await;
                     }
                     let retry = retryable_http_status(status, &method, &path);
-                    if retry {
+                    if retry && !capacity {
                         if status == StatusCode::TOO_MANY_REQUESTS
                             || status == StatusCode::PAYMENT_REQUIRED
                         {
@@ -1593,7 +1605,7 @@ impl App {
 
     async fn map_file_create_response(
         &self,
-        response: Response<Incoming>,
+        response: Response<ProxyBody>,
         account: &str,
     ) -> Result<Response<ProxyBody>> {
         let (mut parts, mut body) = response.into_parts();
@@ -1634,7 +1646,7 @@ impl App {
 
     async fn map_file_finalize_response(
         &self,
-        response: Response<Incoming>,
+        response: Response<ProxyBody>,
         account: &str,
         file_id: &str,
     ) -> Result<Response<ProxyBody>> {
@@ -2412,9 +2424,14 @@ impl App {
                     }
                 }
             }
+            let (response, body_failure) = inspect_rejection_body(response).await?;
+            let capacity = body_failure == Some(FailureKind::Capacity);
             let status = response.status();
             self.router.end(account).await;
-            if status == StatusCode::UNAUTHORIZED && attempt == 0 {
+            if capacity {
+                self.router.capacity_failure(account).await;
+            }
+            if !capacity && status == StatusCode::UNAUTHORIZED && attempt == 0 {
                 match self
                     .auth
                     .force_refresh(&self.config.accounts[account], &credentials)
@@ -2445,7 +2462,9 @@ impl App {
                     }
                 }
             }
-            if is_quota_status(status) {
+            if capacity {
+                // The body classification takes precedence over quota/gateway status.
+            } else if is_quota_status(status) {
                 self.router.quota_failure(account, response.headers()).await;
             } else if is_selected_gateway_failure(status) {
                 self.router.soft_failure(account).await;
@@ -2788,6 +2807,9 @@ impl App {
                                             .quota_failure(&account, &hyper::HeaderMap::new())
                                             .await;
                                     }
+                                    FailureKind::Capacity => {
+                                        self.router.capacity_failure(&account).await;
+                                    }
                                     FailureKind::Authentication { .. } => {
                                         self.router.auth_failure(&account).await;
                                     }
@@ -2855,6 +2877,7 @@ impl App {
                                 }
                             }
                             if let Some(response_id) = association.response_id.as_deref()
+                                && terminal_permits_affinity(&association.failure)
                                 && !association.turn_ids.is_empty()
                             {
                                 let key = self.router.affinity.key(&format!("previous-response:{response_id}"));
@@ -2984,6 +3007,7 @@ impl App {
                     .quota_failure(account, &hyper::HeaderMap::new())
                     .await;
             }
+            FailureKind::Capacity => self.router.capacity_failure(account).await,
             FailureKind::Transient => self.router.soft_failure(account).await,
             _ => {}
         }
@@ -3614,7 +3638,12 @@ impl App {
                 return Ok(map_upgrade_response(response));
             }
             self.router.end(&selection.account_id).await;
-            if response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
+            let (response, body_failure) = inspect_rejection_body(response).await?;
+            let capacity = body_failure == Some(FailureKind::Capacity);
+            if capacity {
+                self.router.capacity_failure(&selection.account_id).await;
+            }
+            if !capacity && response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
                 match self
                     .auth
                     .force_refresh(&self.config.accounts[&selection.account_id], &credentials)
@@ -3651,12 +3680,14 @@ impl App {
                         self.router.auth_failure(&selection.account_id).await;
                     }
                 }
-            } else if response.status() == StatusCode::UNAUTHORIZED {
+            } else if !capacity && response.status() == StatusCode::UNAUTHORIZED {
                 self.router.auth_failure(&selection.account_id).await;
             }
             let retry = is_quota_status(response.status())
                 || is_selected_gateway_failure(response.status());
-            if matches!(
+            if capacity {
+                // The body classification takes precedence over quota/gateway status.
+            } else if matches!(
                 response.status(),
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYMENT_REQUIRED
             ) {
@@ -3667,7 +3698,7 @@ impl App {
                 self.router.soft_failure(&selection.account_id).await;
             }
             if retry && !forced_live && !hard_owner && attempt == 0 {
-                selection = self
+                let alternate = self
                     .router
                     .select(
                         &listener.pool,
@@ -3675,14 +3706,18 @@ impl App {
                         key.clone(),
                         Some(&selection.account_id),
                     )
-                    .await
-                    .context("no alternate account")?;
+                    .await;
+                if capacity && alternate.is_none() {
+                    return Ok(response);
+                }
+                selection = alternate.context("no alternate account")?;
                 for (_, alias) in &affinity_keys {
                     self.router.bind(alias.clone(), &selection.account_id).await;
                 }
                 continue;
             }
-            if response.status() == StatusCode::UNAUTHORIZED
+            if !capacity
+                && response.status() == StatusCode::UNAUTHORIZED
                 && matches!(
                     self.config.accounts[&selection.account_id],
                     crate::config::AccountConfig::CodexHome { .. }
@@ -3690,7 +3725,7 @@ impl App {
             {
                 self.router.auth_failure(&selection.account_id).await;
             }
-            return Ok(map_http_response(response));
+            return Ok(response);
         }
         unreachable!()
     }
@@ -3907,7 +3942,7 @@ fn mark_compaction_request(headers: &mut hyper::HeaderMap) -> Result<()> {
     Ok(())
 }
 
-async fn map_legacy_compact_response(response: Response<Incoming>) -> Result<Response<ProxyBody>> {
+async fn map_legacy_compact_response(response: Response<ProxyBody>) -> Result<Response<ProxyBody>> {
     let (mut parts, mut body) = response.into_parts();
     let mut decoder = SseDecoder::default();
     let mut created_id = None;
@@ -4067,19 +4102,119 @@ fn is_shared_network_io_error(error: &std::io::Error) -> bool {
     })
 }
 
+/// Inspect a bounded rejection prefix before interpreting its HTTP status. Replay every
+/// frame unchanged, including trailers and any read error, to the downstream body.
+async fn inspect_rejection_body(
+    response: Response<Incoming>,
+) -> Result<(Response<ProxyBody>, Option<FailureKind>)> {
+    if response.status().is_success()
+        || matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        )
+    {
+        return Ok((map_http_response(response), None));
+    }
+    let (mut parts, mut body) = response.into_parts();
+    let mut frames = std::collections::VecDeque::new();
+    let mut bytes = Vec::new();
+    let mut complete = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while bytes.len() <= FILE_CREATE_RESPONSE_LIMIT && frames.len() < 128 {
+        let next = tokio::time::timeout_at(deadline, body.frame()).await;
+        match next {
+            Ok(Some(Ok(frame))) => {
+                let oversized = frame.data_ref().is_some_and(|data| {
+                    bytes.len().saturating_add(data.len()) > FILE_CREATE_RESPONSE_LIMIT
+                });
+                if !oversized && let Some(data) = frame.data_ref() {
+                    bytes.extend_from_slice(data);
+                }
+                let terminal = frame.is_trailers() || body.is_end_stream();
+                frames.push_back(Ok(frame));
+                if oversized {
+                    break;
+                }
+                if terminal {
+                    complete = true;
+                    break;
+                }
+            }
+            Ok(None) => {
+                complete = true;
+                break;
+            }
+            Ok(Some(Err(error))) => {
+                frames.push_back(Err(std::io::Error::other(error)));
+                break;
+            }
+            // Exhausting the inspection budget is not a transport failure. Resume
+            // forwarding the untouched remaining stream under its normal body timeout.
+            Err(_) => break,
+        }
+    }
+    let failure = complete
+        .then(|| {
+            let mut observer = HttpResponseObserver::new(response_observer_for_content_type(None));
+            observer.observe(&bytes);
+            observer.finish().failure.map(|failure| failure.kind)
+        })
+        .flatten();
+    headers::strip_hop_by_hop(&mut parts.headers);
+    Ok((
+        Response::from_parts(
+            parts,
+            ReplayedIncoming {
+                frames,
+                inner: incoming_body(body),
+            }
+            .boxed(),
+        ),
+        failure,
+    ))
+}
+
+struct ReplayedIncoming {
+    frames: std::collections::VecDeque<std::io::Result<Frame<bytes::Bytes>>>,
+    inner: ProxyBody,
+}
+
+impl Body for ReplayedIncoming {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::io::Result<Frame<bytes::Bytes>>>> {
+        if let Some(frame) = self.frames.pop_front() {
+            return Poll::Ready(Some(frame));
+        }
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty() && self.inner.is_end_stream()
+    }
+}
+
 fn map_http_response(response: Response<Incoming>) -> Response<ProxyBody> {
     let (mut parts, body) = response.into_parts();
     headers::strip_hop_by_hop(&mut parts.headers);
     Response::from_parts(parts, incoming_body(body))
 }
 
-fn map_http_response_leased(
-    response: Response<Incoming>,
+fn map_http_response_leased<B>(
+    response: Response<B>,
     router: Arc<Router>,
     selection: &Selection,
     observe_response_ids: bool,
     deferred_affinity: Vec<crate::routing::ThreadKey>,
-) -> Response<ProxyBody> {
+) -> Response<ProxyBody>
+where
+    B: Body<Data = bytes::Bytes> + Send + Sync + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let (mut parts, body) = response.into_parts();
     headers::strip_hop_by_hop(&mut parts.headers);
     parts.extensions.insert(SelectedAccount {
@@ -4087,6 +4222,12 @@ fn map_http_response_leased(
         generation: selection.account_generation,
         seq: selection.seq,
     });
+    let capacity_observation = parts
+        .extensions
+        .get::<CapacityObservation>()
+        .cloned()
+        .unwrap_or_default();
+    parts.extensions.insert(capacity_observation.clone());
     let account = selection.account_id.clone();
     let response_headers = parts.headers.clone();
     let observer = observe_response_ids.then(|| {
@@ -4097,7 +4238,8 @@ fn map_http_response_leased(
     Response::from_parts(
         parts,
         BodyExt::boxed(LeasedIncoming {
-            inner: body,
+            inner: body.map_err(std::io::Error::other).boxed(),
+            capacity_observation,
             router,
             account: Some(account),
             observer,
@@ -4112,7 +4254,8 @@ fn map_http_response_leased(
 }
 
 struct LeasedIncoming {
-    inner: Incoming,
+    inner: ProxyBody,
+    capacity_observation: CapacityObservation,
     router: Arc<Router>,
     account: Option<String>,
     observer: Option<HttpResponseObserver>,
@@ -4140,7 +4283,7 @@ enum HttpResponseObserverKind {
 struct HttpResponseObserver {
     kind: HttpResponseObserverKind,
     deferred_ids: Vec<String>,
-    quota: Option<FailureClassification>,
+    failure: Option<FailureClassification>,
     terminal: Option<sse::TerminalStatus>,
 }
 
@@ -4149,7 +4292,7 @@ impl HttpResponseObserver {
         Self {
             kind,
             deferred_ids: Vec::new(),
-            quota: None,
+            failure: None,
             terminal: None,
         }
     }
@@ -4219,8 +4362,11 @@ impl HttpResponseObserver {
             // `event.response.error`, narrow `incomplete_details`, numeric
             // `status`/`status_code` fallback.
             let classification = classify_terminal_event(&event.value);
-            if classification.kind == FailureKind::Quota {
-                self.quota = Some(classification);
+            if matches!(
+                classification.kind,
+                FailureKind::Quota | FailureKind::Capacity
+            ) {
+                self.failure = Some(classification);
                 self.terminal = event.terminal.or(self.terminal);
                 // Quota terminals never bind previous-response IDs; drop any
                 // IDs buffered from earlier non-terminal events in the same
@@ -4266,8 +4412,11 @@ impl HttpResponseObserver {
                             message: None,
                             response_id: None,
                         });
-                    if classification.kind == FailureKind::Quota {
-                        self.quota = Some(classification);
+                    if matches!(
+                        classification.kind,
+                        FailureKind::Quota | FailureKind::Capacity
+                    ) {
+                        self.failure = Some(classification);
                         self.deferred_ids.clear();
                     } else {
                         self.deferred_ids = response_ids_from_json(&bytes);
@@ -4300,8 +4449,11 @@ impl HttpResponseObserver {
                         message: None,
                         response_id: None,
                     });
-                if classification.kind == FailureKind::Quota {
-                    self.quota = Some(classification);
+                if matches!(
+                    classification.kind,
+                    FailureKind::Quota | FailureKind::Capacity
+                ) {
+                    self.failure = Some(classification);
                 } else {
                     self.deferred_ids = response_ids_from_json(&bytes);
                 }
@@ -4309,7 +4461,7 @@ impl HttpResponseObserver {
         }
         HttpObservedBody {
             ids: std::mem::take(&mut self.deferred_ids),
-            quota: self.quota,
+            failure: self.failure,
             terminal: self.terminal,
         }
     }
@@ -4317,7 +4469,7 @@ impl HttpResponseObserver {
 
 struct HttpObservedBody {
     ids: Vec<String>,
-    quota: Option<FailureClassification>,
+    failure: Option<FailureClassification>,
     terminal: Option<sse::TerminalStatus>,
 }
 
@@ -4443,14 +4595,20 @@ impl LeasedIncoming {
         let router = self.router.clone();
         let headers = self.response_headers.clone();
         let deferred_affinity = self.deferred_affinity.clone();
+        let capacity_observation = self.capacity_observation.clone();
         Some(Box::pin(async move {
-            if let Some(quota) = observed.quota {
+            if let Some(quota) = observed.failure {
                 // Late body reclassification as quota: feed
                 // `quota_failure(headers)` preserving retry-after and bind
                 // nothing (no previous-response IDs, no deferred affinity,
                 // no continuation).
-                let _ = quota;
-                router.quota_failure(&account, &headers).await;
+                if quota.kind == FailureKind::Capacity {
+                    if !capacity_observation.0.swap(true, Ordering::AcqRel) {
+                        router.capacity_failure(&account).await;
+                    }
+                } else {
+                    router.quota_failure(&account, &headers).await;
+                }
                 return;
             }
             // Bind deferred success affinity only behind a non-quota
@@ -4865,6 +5023,11 @@ async fn pump_http_response_to_websocket(
     upstream_idle_timeout: Duration,
 ) -> std::result::Result<(), HttpBridgePumpFailure> {
     let mut capture = HttpBridgeCapture {
+        capacity_observation: response
+            .extensions()
+            .get::<CapacityObservation>()
+            .cloned()
+            .unwrap_or_default(),
         input: request_input,
         response_id: None,
         output: Vec::new(),
@@ -4914,7 +5077,8 @@ async fn pump_http_response_to_websocket(
         // a quota-shaped error body (numeric 429, quota code/message)
         // feeds `quota_failure(headers)` even when the transport status is
         // not itself 429/402.
-        if let Some(account) = selected_account.as_deref()
+        if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            && let Some(account) = selected_account.as_deref()
             && let Some(body_value) = parsed.as_ref()
         {
             let body_classification = if body_value.get("type").is_some() {
@@ -4922,8 +5086,14 @@ async fn pump_http_response_to_websocket(
             } else {
                 classify_http_json_body(body_value)
             };
-            if body_classification.kind == FailureKind::Quota {
-                app.router.quota_failure(account, &response_headers).await;
+            if matches!(body_classification.kind, FailureKind::Quota | FailureKind::Capacity) {
+                if body_classification.kind == FailureKind::Capacity {
+                    if !capture.capacity_observation.0.swap(true, Ordering::AcqRel) {
+                        app.router.capacity_failure(account).await;
+                    }
+                } else {
+                    app.router.quota_failure(account, &response_headers).await;
+                }
             }
         }
         let error = parsed
@@ -5126,17 +5296,24 @@ async fn send_protocol_events(
         // inside `classify_terminal_event`).
         let classification = classify_terminal_event(&event.value);
         let is_quota = classification.kind == FailureKind::Quota;
-        if is_quota {
+        if is_quota || classification.kind == FailureKind::Capacity {
             if let Some(account) = account {
-                app.router.quota_failure(account, response_headers).await;
+                if is_quota {
+                    app.router.quota_failure(account, response_headers).await;
+                } else if !capture.capacity_observation.0.swap(true, Ordering::AcqRel) {
+                    app.router.capacity_failure(account).await;
+                }
             }
             // Never bind previous-response affinity nor cache a continuation
             // for quota terminals; the account is cooling down.
             let previous_response_id = capture.response_id.clone();
             capture.observe(&event.value);
             capture.response_id = previous_response_id;
-            let payload =
-                enrich_bridge_quota_payload(&event.payload, &event.value, response_headers);
+            let payload = if is_quota {
+                enrich_bridge_quota_payload(&event.payload, &event.value, response_headers)
+            } else {
+                event.payload.clone()
+            };
             if !outbound.send(Message::Text(payload.into())).await {
                 capture.delivery_failed = true;
                 anyhow::bail!("downstream WebSocket writer stopped before event delivery")
@@ -5339,6 +5516,7 @@ async fn collect_proxy_body_with_initial(
 
 #[cfg(test)]
 mod tests {
+    include!("capacity_tests.rs");
     use super::*;
     use crate::{
         config::{AccountConfig, ProxyConfig, ResponsesWebsocketMode},
@@ -5601,7 +5779,7 @@ mod tests {
         observer.observe(br#"{"id":"resp_missing_type","object":"response","status":"completed"}"#);
         let observed = observer.finish();
         assert_eq!(observed.ids, ["resp_missing_type"]);
-        assert!(observed.quota.is_none());
+        assert!(observed.failure.is_none());
         assert_eq!(observed.terminal, Some(sse::TerminalStatus::Completed));
     }
 
@@ -5617,7 +5795,7 @@ mod tests {
         observer.observe(br#"{"response":{"id":"resp_generic_type","status":"completed"}}"#);
         let observed = observer.finish();
         assert_eq!(observed.ids, ["resp_generic_type"]);
-        assert!(observed.quota.is_none());
+        assert!(observed.failure.is_none());
     }
 
     #[test]
@@ -5645,7 +5823,7 @@ mod tests {
         let observed = observer.finish();
         assert_eq!(observed.ids, ["resp_stream"]);
         assert_eq!(observed.terminal, Some(sse::TerminalStatus::Completed));
-        assert!(observed.quota.is_none());
+        assert!(observed.failure.is_none());
 
         // A mislabeled stream takes the dual path, but still discovers the ID
         // from the current frame instead of waiting for EOF/JSON parsing.
@@ -5678,7 +5856,7 @@ mod tests {
         malformed.observe(br#"{"id":"resp_broken""#);
         let observed = malformed.finish();
         assert!(observed.ids.is_empty());
-        assert!(observed.quota.is_none());
+        assert!(observed.failure.is_none());
 
         let generic = hyper::header::HeaderValue::from_static("text/plain");
         let mut unrelated =
@@ -5686,7 +5864,7 @@ mod tests {
         unrelated.observe(br#"{"ok":true,"items":[]}"#);
         let observed = unrelated.finish();
         assert!(observed.ids.is_empty());
-        assert!(observed.quota.is_none());
+        assert!(observed.failure.is_none());
     }
 
     #[test]
@@ -5732,7 +5910,7 @@ mod tests {
         let observed = observer.finish();
         assert!(observed.ids.is_empty());
         assert_eq!(
-            observed.quota.as_ref().map(|quota| &quota.kind),
+            observed.failure.as_ref().map(|quota| &quota.kind),
             Some(&FailureKind::Quota)
         );
 
@@ -7168,21 +7346,30 @@ mod tests {
                 .is_ok()
         );
 
-        // Old slow-path product: re-select excluding slow-but-healthy A.
+        // A normal fresh selection still retains the healthy preferred account;
+        // credential latency alone must never introduce an exclusion.
+        let fresh = router.select("default", pool, None, None).await.unwrap();
+        assert_eq!(fresh.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&fresh, "default", pool)
+                .await
+                .is_ok()
+        );
+
+        // An explicit retry exclusion is different: its stamped choice must remain
+        // valid even while A is preferred. The former fence contradicted this
+        // deliberate failover decision by immediately selecting A again.
         let reselected = router
             .select("default", pool, None, Some(&selected.account_id))
             .await
             .unwrap();
         assert_eq!(reselected.account_id, "b");
-
-        // Attempt 1 fence: B is unwirable while A remains healthy+preferred, so the
-        // final attempt would end in `continuity_owner_unavailable` (503) with no
-        // budget left. The fixed slow path keeps A instead of excluding it.
-        assert_eq!(
+        assert!(
             router
                 .validate_selection(&reselected, "default", pool)
-                .await,
-            Err(SelectionStaleReason::PreferredSuperseded)
+                .await
+                .is_ok()
         );
         assert!(
             router
