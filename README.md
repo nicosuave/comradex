@@ -225,6 +225,39 @@ workspace, and survives quota failures and authentication changes. Up to 32 phys
 are recorded per session; a dispatch that would exceed that limit fails before reaching upstream.
 Changing or losing the state/key requires starting a new context task.
 
+#### Restoring context or leaving Comradex
+
+Notes and history tool results can be retained in a task as private
+`comradex-context-v1:` wrappers. These are Comradex envelopes, not native upstream
+ciphertext: Comradex must authenticate and decode them with the original
+`proxy.affinity_key`, verify the pool and root session, and restore the enclosed native
+results before forwarding inference. The enclosed history results remain separate
+account partitions; decoding the wrapper does not decrypt their native contents.
+
+To resume through Comradex, preserve both `context.sqlite3` under `proxy.state_dir`
+and the original `proxy.affinity_key`, along with the task's saved context. The database
+records ownership and participant order, not a backup of notes or history contents.
+Keep the same pool and root session and access to the recorded account identities;
+restoring an account alias with a different signed-in user is insufficient.
+
+Changing a task's route to native Codex, changing `openai_base_url`, or uninstalling
+Comradex does not rewrite saved wrappers or consolidate account-local notes and
+history. Native compaction is a separate request path, not an export or migration
+mechanism. A migration of an existing context task would need to:
+
+1. Authenticate and expand every retained Comradex wrapper using the original key,
+   pool, session, and participant mapping.
+2. Recover the required notes and history from their recorded accounts and preserve
+   their source identity; establish ordering, deduplication, and pagination where
+   the destination requires a single history.
+3. Verify that the destination accepts the resulting native context and continuity
+   state, or create a supported handoff with the information needed to continue.
+
+Comradex currently provides no exporter or automatic migration for this. Keep the
+existing task routed through Comradex, or start a new native task with an explicit
+handoff. These limits concern Comradex wrappers and distributed context storage;
+they do not establish that all native encrypted reasoning is account-bound.
+
 Each listener maps to an account pool. Comradex uses Codex's continuity signals to keep related work on the same healthy account, while quota thresholds affect only the admission of new threads.
 
 ### Affinity and ownership
