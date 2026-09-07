@@ -237,6 +237,7 @@ pub struct EventAssociation {
 pub enum FailureKind {
     None,
     Quota,
+    Capacity,
     Authentication { requires_reauthentication: bool },
     PreviousResponseNotFound,
     Transient,
@@ -310,8 +311,7 @@ pub enum ReplayDecision {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReplayContext {
     /// True when the failure event being classified carries a response ID.
-    /// Quota failures may still be pre-created capacity rejection envelopes;
-    /// other failures with an ID are treated as accepted work.
+    /// An assigned ID is treated as accepted work, even for quota or capacity failures.
     pub current_event_has_response_id: bool,
 }
 
@@ -560,6 +560,7 @@ impl ProtocolState {
         let supported = matches!(
             failure,
             FailureKind::Quota
+                | FailureKind::Capacity
                 | FailureKind::Authentication { .. }
                 | FailureKind::PreviousResponseNotFound
                 | FailureKind::Transient
@@ -943,22 +944,31 @@ fn is_quota_code(code: &str) -> bool {
             | "insufficient_quota"
             | "quota_exceeded"
             | "usage_not_included"
-            | "overloaded_error"
-            | "server_is_overloaded"
     )
 }
 
 fn is_quota_message(message: &str) -> bool {
-    message.contains("usage limit")
-        || message.contains("insufficient quota")
-        || message.contains("server is overloaded")
+    message.contains("usage limit") || message.contains("insufficient quota")
 }
 
-/// Narrow quota signals from `response.incomplete_details` and
-/// `response.error.message` for quota-shaped `incomplete`/`failed` terminals.
-/// Only exact codes and the existing narrow substrings count; bare
-/// `limit|usage|quota|overloaded` substrings never match.
-fn incomplete_quota_signal(event: &Value) -> (Option<String>, Option<String>) {
+fn is_capacity_code(code: &str) -> bool {
+    matches!(
+        code,
+        "server_is_overloaded" | "overloaded_error" | "model_at_capacity"
+    )
+}
+
+fn is_capacity_message(message: &str) -> bool {
+    message.contains("server is overloaded") || message.contains("model is at capacity")
+}
+
+/// Narrow quota or capacity evidence from failed/incomplete terminal details.
+/// Bare `limit|usage|quota|overloaded` substrings never match.
+fn incomplete_failure_signal(
+    event: &Value,
+    matches_code: fn(&str) -> bool,
+    matches_message: fn(&str) -> bool,
+) -> (Option<String>, Option<String>) {
     let event_type = event.get("type").and_then(Value::as_str);
     if !matches!(
         event_type,
@@ -974,10 +984,10 @@ fn incomplete_quota_signal(event: &Value) -> (Option<String>, Option<String>) {
     let mut matched_message: Option<String> = None;
     let mut check_text = |text: &str| {
         let normalized = text.to_ascii_lowercase();
-        if matched_code.is_none() && is_quota_code(normalized.as_str()) {
+        if matched_code.is_none() && matches_code(normalized.as_str()) {
             matched_code = Some(bounded_owned(text, MAX_CLASSIFIED_CODE_BYTES));
         }
-        if is_quota_message(normalized.as_str()) {
+        if matches_message(normalized.as_str()) {
             matched_message
                 .get_or_insert_with(|| bounded_owned(text, MAX_CLASSIFIED_MESSAGE_BYTES));
         }
@@ -1105,10 +1115,17 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
     // Quota-shaped `incomplete`/`failed` terminals carry the signal in
     // `response.incomplete_details` or `response.error.message` rather than
     // the primary error object.
-    let (incomplete_code, incomplete_message) = incomplete_quota_signal(event);
+    let (incomplete_code, incomplete_message) =
+        incomplete_failure_signal(event, is_quota_code, is_quota_message);
     if incomplete_code.is_some() || incomplete_message.is_some() {
         quota = true;
     }
+    let (capacity_code, capacity_message) =
+        incomplete_failure_signal(event, is_capacity_code, is_capacity_message);
+    let capacity = is_capacity_code(normalized_code)
+        || is_capacity_message(&normalized_message)
+        || capacity_code.is_some()
+        || capacity_message.is_some();
 
     // Numeric fallback: envelope or nested error `status`/`status_code` as
     // numbers or numeric strings. Only 429/402 act as failure signals; a body
@@ -1121,9 +1138,6 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
         Some(402) => quota || incomplete_code.is_some() || incomplete_message.is_some(),
         _ => false,
     };
-    if numeric_quota {
-        quota = true;
-    }
     let numeric_auth = matches!(numeric, Some(401 | 403));
     let authentication = authentication || numeric_auth;
 
@@ -1133,6 +1147,8 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
         && numeric.is_none()
         && incomplete_code.is_none()
         && incomplete_message.is_none()
+        && capacity_code.is_none()
+        && capacity_message.is_none()
     {
         return FailureClassification::none();
     }
@@ -1145,6 +1161,12 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
         }
     } else if quota {
         FailureKind::Quota
+    } else if capacity {
+        // Explicit capacity evidence overrides a generic numeric 429. Actual quota
+        // evidence above remains fail-closed even if an envelope also mentions capacity.
+        FailureKind::Capacity
+    } else if numeric_quota {
+        FailureKind::Quota
     } else if transient {
         FailureKind::Transient
     } else {
@@ -1153,8 +1175,12 @@ pub fn classify_failure(event: &Value) -> FailureClassification {
     // Prefer the primary error code/message; fall back to the narrow
     // incomplete signal so quota terminals without an error object still
     // carry evidence.
-    let code = code.or_else(|| incomplete_code.map(|value| value.to_ascii_lowercase()));
-    let message = message.or(incomplete_message);
+    let code = code.or_else(|| {
+        incomplete_code
+            .or(capacity_code)
+            .map(|value| value.to_ascii_lowercase())
+    });
+    let message = message.or(incomplete_message).or(capacity_message);
     FailureClassification {
         kind,
         code,
@@ -1174,7 +1200,7 @@ pub fn response_id(event: &Value) -> Option<&str> {
 
 /// Canonical terminal classification shared by Direct, Bridge, and HTTP
 /// lanes. Only terminal event types (`response.failed`,
-/// `response.incomplete`, `error`) can yield a quota failure; a quota-shaped
+/// `response.incomplete`, `error`) can yield quota or capacity failures; such a
 /// signal on any other terminal (completed/cancelled/non-terminal) is
 /// downgraded to `Other` so normal `incomplete` (max_tokens/length/
 /// content_filter) and success affinity stay intact.
@@ -1182,7 +1208,7 @@ pub fn classify_terminal_event(event: &Value) -> FailureClassification {
     let terminal = terminal_kind(event.get("type").and_then(Value::as_str));
     let classification = classify_failure(event);
     match classification.kind {
-        FailureKind::Quota => match terminal {
+        FailureKind::Quota | FailureKind::Capacity => match terminal {
             Some(TerminalKind::Failed) | Some(TerminalKind::Incomplete) => classification,
             _ => FailureClassification {
                 kind: FailureKind::Other,
@@ -1196,10 +1222,13 @@ pub fn classify_terminal_event(event: &Value) -> FailureClassification {
 }
 
 /// Whether a terminal classification permits success-affinity binding and
-/// continuation caching. Quota terminals must never bind previous-response
+/// continuation caching. Quota and capacity terminals must never bind previous-response
 /// IDs nor cache continuations.
 pub fn terminal_permits_affinity(classification: &FailureClassification) -> bool {
-    !matches!(classification.kind, FailureKind::Quota)
+    !matches!(
+        classification.kind,
+        FailureKind::Quota | FailureKind::Capacity
+    )
 }
 
 /// Classifies a non-streaming Responses JSON body (`value.response ?? value`).
@@ -2097,6 +2126,73 @@ mod tests {
             classify_failure(&json!({"type":"error","status_code":502})).kind,
             FailureKind::Quota
         );
+    }
+
+    #[test]
+    fn capacity_is_distinct_from_quota_across_terminal_shapes() {
+        for code in [
+            "server_is_overloaded",
+            "overloaded_error",
+            "model_at_capacity",
+        ] {
+            for event in [
+                json!({"type":"error", "error":{"code":code}}),
+                json!({"type":"error", "status":429, "error":{"code":code}}),
+                json!({"type":"error", "status":503, "error":{"code":code}}),
+                json!({"type":"response.failed", "response":{"id":"resp_busy", "error":{"code":code}}}),
+                json!({"type":"response.incomplete", "response":{"incomplete_details":{"reason":code}}}),
+            ] {
+                let failure = classify_terminal_event(&event);
+                assert_eq!(failure.kind, FailureKind::Capacity, "{event}");
+                assert!(!terminal_permits_affinity(&failure));
+            }
+            let json = json!({"status":"failed", "error":{"code":code}});
+            assert_eq!(classify_http_json_body(&json).kind, FailureKind::Capacity);
+        }
+        for message in [
+            "The server is overloaded. Please try again later.",
+            "The selected model is at capacity",
+        ] {
+            let event = json!({"type":"error", "error":{"message":message}});
+            assert_eq!(classify_terminal_event(&event).kind, FailureKind::Capacity);
+        }
+        for message in ["overloaded", "capacity", "the tool returned overloaded"] {
+            let event = json!({"type":"error", "error":{"message":message}});
+            assert_eq!(classify_terminal_event(&event).kind, FailureKind::Other);
+        }
+        // Never downgrade actual auth or quota evidence to a capacity hint.
+        let auth = json!({"type":"error", "status":401, "error":{"code":"server_is_overloaded"}});
+        assert!(matches!(
+            classify_terminal_event(&auth).kind,
+            FailureKind::Authentication { .. }
+        ));
+        let quota = json!({"type":"error", "error":{"code":"usage_limit_reached", "message":"server is overloaded"}});
+        assert_eq!(classify_terminal_event(&quota).kind, FailureKind::Quota);
+        let completed =
+            json!({"type":"response.completed", "response":{"error":{"code":"model_at_capacity"}}});
+        assert_eq!(classify_terminal_event(&completed).kind, FailureKind::Other);
+    }
+
+    #[test]
+    fn capacity_replay_still_requires_precreated_turn() {
+        let mut protocol = state();
+        let turn = protocol
+            .admit_response_create(&create(json!("hello")))
+            .unwrap();
+        assert_eq!(
+            protocol.replay_decision(turn, FailureKind::Capacity, ReplayContext::default()),
+            ReplayDecision::Eligible(ReplayMode::OriginalRequest)
+        );
+        protocol
+            .observe_upstream_event(
+                &json!({"type":"response.created", "response":{"id":"resp_busy"}}),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            protocol.replay_decision(turn, FailureKind::Capacity, ReplayContext::default()),
+            ReplayDecision::Refused(_)
+        ));
     }
 
     #[test]
