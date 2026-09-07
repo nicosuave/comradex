@@ -3,11 +3,11 @@ import SwiftUI
 
 enum StatusIcon {
     static let image: NSImage = {
-        let base = NSImage(
-            systemSymbolName: "point.3.connected.trianglepath.dotted",
-            accessibilityDescription: "Comradex"
-        ) ?? NSImage(systemSymbolName: "circle.grid.2x2", accessibilityDescription: "Comradex")!
-        let image = base.withSymbolConfiguration(.init(pointSize: 15, weight: .medium)) ?? base
+        let url = Bundle.main.url(forResource: "comradex-logo", withExtension: "svg")
+            ?? Bundle.module.url(forResource: "comradex-logo", withExtension: "svg")!
+        let image = NSImage(contentsOf: url)!
+        image.size = NSSize(width: 19, height: 13)
+        image.accessibilityDescription = "Comradex"
         image.isTemplate = true
         return image
     }()
