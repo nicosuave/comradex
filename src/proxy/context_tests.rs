@@ -620,7 +620,7 @@ async fn signed_context_wrapper_can_rotate_inference_without_moving_notes_owner(
 }
 
 #[tokio::test]
-async fn unrelated_encrypted_reasoning_keeps_signed_context_replay_on_first_account() {
+async fn native_reasoning_and_signed_context_replay_together_unchanged() {
     let upstream = start_upstream(Arc::new(|request| {
         if request.path.contains("/alpha/notes/") {
             return (
@@ -651,7 +651,7 @@ async fn unrelated_encrypted_reasoning_keeps_signed_context_replay_on_first_acco
         response_with_context_wrapper(&wrapper, true),
     )
     .await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(status, StatusCode::OK);
 
     let seen = upstream.seen.lock().unwrap();
     let attempted: Vec<_> = seen
@@ -664,14 +664,23 @@ async fn unrelated_encrypted_reasoning_keeps_signed_context_replay_on_first_acco
                     .any(|window| window == b"call_context")
         })
         .collect();
-    assert_eq!(attempted.len(), 1);
+    assert_eq!(attempted.len(), 2);
     assert_eq!(attempted[0].account_id, "workspace-a");
-    assert!(
-        attempted[0]
-            .body
-            .windows(b"unrelated-native-ciphertext".len())
-            .any(|window| window == b"unrelated-native-ciphertext")
-    );
+    assert_eq!(attempted[1].account_id, "workspace-b");
+    for attempt in attempted {
+        assert!(
+            attempt
+                .body
+                .windows(b"unrelated-native-ciphertext".len())
+                .any(|window| window == b"unrelated-native-ciphertext")
+        );
+        assert!(
+            attempt
+                .body
+                .windows(b"cipher-workspace-a".len())
+                .any(|window| window == b"cipher-workspace-a")
+        );
+    }
 }
 
 #[tokio::test]

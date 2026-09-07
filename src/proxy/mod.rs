@@ -9739,7 +9739,7 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
             ))
             .header(AUTHORIZATION, "Bearer inbound-ignored")
             .body(Full::new(Bytes::from_static(
-                br#"{"model":"gpt-test","input":[{"type":"reasoning","id":"rs_owner","encrypted_content":"ciphertext"}],"stream":true}"#,
+                br#"{"model":"gpt-test","input":[{"type":"compaction","id":"cmp_owner","encrypted_content":"ciphertext"}],"stream":true}"#,
             )))
             .unwrap();
 

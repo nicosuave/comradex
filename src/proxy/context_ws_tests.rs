@@ -566,3 +566,146 @@ async fn http_bridge_websocket_context_replay_preserves_native_context_ownership
     exercise_trusted_context_replay(ResponsesWebsocketMode::HttpBridge).await;
     exercise_untrusted_ciphertext_is_not_replayed(ResponsesWebsocketMode::HttpBridge).await;
 }
+
+fn native_reasoning_continuation() -> Value {
+    json!({
+        "type":"response.create", "model":"gpt-test", "stream":true,
+        "input":[
+            {"role":"user","content":"Compute 17 plus 25."},
+            {"type":"reasoning","id":"rs_native","summary":[{"type":"summary_text","text":"Use addition."}],"content":[{"type":"reasoning_text","text":"Synthetic reasoning."}],"status":"completed","encrypted_content":"native-reasoning-ciphertext"},
+            {"type":"function_call","name":"add","call_id":"call_add","arguments":"{\"a\":17,\"b\":25}"},
+            {"type":"function_call_output","call_id":"call_add","output":"42"}
+        ]
+    })
+}
+
+async fn send_native_reasoning_request(
+    proxy: &ContextWebSocketProxy,
+    body: Value,
+    websocket: bool,
+) -> bool {
+    if websocket {
+        let mut connection = connect_proxy(proxy.address).await;
+        send_turn(&mut connection, body).await.last().unwrap()["type"] == "response.completed"
+    } else {
+        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .build_http::<Full<Bytes>>();
+        let mut body = body;
+        body.as_object_mut().unwrap().remove("type");
+        let response = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "http://{}/{SECRET}/backend-api/codex/responses",
+                        proxy.address
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let success = response.status().is_success();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        success && String::from_utf8_lossy(&bytes).contains("response.completed")
+    }
+}
+
+async fn exercise_native_reasoning_quota_replay(mode: ResponsesWebsocketMode, websocket: bool) {
+    let upstream = start_context_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let proxy = start_context_proxy(dir.path(), upstream.address, mode).await;
+    let body = native_reasoning_continuation();
+    assert!(send_native_reasoning_request(&proxy, body.clone(), websocket).await);
+    let seen = upstream.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[0].authorization,
+        format!("Bearer {}", test_token("workspace-a", "user-a"))
+    );
+    assert_eq!(
+        seen[1].authorization,
+        format!("Bearer {}", test_token("workspace-b", "user-b"))
+    );
+    assert_eq!(seen[0].body["input"], body["input"]);
+    assert_eq!(seen[1].body["input"], body["input"]);
+    assert_eq!(seen[0].body, seen[1].body);
+}
+
+async fn exercise_native_reasoning_ownership_negatives(
+    mode: ResponsesWebsocketMode,
+    websocket: bool,
+) {
+    let mut cases = Vec::new();
+    for extra in [
+        json!({"type":"compaction","encrypted_content":"owned-compaction"}),
+        json!({"type":"encrypted_content","encrypted_content":"owned-tool-output"}),
+        json!({"type":"code_interpreter_call","id":"ci_owned","container_id":"container_owned"}),
+        json!({"type":"item_reference","id":"stored_item"}),
+        json!({"type":"input_file","file_id":"file_owned"}),
+        json!({"type":"reasoning","id":"rs_missing_ciphertext"}),
+        json!({"type":"reasoning","encrypted_content":"native","nested":{"encrypted_content":"owned"}}),
+    ] {
+        let mut body = native_reasoning_continuation();
+        body["input"].as_array_mut().unwrap().push(extra);
+        cases.push(body);
+    }
+    for (key, value) in [
+        ("previous_response_id", json!("resp_unknown")),
+        ("turn_state", json!("turn_unknown")),
+        ("conversation", json!("conversation_owned")),
+        (
+            "internal_chat_message_metadata_passthrough",
+            json!({"operation_id":"op_owned"}),
+        ),
+    ] {
+        let mut body = native_reasoning_continuation();
+        body[key] = value;
+        cases.push(body);
+    }
+    for (index, body) in cases.into_iter().enumerate() {
+        let upstream = start_context_upstream().await;
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = start_context_proxy(dir.path(), upstream.address, mode).await;
+        assert!(
+            proxy
+                .app
+                .file_owners
+                .put(
+                    proxy.app.router.affinity.key("file:file_owned"),
+                    "a".into(),
+                    0
+                )
+                .await
+        );
+        assert!(
+            !send_native_reasoning_request(&proxy, body, websocket).await,
+            "ownership case {index}"
+        );
+        let seen = upstream.seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|request| request.authorization
+                == format!("Bearer {}", test_token("workspace-a", "user-a"))),
+            "ownership case {index} crossed accounts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_native_reasoning_quota_replay_preserves_items_and_ownership() {
+    exercise_native_reasoning_quota_replay(ResponsesWebsocketMode::HttpBridge, false).await;
+    exercise_native_reasoning_ownership_negatives(ResponsesWebsocketMode::HttpBridge, false).await;
+}
+
+#[tokio::test]
+async fn http_bridge_native_reasoning_quota_replay_preserves_items_and_ownership() {
+    exercise_native_reasoning_quota_replay(ResponsesWebsocketMode::HttpBridge, true).await;
+    exercise_native_reasoning_ownership_negatives(ResponsesWebsocketMode::HttpBridge, true).await;
+}
+
+#[tokio::test]
+async fn direct_websocket_native_reasoning_quota_replay_preserves_items_and_ownership() {
+    exercise_native_reasoning_quota_replay(ResponsesWebsocketMode::Direct, true).await;
+    exercise_native_reasoning_ownership_negatives(ResponsesWebsocketMode::Direct, true).await;
+}

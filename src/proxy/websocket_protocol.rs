@@ -1412,23 +1412,30 @@ fn has_file_reference(value: &Value) -> bool {
 }
 
 fn frame_contains_nonportable_state(value: &Value) -> bool {
-    contains_nonportable_state(value, true)
+    contains_nonportable_state(value, true, false)
 }
 
-fn contains_nonportable_state(value: &Value, at_root: bool) -> bool {
+fn contains_nonportable_state(value: &Value, at_root: bool, native_input_item: bool) -> bool {
     match value {
         Value::Array(values) => values
             .iter()
-            .any(|value| contains_nonportable_state(value, false)),
+            .any(|value| contains_nonportable_state(value, false, false)),
         Value::Object(object) => {
+            let portable_reasoning = native_input_item
+                && object.get("type").and_then(Value::as_str) == Some("reasoning")
+                && object
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty());
             if object.keys().any(|key| {
-                matches!(
-                    key.as_str(),
-                    "encrypted_content"
-                        | "operation_id"
-                        | "codex_operation_id"
-                        | "internal_chat_message_metadata_passthrough"
-                ) || (at_root && matches!(key.as_str(), "conversation" | "prompt" | "turn_state"))
+                (key == "encrypted_content" && !portable_reasoning)
+                    || matches!(
+                        key.as_str(),
+                        "operation_id"
+                            | "codex_operation_id"
+                            | "internal_chat_message_metadata_passthrough"
+                    )
+                    || (at_root && matches!(key.as_str(), "conversation" | "prompt" | "turn_state"))
             }) {
                 return true;
             }
@@ -1436,26 +1443,36 @@ fn contains_nonportable_state(value: &Value, at_root: bool) -> bool {
                 .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|item_type| {
-                    matches!(
-                        item_type,
-                        "reasoning"
-                            | "item_reference"
-                            | "code_interpreter_call"
-                            | "computer_call"
-                            | "computer_call_output"
-                            | "file_search_call"
-                            | "image_generation_call"
-                            | "tool_search_call"
-                            | "tool_search_output"
-                            | "web_search_call"
-                    )
+                    (item_type == "reasoning" && !portable_reasoning)
+                        || matches!(
+                            item_type,
+                            "compaction"
+                                | "item_reference"
+                                | "code_interpreter_call"
+                                | "computer_call"
+                                | "computer_call_output"
+                                | "file_search_call"
+                                | "image_generation_call"
+                                | "tool_search_call"
+                                | "tool_search_output"
+                                | "web_search_call"
+                        )
                 })
             {
                 return true;
             }
-            object
-                .values()
-                .any(|value| contains_nonportable_state(value, false))
+            object.iter().any(|(key, value)| {
+                if at_root
+                    && key == "input"
+                    && let Some(items) = value.as_array()
+                {
+                    items
+                        .iter()
+                        .any(|item| contains_nonportable_state(item, false, true))
+                } else {
+                    contains_nonportable_state(value, false, false)
+                }
+            })
         }
         _ => false,
     }
@@ -2336,7 +2353,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_reasoning_remains_nonportable_after_anchor_removal() {
+    fn native_reasoning_is_portable_without_changing_anchor_policy() {
         let frame = json!({
             "type":"response.create",
             "previous_response_id":"resp_old",
@@ -2346,13 +2363,15 @@ mod tests {
             ]
         });
         let analysis = analyze_response_create(&frame, ProtocolLimits::default()).unwrap();
-        assert!(analysis.has_nonportable_state);
+        assert!(!analysis.has_nonportable_state);
+        assert_eq!(analysis.previous_response_id.as_deref(), Some("resp_old"));
         assert_eq!(analysis.full_resend, FullResendSafety::Eligible);
 
         let fresh =
             fresh_replay_without_previous_response(&frame, ProtocolLimits::default()).unwrap();
         assert!(fresh.get("previous_response_id").is_none());
-        assert!(frame_contains_nonportable_state(&fresh));
+        assert!(!frame_contains_nonportable_state(&fresh));
+        assert_eq!(fresh["input"], frame["input"]);
     }
 
     #[test]

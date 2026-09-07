@@ -214,8 +214,9 @@ does not change inference quota state or globally stop inference.
 
 The relay preserves native encrypted arguments and protocol headers. It authenticates and encrypts
 the combined tool result, then restores the native results before the next inference request. Only
-verified context outputs receive portable routing treatment; unrelated encrypted reasoning and
-other account-owned state retain their existing continuity restrictions. HTTP, the HTTP WebSocket
+verified context outputs receive portable routing treatment on this path. Native reasoning items
+with nonempty encrypted content directly in Responses input are also portable, with their full item
+shape preserved. Other account-owned state retains its continuity restrictions. HTTP, the HTTP WebSocket
 bridge, and direct Responses WebSockets support this path. Backend-alias Responses WebSockets use
 frame inspection even when the legacy `/v1` transport is configured as raw.
 
@@ -246,7 +247,16 @@ Existing owners remain usable, and an account in capacity backoff is still selec
 no alternative is eligible. `comradex status --json` exposes the soft deadline as
 `routing.account_states.<account>.capacity_backoff_until_unix`.
 
-A pre-output quota response, account-scoped connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Responses bodies carrying encrypted reasoning, hosted operation state, or durable operation metadata become bound to the first account that actually receives them; a proven pre-dispatch connection failure does not create that binding. Shared DNS and network-reachability failures remain account-neutral and do not rotate credentials. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry, and a 401/403 never crosses accounts. No response is retried after visible output. When no alternate is eligible, the original upstream rejection and its `Retry-After` or reset headers are preserved; primary, secondary, and tertiary reset windows bound quota cooldowns.
+A pre-output quota response, account-scoped connection-establishment failure, or selected gateway failure may use one alternate only for native Responses or idempotent methods, never for hard account-owned continuity. Native encrypted reasoning items can travel unchanged with a self-contained transcript. Compaction, unrelated encrypted tool output, hosted operation state, and durable operation metadata remain bound to the first account that actually receives them; a proven pre-dispatch connection failure does not create that binding. File ownership and previous-response or turn-state anchors remain separately enforced. Shared DNS and network-reachability failures remain account-neutral and do not rotate credentials. Successful or ambiguous Live Voice creation is never replayed. On HTTP, a managed-account 401 gets one same-account refresh retry, and a 401/403 never crosses accounts. No response is retried after visible output. When no alternate is eligible, the original upstream rejection and its `Retry-After` or reset headers are preserved; primary, secondary, and tertiary reset windows bound quota cooldowns.
+
+Native reasoning portability was qualified on the configured Codex backend with `gpt-6-astra`,
+two distinct managed identities, and an unchanged tool continuation on September 7, 2026. Both the
+same-account control and cross-account continuation completed the synthetic task. This observation
+does not establish a contract for every model, account combination, or encrypted payload. The ignored
+`native_reasoning_live` integration test repeats that gate using normal Comradex credential resolution;
+set `COMRADEX_PROBE_MODEL` to the configured client model and explicitly authorize live account use
+before running `mbx test --test native_reasoning_live -- --ignored --nocapture`. It logs only safe
+status metadata and keeps credentials, native items, and synthetic response text in memory.
 
 Quota cooldowns recover automatically on the next selection or status request. When upstream reports several quota windows, only windows explicitly reported at 100% constrain a quota rejection; unrelated longer windows do not keep the account blocked. `comradex status` and `comradex status --json` expose each account's availability, retry deadline, usage, and blocking quota windows. Neither Comradex nor Codex needs to be restarted when a quota window resets.
 
