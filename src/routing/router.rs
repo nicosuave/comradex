@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::{
-    auth::{ManagedAuthHealth, ManagedAuthStatus},
+    auth::{ManagedAuthHealth, ManagedAuthStatus, QuotaOwner, managed_quota_owner},
     config::{AccountConfig, Config, PoolConfig, normalize_codex_home},
     routing::{AffinityStore, ThreadKey},
     usage::UsageSnapshot,
@@ -120,6 +120,7 @@ pub struct QuotaWindowStatus {
 
 #[derive(Debug, Default)]
 struct AccountRuntime {
+    quota_owner: Option<QuotaOwner>,
     reauth_required: bool,
     bearer_unusable: bool,
     usage: Option<u8>,
@@ -226,6 +227,17 @@ impl Router {
         let mut accounts = self.accounts.lock().await;
         let now = Utc::now().timestamp().max(0) as u64;
         for (name, runtime) in accounts.iter_mut() {
+            if runtime
+                .quota_owner
+                .as_ref()
+                .is_some_and(QuotaOwner::is_known)
+                && (runtime.quota_until.is_some()
+                    || runtime.quota_evidence.is_some()
+                    || runtime.usage.is_some()
+                    || !runtime.usage_windows.is_empty())
+            {
+                self.reconcile_quota_owner(name, runtime);
+            }
             let status = match self.managed_homes.get(name) {
                 Some(path) => self.auth_health.status_normalized(path, now),
                 _ => ManagedAuthStatus::default(),
@@ -234,6 +246,55 @@ impl Router {
             runtime.bearer_unusable = status.bearer_unusable;
         }
         accounts
+    }
+
+    fn reconcile_quota_owner(&self, account: &str, runtime: &mut AccountRuntime) {
+        let Some(home) = self.managed_homes.get(account) else {
+            return;
+        };
+        let Ok(current) = managed_quota_owner(home) else {
+            return;
+        };
+        Self::reconcile_quota_owner_snapshot(runtime, &current);
+    }
+
+    fn reconcile_quota_owner_snapshot(runtime: &mut AccountRuntime, current: &QuotaOwner) {
+        if runtime
+            .quota_owner
+            .as_ref()
+            .is_some_and(|old| old.is_known() && current.is_known() && old != current)
+        {
+            runtime.quota_until = None;
+            runtime.quota_reset_at = None;
+            runtime.quota_evidence = None;
+            runtime.usage = None;
+            runtime.usage_updated_at_unix = None;
+            runtime.usage_windows.clear();
+            runtime.quota_owner = None;
+        }
+    }
+
+    /// Check the actual managed file, never register a response's old credentials as current.
+    /// The caller holds the runtime lock through both this check and the ensuing mutation.
+    fn accepts_quota_owner(
+        &self,
+        account: &str,
+        runtime: &mut AccountRuntime,
+        owner: &QuotaOwner,
+    ) -> bool {
+        if let Some(home) = self.managed_homes.get(account) {
+            let Ok(current) = managed_quota_owner(home) else {
+                return false;
+            };
+            if &current != owner {
+                return false;
+            }
+            Self::reconcile_quota_owner_snapshot(runtime, &current);
+        }
+        // Inbound aliases have no authoritative current credential file. Preserve their
+        // existing alias-scoped semantics rather than letting competing callers reset quota.
+        runtime.quota_owner = Some(owner.clone());
+        true
     }
 
     pub fn new(config: &Config, affinity: Arc<AffinityStore>) -> Self {
@@ -784,11 +845,19 @@ impl Router {
             account.inflight = 0;
         }
     }
-    pub async fn quota_failure(&self, account: &str, headers: &hyper::HeaderMap) {
+    pub async fn quota_failure_for_owner(
+        &self,
+        account: &str,
+        headers: &hyper::HeaderMap,
+        owner: &QuotaOwner,
+    ) {
         let now = Utc::now();
         let evidence = blocking_quota_evidence(headers, now);
         let delay = quota_delay_at(headers, now, &evidence);
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
+            if !self.accepts_quota_owner(account, a, owner) {
+                return;
+            }
             a.quota_until = Some(Instant::now() + delay);
             a.quota_reset_at = now.checked_add_signed(
                 chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX),
@@ -873,7 +942,12 @@ impl Router {
             }
         }
     }
-    pub async fn observe_headers(&self, account: &str, headers: &hyper::HeaderMap) {
+    pub async fn observe_headers_for_owner(
+        &self,
+        account: &str,
+        headers: &hyper::HeaderMap,
+        owner: &QuotaOwner,
+    ) {
         let observed_evidence = quota_evidence(headers, Utc::now());
         let candidates = [
             "x-codex-primary-used-percent",
@@ -888,6 +962,12 @@ impl Router {
             .max_by(|left, right| left.total_cmp(right))
             .map(|v| v.clamp(0.0, 100.0) as u8);
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
+            if usage.is_none() && observed_evidence.is_empty() {
+                return;
+            }
+            if !self.accepts_quota_owner(account, a, owner) {
+                return;
+            }
             if let Some(usage) = usage {
                 a.usage = Some(usage);
                 a.usage_updated_at_unix = Some(Utc::now().timestamp());
@@ -919,9 +999,17 @@ impl Router {
     /// Replace the last observed usage view with an authoritative WHAM snapshot. This updates
     /// fresh-work admission scores and status metadata without turning a reported 100% window
     /// into a hard quota cooldown before upstream actually rejects a request.
-    pub async fn observe_usage_snapshot(&self, account: &str, snapshot: UsageSnapshot) {
+    pub async fn observe_usage_snapshot_for_owner(
+        &self,
+        account: &str,
+        snapshot: UsageSnapshot,
+        owner: &QuotaOwner,
+    ) {
         let observed_evidence = usage_snapshot_evidence(&snapshot);
         if let Some(runtime) = self.accounts.lock().await.get_mut(account) {
+            if !self.accepts_quota_owner(account, runtime, owner) {
+                return;
+            }
             runtime.usage = snapshot
                 .windows
                 .values()
@@ -942,6 +1030,27 @@ impl Router {
     }
     pub async fn record_count(&self) -> usize {
         self.accounts.lock().await.len()
+    }
+
+    #[cfg(test)]
+    pub async fn quota_failure(&self, account: &str, headers: &hyper::HeaderMap) {
+        let owner = self
+            .managed_homes
+            .get(account)
+            .and_then(|home| managed_quota_owner(home).ok())
+            .unwrap_or_default();
+        self.quota_failure_for_owner(account, headers, &owner).await;
+    }
+
+    #[cfg(test)]
+    pub async fn observe_headers(&self, account: &str, headers: &hyper::HeaderMap) {
+        let owner = self
+            .managed_homes
+            .get(account)
+            .and_then(|home| managed_quota_owner(home).ok())
+            .unwrap_or_default();
+        self.observe_headers_for_owner(account, headers, &owner)
+            .await;
     }
 }
 

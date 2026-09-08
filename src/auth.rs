@@ -57,7 +57,32 @@ pub struct Credentials {
     pub account_id: Option<String>,
 }
 
+/// Quota belongs to a workspace/user, not to a rotating bearer or configured alias.
+/// Opaque credentials retain legacy alias-scoped accounting when claims are unavailable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuotaOwner(Option<blake3::Hash>);
+
+impl QuotaOwner {
+    pub fn is_known(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+pub fn managed_quota_owner(home: &Path) -> Result<QuotaOwner> {
+    Ok(read_auth(&home.join("auth.json"))?
+        .credentials
+        .quota_owner())
+}
+
 impl Credentials {
+    pub fn quota_owner(&self) -> QuotaOwner {
+        QuotaOwner(
+            self.context_identity()
+                .ok()
+                .map(|identity| blake3::hash(identity.as_bytes())),
+        )
+    }
+
     /// Context belongs to a user within a workspace, not to a token or a config alias.
     /// These claims identify the credential; upstream still authenticates the bearer itself.
     pub fn context_identity(&self) -> Result<String> {
