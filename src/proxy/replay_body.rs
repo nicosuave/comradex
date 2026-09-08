@@ -4,22 +4,55 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use async_compression::{codecs::zstd::params::DParameter, tokio::bufread::ZstdDecoder};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{
     Error as HyperError,
-    body::{Frame, Incoming},
+    body::{Body, Frame, Incoming},
 };
 use tempfile::NamedTempFile;
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::state::Stats;
 
 const REQUEST_BODY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub type ProxyBody = BoxBody<Bytes, std::io::Error>;
+
+#[derive(Debug)]
+pub enum ReplayLimit {
+    Request,
+    Global,
+}
+
+impl std::fmt::Display for ReplayLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Request => "request body exceeds configured limit",
+            Self::Global => "global replay spool limit exceeded",
+        })
+    }
+}
+
+impl std::error::Error for ReplayLimit {}
+
+#[derive(Debug)]
+pub struct DecodeError(std::io::Error);
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "decode zstd request body: {}", self.0)
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 pub struct ReplayBody {
     storage: Storage,
@@ -368,7 +401,7 @@ impl Reservation {
             self.stats
                 .active_spool_bytes
                 .fetch_sub(amount, Ordering::AcqRel);
-            bail!("global replay spool limit exceeded")
+            return Err(ReplayLimit::Global.into());
         }
         self.bytes += amount;
         Ok(())
@@ -396,7 +429,7 @@ impl ReplayBody {
         stats: Arc<Stats>,
     ) -> Result<Self> {
         if bytes.len() > hard_limit {
-            bail!("request body exceeds configured limit")
+            return Err(ReplayLimit::Request.into());
         }
         let previous = stats
             .active_spool_bytes
@@ -405,7 +438,7 @@ impl ReplayBody {
             stats
                 .active_spool_bytes
                 .fetch_sub(bytes.len(), Ordering::AcqRel);
-            bail!("global replay spool limit exceeded")
+            return Err(ReplayLimit::Global.into());
         }
         let mut metadata = MetadataScanner::default();
         metadata.feed(&bytes);
@@ -425,13 +458,65 @@ impl ReplayBody {
         })
     }
 
-    pub async fn read(
-        incoming: Incoming,
+    pub async fn read_encoded<B>(
+        incoming: B,
+        zstd: bool,
         memory_limit: usize,
         hard_limit: usize,
         global_limit: usize,
         stats: Arc<Stats>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if !zstd {
+            return Self::read(incoming, memory_limit, hard_limit, global_limit, stats).await;
+        }
+        // Bound the wire representation as well as the decoded body. Decode before
+        // scanning: binary bytes cannot establish JSON routing or context ownership.
+        let mut wire_len = 0usize;
+        let stream = incoming
+            .into_data_stream()
+            .map_err(std::io::Error::other)
+            .and_then(move |data| {
+                wire_len = wire_len.saturating_add(data.len());
+                let result = if wire_len > hard_limit {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::FileTooLarge,
+                        ReplayLimit::Request,
+                    ))
+                } else {
+                    Ok(data)
+                };
+                std::future::ready(result)
+            });
+        // zstd windows are independent of decoded output size. Keep the decoder's
+        // allocation bounded even when an input declares an enormous window.
+        let mut decoder =
+            ZstdDecoder::with_params(StreamReader::new(stream), &[DParameter::window_log_max(27)]);
+        // Consume every frame and reject trailing garbage rather than silently
+        // forwarding only the first frame of a request.
+        decoder.multiple_members(true);
+        let decoded = StreamBody::new(
+            ReaderStream::new(decoder)
+                .map_ok(Frame::data)
+                .map_err(DecodeError),
+        );
+        Self::read(decoded, memory_limit, hard_limit, global_limit, stats).await
+    }
+
+    async fn read<B>(
+        incoming: B,
+        memory_limit: usize,
+        hard_limit: usize,
+        global_limit: usize,
+        stats: Arc<Stats>,
+    ) -> Result<Self>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let mut incoming = incoming;
         let mut memory = Vec::new();
         let mut temp: Option<(tokio::fs::File, tempfile::TempPath)> = None;
@@ -456,7 +541,7 @@ impl ReplayBody {
                 .checked_add(data.len())
                 .context("request length overflow")?;
             if len > hard_limit {
-                bail!("request body exceeds configured limit")
+                return Err(ReplayLimit::Request.into());
             }
             reservation.add(data.len(), global_limit)?;
             metadata.feed(&data);
@@ -622,6 +707,119 @@ fn never_to_io(never: std::convert::Infallible) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn zstd_bytes(bytes: &[u8]) -> Bytes {
+        let mut encoder = async_compression::tokio::bufread::ZstdEncoder::new(bytes);
+        let mut encoded = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut encoder, &mut encoded)
+            .await
+            .unwrap();
+        encoded.into()
+    }
+
+    #[tokio::test]
+    async fn zstd_metadata_and_replay_survive_chunking_and_disk_spooling() {
+        let payload = Bytes::from_static(br#"{"client_metadata":{"thread_id":"thread-1","session_id":"session-1"},"previous_response_id":"resp-1","prompt_cache_key":"cache-1","input":[{"type":"input_file","file_id":"file-1"},{"type":"compaction","encrypted_content":"owned"}]}"#);
+        let wire = zstd_bytes(&payload).await;
+        for memory_limit in [1, 4096] {
+            let stats = Arc::new(Stats::default());
+            let chunks = wire
+                .iter()
+                .map(|byte| Ok::<_, std::io::Error>(Frame::data(Bytes::copy_from_slice(&[*byte]))))
+                .collect::<Vec<_>>();
+            let body = StreamBody::new(futures_util::stream::iter(chunks));
+            let mut replay =
+                ReplayBody::read_encoded(body, true, memory_limit, 4096, 4096, stats.clone())
+                    .await
+                    .unwrap();
+            assert_eq!(replay.thread_id(), Some("thread-1"));
+            assert_eq!(replay.context_session_id(), Some("session-1"));
+            assert_eq!(replay.previous_response_id(), Some("resp-1"));
+            assert_eq!(replay.prompt_cache_key(), Some("cache-1"));
+            assert_eq!(replay.file_ids(), &["file-1"]);
+            assert!(replay.has_nonportable_state());
+            assert_eq!(
+                stats.active_spool_bytes.load(Ordering::Relaxed),
+                payload.len()
+            );
+            for attempt in 0..2 {
+                assert_eq!(
+                    replay
+                        .body(attempt)
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap()
+                        .to_bytes(),
+                    payload
+                );
+            }
+            drop(replay);
+            assert_eq!(stats.active_spool_bytes.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn zstd_replay_limits_release_partial_reservations() {
+        let stats = Arc::new(Stats::default());
+        let payload = vec![b'x'; 50_000];
+        let wire = zstd_bytes(&payload).await;
+        for (hard, global, expected) in [
+            (40_000, 100_000, "request body"),
+            (100_000, 40_000, "global replay"),
+        ] {
+            let error = ReplayBody::read_encoded(
+                Full::new(wire.clone()),
+                true,
+                1,
+                hard,
+                global,
+                stats.clone(),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(stats.active_spool_bytes.load(Ordering::Relaxed), 0);
+        }
+        // An existing request's reservation must count toward decoded admission,
+        // and remain intact when a second request exceeds the shared limit.
+        let existing = ReplayBody::from_bytes(
+            Bytes::from(vec![b'x'; 30_000]),
+            100_000,
+            60_000,
+            stats.clone(),
+        )
+        .unwrap();
+        let error =
+            ReplayBody::read_encoded(Full::new(wire), true, 1, 100_000, 60_000, stats.clone())
+                .await
+                .err()
+                .unwrap();
+        assert!(matches!(
+            error.downcast_ref::<ReplayLimit>(),
+            Some(ReplayLimit::Global)
+        ));
+        assert_eq!(stats.active_spool_bytes.load(Ordering::Relaxed), 30_000);
+        drop(existing);
+        assert_eq!(stats.active_spool_bytes.load(Ordering::Relaxed), 0);
+
+        let wire = zstd_bytes(&payload).await;
+        let truncated = wire.slice(..wire.len() - 1);
+        let error = ReplayBody::read_encoded(
+            Full::new(truncated),
+            true,
+            1,
+            100_000,
+            100_000,
+            stats.clone(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.downcast_ref::<DecodeError>().is_some(), "{error:#}");
+        assert_eq!(stats.active_spool_bytes.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn nesting_limit_does_not_hide_later_account_owned_state() {

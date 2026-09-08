@@ -1,6 +1,8 @@
 mod accepted_retry;
 #[cfg(test)]
 mod accepted_retry_tests;
+#[cfg(test)]
+mod compression_tests;
 mod context;
 mod context_codec;
 mod context_store;
@@ -1185,16 +1187,78 @@ impl App {
         path: String,
     ) -> Result<Response<ProxyBody>> {
         let (parts, body) = req.into_parts();
-        let inbound_headers = parts.headers;
+        let mut inbound_headers = parts.headers;
         let method = parts.method;
-        let replay = ReplayBody::read(
+        // Content-Encoding describes the bytes, not the JSON inside them. Reject
+        // unsupported/stacked codings rather than inspecting opaque bytes or
+        // bypassing ownership checks. Codex HTTP requests use zstd.
+        let encodings = inbound_headers
+            .get_all("content-encoding")
+            .iter()
+            .collect::<Vec<_>>();
+        let zstd = match encodings.as_slice() {
+            [] => false,
+            [value] if value.as_bytes().eq_ignore_ascii_case(b"identity") => false,
+            [value] if value.as_bytes().eq_ignore_ascii_case(b"zstd") => true,
+            _ => {
+                return Ok(error_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "unsupported_content_encoding",
+                    "supported request content encodings are identity and zstd",
+                ));
+            }
+        };
+        let replay = match ReplayBody::read_encoded(
             body,
+            zstd,
             self.config.proxy.replay_memory_bytes,
             self.config.proxy.max_request_bytes,
             self.config.proxy.max_spool_bytes,
             self.stats.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(replay) => replay,
+            Err(error) => {
+                let request_limit = matches!(
+                    error.downcast_ref::<replay_body::ReplayLimit>(),
+                    Some(replay_body::ReplayLimit::Request)
+                ) || error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge)
+                });
+                let (status, code, message) = if request_limit {
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_body_too_large",
+                        "request body exceeds configured limit",
+                    )
+                } else if matches!(
+                    error.downcast_ref::<replay_body::ReplayLimit>(),
+                    Some(replay_body::ReplayLimit::Global)
+                ) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "replay_capacity",
+                        "global replay spool limit exceeded",
+                    )
+                } else if error.downcast_ref::<replay_body::DecodeError>().is_some() {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid_compressed_body",
+                        "could not decode zstd request body",
+                    )
+                } else {
+                    return Err(error);
+                };
+                return Ok(error_response(status, code, message));
+            }
+        };
+        if zstd {
+            inbound_headers.remove("content-encoding");
+            inbound_headers.remove(CONTENT_LENGTH);
+        }
         self.handle_http_replay(
             inbound_headers,
             method,
