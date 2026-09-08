@@ -1,6 +1,6 @@
 [package]
 name = "comradex"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A bounded, sticky account-pool router for native Codex traffic"
@@ -28,6 +28,7 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-linux-x8
 
 [dependencies]
 anyhow = "1"
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 aws-lc-rs = "=1.16.2"
 base64 = "0.22"
 blake3 = "1"

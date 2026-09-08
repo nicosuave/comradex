@@ -1,6 +1,8 @@
 mod accepted_retry;
 #[cfg(test)]
 mod accepted_retry_tests;
+#[cfg(test)]
+mod compression_tests;
 mod context;
 mod context_codec;
 mod context_store;
@@ -9,6 +11,8 @@ mod context_tests;
 #[cfg(test)]
 mod context_ws_tests;
 mod headers;
+#[cfg(test)]
+mod http_continuity_tests;
 mod replay_body;
 #[allow(dead_code)]
 mod sse;
@@ -1185,16 +1189,78 @@ impl App {
         path: String,
     ) -> Result<Response<ProxyBody>> {
         let (parts, body) = req.into_parts();
-        let inbound_headers = parts.headers;
+        let mut inbound_headers = parts.headers;
         let method = parts.method;
-        let replay = ReplayBody::read(
+        // Content-Encoding describes the bytes, not the JSON inside them. Reject
+        // unsupported/stacked codings rather than inspecting opaque bytes or
+        // bypassing ownership checks. Codex HTTP requests use zstd.
+        let encodings = inbound_headers
+            .get_all("content-encoding")
+            .iter()
+            .collect::<Vec<_>>();
+        let zstd = match encodings.as_slice() {
+            [] => false,
+            [value] if value.as_bytes().eq_ignore_ascii_case(b"identity") => false,
+            [value] if value.as_bytes().eq_ignore_ascii_case(b"zstd") => true,
+            _ => {
+                return Ok(error_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "unsupported_content_encoding",
+                    "supported request content encodings are identity and zstd",
+                ));
+            }
+        };
+        let replay = match ReplayBody::read_encoded(
             body,
+            zstd,
             self.config.proxy.replay_memory_bytes,
             self.config.proxy.max_request_bytes,
             self.config.proxy.max_spool_bytes,
             self.stats.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(replay) => replay,
+            Err(error) => {
+                let request_limit = matches!(
+                    error.downcast_ref::<replay_body::ReplayLimit>(),
+                    Some(replay_body::ReplayLimit::Request)
+                ) || error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::FileTooLarge)
+                });
+                let (status, code, message) = if request_limit {
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_body_too_large",
+                        "request body exceeds configured limit",
+                    )
+                } else if matches!(
+                    error.downcast_ref::<replay_body::ReplayLimit>(),
+                    Some(replay_body::ReplayLimit::Global)
+                ) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "replay_capacity",
+                        "global replay spool limit exceeded",
+                    )
+                } else if error.downcast_ref::<replay_body::DecodeError>().is_some() {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid_compressed_body",
+                        "could not decode zstd request body",
+                    )
+                } else {
+                    return Err(error);
+                };
+                return Ok(error_response(status, code, message));
+            }
+        };
+        if zstd {
+            inbound_headers.remove("content-encoding");
+            inbound_headers.remove(CONTENT_LENGTH);
+        }
         self.handle_http_replay(
             inbound_headers,
             method,
@@ -1597,11 +1663,11 @@ impl App {
                         .observe_headers(&account, response.headers())
                         .await;
                     let status = response.status();
-                    // Defer success affinity for native Responses until the
-                    // body terminal confirms a non-quota outcome. Header-time
-                    // binds would otherwise poison affinity when a late body
-                    // (HTTP 200 + SSE `type:error` / quota-shaped
-                    // `incomplete`/`failed`) reclassifies as quota.
+                    // Defer soft success affinity for native Responses until
+                    // the body terminal confirms a non-quota outcome. Returned
+                    // turn-state is different: once exposed to the client, it
+                    // belongs to the issuing account even if the body is aborted
+                    // or later reports quota/capacity failure.
                     let defer_affinity = status.is_success() && is_native_responses(&path);
                     let mut deferred_affinity: Vec<crate::routing::ThreadKey> = Vec::new();
                     if status.is_success()
@@ -1615,10 +1681,15 @@ impl App {
                             .router
                             .affinity
                             .key(&format!("turn-state:{turn_state}"));
-                        if defer_affinity {
-                            deferred_affinity.push(alias);
-                        } else {
-                            self.router.bind(alias, &account).await;
+                        // Codex retains this header before consuming the body and
+                        // may close the HTTP stream after its terminal SSE event.
+                        // Persist its owner before exposing the token, not at EOF.
+                        if !self.router.bind(alias, &account).await {
+                            return Ok(error_response(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "continuity_owner_unavailable",
+                                "could not persist returned turn-state owner",
+                            ));
                         }
                     }
                     if status == StatusCode::UNAUTHORIZED && !capacity {
@@ -4775,7 +4846,7 @@ enum HttpResponseObserverKind {
 }
 
 /// Canonical body observer for the HTTP lane. It defers all success-affinity
-/// binds (previous-response IDs plus header-time affinity keys) until the
+/// binds (previous-response IDs plus soft affinity keys) until the
 /// body terminal confirms a non-quota outcome, and records a quota-terminal
 /// classification for `quota_failure(headers)` with retry-after preserved.
 struct HttpResponseObserver {
@@ -5098,8 +5169,8 @@ impl LeasedIncoming {
             if let Some(quota) = observed.failure {
                 // Late body reclassification as quota: feed
                 // `quota_failure(headers)` preserving retry-after and bind
-                // nothing (no previous-response IDs, no deferred affinity,
-                // no continuation).
+                // no success-affinity (previous-response IDs or deferred soft
+                // keys). Any already-exposed turn-state retains its issuing owner.
                 if quota.kind == FailureKind::Capacity {
                     if !capacity_observation.0.swap(true, Ordering::AcqRel) {
                         router.capacity_failure(&account).await;
