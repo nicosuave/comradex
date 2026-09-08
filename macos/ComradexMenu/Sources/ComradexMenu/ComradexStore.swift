@@ -8,6 +8,7 @@ final class ComradexStore: ObservableObject {
     @Published private(set) var login: LoginSnapshot?
     @Published private(set) var isRefreshing = false
     @Published private(set) var updatingPool: String?
+    @Published private(set) var connectingAccount: String?
     @Published private(set) var errorMessage: String?
     @Published private(set) var actionErrorMessage: String?
     @Published private(set) var lastSuccessfulRefresh: Date?
@@ -79,6 +80,32 @@ final class ComradexStore: ObservableObject {
             } catch {
                 apply(login: LoginSnapshot(account: account, sessionID: login?.sessionID, state: .failed, error: error.localizedDescription))
             }
+        }
+    }
+
+    func connectExistingLogin(account: String) async {
+        guard connectingAccount == nil, !isLoginRunning, updatingPool == nil else { return }
+        connectingAccount = account
+        defer { connectingAccount = nil }
+        do {
+            try await client.connectExistingLogin(account: account)
+            // The daemon acknowledges before reloading. Wait until the new account
+            // is visible instead of reporting the old inbound snapshot as success.
+            for _ in 0..<40 {
+                try await Task.sleep(nanoseconds: 250_000_000)
+                if let updated = try? await client.status(),
+                   let connected = updated.accounts.first(where: { $0.name == account }),
+                   !connected.isInbound {
+                    apply(status: updated)
+                    actionErrorMessage = nil
+                    return
+                }
+            }
+            throw ControlSocketError.daemon("Login connection saved, but Comradex has not reconnected yet. Refresh to check its status.")
+        } catch is CancellationError {
+            return
+        } catch {
+            actionErrorMessage = error.localizedDescription
         }
     }
 

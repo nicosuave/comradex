@@ -32,7 +32,7 @@ Restart the Codex app after installation, or let Comradex restart its background
 comradex restart-codex
 ```
 
-That's enough to route the Codex App's existing account through Comradex. To add another account:
+That's enough to route Codex through Comradex. Setup reuses your existing local Codex login when available. To sign in another account:
 
 ```sh
 comradex account add personal_2
@@ -74,7 +74,17 @@ The daemon reads the configuration once at startup. Restart it after adding an a
 
 ### Accounts
 
-The generated configuration contains the special `app` account. It forwards the Codex App's inbound `Authorization` and `ChatGPT-Account-Id` headers and never stores or refreshes them.
+Setup creates an `app` account connected to the existing ChatGPT login in `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` by default. It uses that file directly, without copying tokens, so the menubar can show usage. If no supported file-based login is available (including keychain-only or API-key logins), setup keeps `app` in `inbound` mode: it forwards the requesting client's `Authorization` and `ChatGPT-Account-Id` headers.
+
+For an existing inbound account, choose **Connect existing Codex login…** in the menubar, or run:
+
+```sh
+comradex account connect app
+# For a custom Codex home:
+comradex account connect app --codex-home /absolute/path/to/codex-home
+```
+
+Connecting preserves the account name, pool membership, and preferred account. The menubar reloads Comradex after confirmation; active requests are interrupted. The CLI restarts a running macOS service; restart a manually launched daemon yourself. The menubar discovers the login from the daemon's `CODEX_HOME` or `~/.codex`; use the CLI option for another home. If the login is unavailable, the action reports an error and leaves the configuration unchanged.
 
 Add a managed account in one step:
 
@@ -94,7 +104,7 @@ comradex account prefer --clear
 comradex account remove personal_2
 ```
 
-`account list` shows each account's login state. `account remove` removes it from the configuration and every pool but keeps its credential directory unless `--purge` is passed.
+`account list` shows each account's login state. `account remove` removes it from the configuration and every pool but keeps its credential directory. `--purge` can delete only the isolated home created for that account; it refuses external or linked Codex homes.
 
 `account prefer <name>` immediately makes that account the first choice for new, unbound work in the default pool. Use `--pool <name>` for another pool and `--clear` to restore automatic selection. The daemon applies the change through an authenticated, user-only Unix socket and persists it in `comradex.toml`; it does not restart, interrupt active turns, or move sticky conversations. An unavailable, quota-limited, or over-threshold preferred account is skipped by the normal quota-aware fallback. If the daemon is not running, the preference is saved and takes effect on its next start.
 
@@ -117,7 +127,7 @@ comradex account login personal_2
 
 This executes `codex login --device-auth` with `CODEX_HOME` set to the isolated directory. Absolute account paths are used unchanged; relative paths are resolved against the canonical directory containing `comradex.toml`, just like a relative `proxy.state_dir`.
 
-For each request, the daemon reads the account's `auth.json`, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. A bounded background sweep checks managed accounts once per minute and refreshes only tokens within five minutes of expiry, so rarely selected accounts do not depend on request-time refresh. Refreshes are single-flight per normalized, non-overlapping account home and atomically rotate `auth.json`; permanent refresh rejection marks only that account as requiring device login. The Codex App's own credentials remain unmanaged.
+For each request, the daemon reads the account's `auth.json`, derives a missing account ID from the ID-token claims, and uses Codex's current OAuth refresh contract when the access token is near expiry or receives a 401. A bounded background sweep checks managed accounts once per minute and refreshes only tokens within five minutes of expiry, so rarely selected accounts do not depend on request-time refresh. Refreshes are single-flight per normalized, non-overlapping account home and atomically rotate `auth.json`; permanent refresh rejection marks only that account as requiring device login. This includes an existing Codex login explicitly connected as a `codex_home` account. Credentials forwarded by an `inbound` account remain unmanaged.
 
 On macOS, `comradex account login` temporarily unloads an installed, running Comradex LaunchAgent while the official Codex client writes the selected account home, then restores the service and waits for its listeners. This prevents login and daemon refresh from racing over rotating credentials.
 

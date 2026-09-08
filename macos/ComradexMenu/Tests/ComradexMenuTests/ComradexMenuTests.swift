@@ -40,11 +40,16 @@ final class ComradexMenuTests: XCTestCase {
         let items = controller.renderedMenu.items
         XCTAssertFalse(controller.renderedMenu.autoenablesItems)
         XCTAssertFalse(items.contains { $0.title.contains("default") || $0.title.contains("Active:") })
-        let app = try XCTUnwrap(items.first(where: { $0.title == "app" }))
+        let app = try XCTUnwrap(items.first(where: { $0.title == "app · Requesting client’s login" }))
+        let connect = try XCTUnwrap(items.first(where: { $0.title == "Connect existing Codex login…" }))
+        XCTAssertEqual(connect.representedObject as? String, "app")
+        XCTAssertTrue(connect.isEnabled)
+        XCTAssertNotNil(connect.action)
+        XCTAssertEqual(items.filter { $0.title == "Connect existing Codex login…" }.count, 1)
         XCTAssertEqual(app.state, .on)
         XCTAssertNil(app.image)
         XCTAssertNil(app.subtitle)
-        XCTAssertEqual(app.toolTip, "Preferred · Codex App account")
+        XCTAssertEqual(app.toolTip, "Preferred · Requesting client’s login")
         let sq = try XCTUnwrap(items.first(where: { $0.title.hasPrefix("sq · 81% left · ") }))
         XCTAssertFalse(sq.title.contains("resets in"))
         XCTAssertFalse(sq.title.contains("19%"))
@@ -210,6 +215,37 @@ final class ComradexMenuTests: XCTestCase {
             with: UIControlCommand.setPreferred(pool: "default", account: nil).encoded()
         ) as? [String: Any])
         XCTAssertTrue(automatic["account"] is NSNull)
+    }
+
+    func testConnectCommandIncludesOnlyAccount() throws {
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: UIControlCommand.connectExistingLogin(account: "app").encoded()
+        ) as? [String: String])
+        XCTAssertEqual(object, ["command": "ui_connect_existing_login", "account": "app"])
+    }
+
+    @MainActor
+    func testConnectFailureRemainsVisibleWithoutClearingStatus() async {
+        let store = ComradexStore(client: FailingClient())
+        let original = UIStatusSnapshot(daemonRunning: true)
+        store.apply(status: original)
+        await store.connectExistingLogin(account: "app")
+        XCTAssertNotNil(store.actionErrorMessage)
+        XCTAssertNil(store.connectingAccount)
+        XCTAssertEqual(store.snapshot, original)
+        XCTAssertNil(store.errorMessage)
+    }
+
+    @MainActor
+    func testConnectWaitsForManagedAccountAfterReload() async throws {
+        let client = ConnectingClient()
+        let store = ComradexStore(client: client)
+        await store.connectExistingLogin(account: "app")
+        XCTAssertNil(store.actionErrorMessage)
+        XCTAssertNil(store.connectingAccount)
+        XCTAssertEqual(store.snapshot?.accounts.first?.kind, "codex_home")
+        let calls = await client.calls
+        XCTAssertEqual(calls, 3)
     }
 
     func testSocketOverrideAndDefaultPath() {
@@ -446,6 +482,7 @@ final class ComradexMenuTests: XCTestCase {
 private struct StubClient: ControlServing {
     func status() async throws -> UIStatusSnapshot { UIStatusSnapshot() }
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
+    func connectExistingLogin(account: String) async throws { throw ControlSocketError.daemon("unavailable") }
     func startLogin(account: String) async throws -> LoginSnapshot { LoginSnapshot(account: account, state: .running) }
     func loginStatus(sessionID: String) async throws -> LoginSnapshot { LoginSnapshot(account: "work", sessionID: sessionID, state: .succeeded) }
 }
@@ -453,6 +490,7 @@ private struct StubClient: ControlServing {
 private struct FailingClient: ControlServing {
     func status() async throws -> UIStatusSnapshot { throw ControlSocketError.daemon("unavailable") }
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { throw ControlSocketError.daemon("unavailable") }
+    func connectExistingLogin(account: String) async throws { throw ControlSocketError.daemon("unavailable") }
     func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.daemon("unavailable") }
     func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.daemon("unavailable") }
 }
@@ -475,6 +513,7 @@ private actor RecoveringClient: ControlServing {
         if account == "missing" { throw ControlSocketError.daemon("Unknown account") }
         return nil
     }
+    func connectExistingLogin(account: String) async throws { throw ControlSocketError.daemon("unavailable") }
     func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
     func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
 }
@@ -492,6 +531,22 @@ private actor SuspendedClient: ControlServing {
         }
     }
     func complete() { continuation?.resume(returning: UIStatusSnapshot(daemonRunning: true)); continuation = nil }
+    func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
+    func connectExistingLogin(account: String) async throws { throw ControlSocketError.daemon("unavailable") }
+    func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+    func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+}
+
+private actor ConnectingClient: ControlServing {
+    private(set) var calls = 0
+    func connectExistingLogin(account: String) async throws {}
+    func status() async throws -> UIStatusSnapshot {
+        calls += 1
+        if calls == 1 { throw ControlSocketError.emptyResponse }
+        let kind = calls == 2 ? "inbound" : "codex_home"
+        let account = try JSONDecoder().decode(AccountSnapshot.self, from: Data("{\"name\":\"app\",\"kind\":\"\(kind)\"}".utf8))
+        return UIStatusSnapshot(daemonRunning: true, accounts: [account])
+    }
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
     func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
     func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
