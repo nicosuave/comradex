@@ -45,7 +45,7 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertNil(app.image)
         XCTAssertNil(app.subtitle)
         XCTAssertEqual(app.toolTip, "Preferred · Codex App account")
-        let sq = try XCTUnwrap(items.first(where: { $0.title.hasPrefix("sq — 81% left · ") }))
+        let sq = try XCTUnwrap(items.first(where: { $0.title.hasPrefix("sq · 81% left · ") }))
         XCTAssertFalse(sq.title.contains("resets in"))
         XCTAssertFalse(sq.title.contains("19%"))
         XCTAssertNotNil(sq.action)
@@ -53,7 +53,7 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertTrue(sq.image?.accessibilityDescription?.contains("Last used") == true)
         XCTAssertNil(sq.subtitle)
         XCTAssertTrue(sq.toolTip?.contains("resets in") == true)
-        let bad = try XCTUnwrap(items.first(where: { $0.title == "bad — Sign-in required" }))
+        let bad = try XCTUnwrap(items.first(where: { $0.title == "bad · Sign-in required" }))
         XCTAssertNil(bad.subtitle)
         XCTAssertNil(bad.image)
         XCTAssertEqual(snapshot.accounts.first(where: { $0.name == "sq" })?.usageUpdatedAtUnix, 1788800000)
@@ -73,7 +73,7 @@ final class ComradexMenuTests: XCTestCase {
             (#""usage_windows":{"primary":{"used_percent":32},"secondary":{"used_percent":10,"limit_window_seconds":604800}}"#, "68% left"),
             (#""usage_percent":31"#, "69% left"),
             (#""usage_windows":{}"#, "Usage pending"),
-            (#""available":false,"unavailable_reason":"quota","retry_at_unix":4102444800"#, "Rate limited"),
+            (#""available":false,"unavailable_reason":"quota""#, "0% left"),
             (#""available":false,"unavailable_reason":"temporary_failure""#, "Temporarily unavailable"),
             (#""auth_state":"login_in_progress""#, "Login in progress"),
             (#""auth_state":"signed_out","signed_in":false"#, "Sign-in required"),
@@ -88,7 +88,7 @@ final class ComradexMenuTests: XCTestCase {
             ]))
             let controller = MenuBarController(store: store)
             controller.rebuildMenu()
-            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "work — \(detail)" })
+            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "work · \(detail)" })
             XCTAssertNil(item.subtitle)
             XCTAssertEqual(item.state, .on)
             XCTAssertFalse(item.toolTip?.contains("0d") == true)
@@ -110,8 +110,28 @@ final class ComradexMenuTests: XCTestCase {
         let controller = MenuBarController(store: store)
         controller.rebuildMenu()
         XCTAssertTrue(controller.renderedMenu.items.contains {
-            $0.title == "sq — 68% left · 6d 4h"
+            $0.title == "sq · 68% left · 6d 4h"
         })
+    }
+
+    @MainActor
+    func testExhaustedQuotaKeepsPercentageAndResetCountdown() throws {
+        let reset = Int64(Date().timeIntervalSince1970) + 5 * 86_400 + 12 * 3_600 + 120
+        let cases = [
+            "\"usage_windows\":{\"primary\":{\"used_percent\":100,\"reset_at_unix\":\(reset),\"limit_window_seconds\":604800}}",
+            "\"usage_windows\":{\"primary\":{\"used_percent\":30,\"limit_window_seconds\":18000},\"secondary\":{\"used_percent\":100,\"reset_at_unix\":\(reset),\"limit_window_seconds\":604800}}",
+            "\"retry_at_unix\":\(reset)",
+            "\"usage_windows\":{\"primary\":{\"used_percent\":100,\"reset_at_unix\":1}},\"retry_at_unix\":\(reset)",
+        ]
+        for fields in cases {
+            let account = try decodeAccount("{\"name\":\"pm\",\"available\":false,\"unavailable_reason\":\"quota\",\(fields)}")
+            let store = ComradexStore(client: StubClient())
+            store.apply(status: UIStatusSnapshot(accounts: [account]))
+            let controller = MenuBarController(store: store)
+            controller.rebuildMenu()
+            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "pm · 0% left · 5d 12h" })
+            XCTAssertTrue(item.toolTip?.contains("Rate limited") == true)
+        }
     }
 
     @MainActor
@@ -219,6 +239,96 @@ final class ComradexMenuTests: XCTestCase {
 
         XCTAssertEqual(store.snapshot, status)
         XCTAssertNotNil(store.errorMessage)
+    }
+
+    @MainActor
+    func testPollingRecoversWithoutMenuInteractionAndStops() async throws {
+        let recovered = expectation(description: "automatic retry succeeded")
+        recovered.assertForOverFulfill = false
+        let client = RecoveringClient(failures: 2, onSuccess: { recovered.fulfill() })
+        let store = ComradexStore(client: client)
+        let controller = MenuBarController(store: store)
+        let cached = UIStatusSnapshot(daemonRunning: false)
+        store.apply(status: cached)
+        await store.refresh()
+        XCTAssertNotNil(store.errorMessage)
+        XCTAssertEqual(store.snapshot, cached)
+        controller.rebuildMenu()
+        XCTAssertTrue(controller.renderedMenu.items.first?.toolTip?.contains("unavailable") == true)
+        XCTAssertFalse(controller.renderedMenu.items.contains { $0.title == "Status may be out of date" })
+
+        controller.startPolling(intervalNanoseconds: 10_000_000)
+        controller.startPolling(intervalNanoseconds: 10_000_000)
+        await fulfillment(of: [recovered], timeout: 2)
+        // Allow the response to reach the main actor before inspecting rendered state.
+        for _ in 0..<100 where store.errorMessage != nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNil(store.errorMessage)
+        XCTAssertEqual(store.snapshot?.daemonRunning, true)
+        XCTAssertNotNil(store.lastSuccessfulRefresh)
+        if #available(macOS 14.4, *) {
+            XCTAssertEqual(controller.renderedMenu.items.first?.subtitle, "Running")
+        }
+        controller.stopPolling()
+        let calls = await client.calls
+        try await Task.sleep(nanoseconds: 40_000_000)
+        let afterStop = await client.calls
+        XCTAssertEqual(afterStop, calls)
+    }
+
+    @MainActor
+    func testOpeningMenuRefreshesAndDefersStructuralUpdateUntilClose() async throws {
+        let refreshed = expectation(description: "opening menu fetched status")
+        refreshed.assertForOverFulfill = false
+        let client = RecoveringClient(failures: 0, onSuccess: { refreshed.fulfill() })
+        let store = ComradexStore(client: client)
+        let controller = MenuBarController(store: store)
+        controller.menuWillOpen(controller.renderedMenu)
+        await fulfillment(of: [refreshed], timeout: 2)
+        for _ in 0..<100 where store.snapshot == nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertEqual(store.snapshot?.daemonRunning, true)
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title == "Connecting…" })
+        controller.menuDidClose(controller.renderedMenu)
+        if #available(macOS 14.4, *) {
+            XCTAssertEqual(controller.renderedMenu.items.first?.subtitle, "Running")
+        }
+        controller.stopPolling()
+    }
+
+    @MainActor
+    func testAccountActionFailureDoesNotMarkConnectionStaleOrDisappearOnPoll() async {
+        let store = ComradexStore(client: RecoveringClient(failures: 0))
+        await store.refresh()
+        await store.setPreferred(pool: "default", account: "missing")
+        XCTAssertNil(store.errorMessage)
+        XCTAssertNotNil(store.actionErrorMessage)
+        await store.refresh()
+        XCTAssertNil(store.errorMessage)
+        XCTAssertNotNil(store.actionErrorMessage)
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title == "Account change failed" })
+        await store.setPreferred(pool: "default", account: "work")
+        XCTAssertNil(store.actionErrorMessage)
+    }
+
+    @MainActor
+    func testConcurrentRefreshesShareOneInFlightRequest() async {
+        let entered = expectation(description: "status request entered")
+        let client = SuspendedClient(onStatus: { entered.fulfill() })
+        let store = ComradexStore(client: client)
+        let first = Task { await store.refresh() }
+        await fulfillment(of: [entered], timeout: 2)
+        await store.refresh()
+        let count = await client.calls
+        XCTAssertEqual(count, 1)
+        await client.complete()
+        await first.value
+        XCTAssertFalse(store.isRefreshing)
+        XCTAssertEqual(store.snapshot?.daemonRunning, true)
     }
 
     @MainActor
@@ -345,4 +455,44 @@ private struct FailingClient: ControlServing {
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { throw ControlSocketError.daemon("unavailable") }
     func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.daemon("unavailable") }
     func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.daemon("unavailable") }
+}
+
+private actor RecoveringClient: ControlServing {
+    private(set) var calls = 0
+    let failures: Int
+    let onSuccess: @Sendable () -> Void
+    init(failures: Int = 1, onSuccess: @escaping @Sendable () -> Void = {}) {
+        self.failures = failures
+        self.onSuccess = onSuccess
+    }
+    func status() async throws -> UIStatusSnapshot {
+        calls += 1
+        if calls <= failures { throw ControlSocketError.daemon("unavailable") }
+        onSuccess()
+        return UIStatusSnapshot(daemonRunning: true)
+    }
+    func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? {
+        if account == "missing" { throw ControlSocketError.daemon("Unknown account") }
+        return nil
+    }
+    func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+    func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+}
+
+private actor SuspendedClient: ControlServing {
+    private(set) var calls = 0
+    let onStatus: @Sendable () -> Void
+    private var continuation: CheckedContinuation<UIStatusSnapshot, Never>?
+    init(onStatus: @escaping @Sendable () -> Void) { self.onStatus = onStatus }
+    func status() async throws -> UIStatusSnapshot {
+        calls += 1
+        return await withCheckedContinuation {
+            continuation = $0
+            onStatus()
+        }
+    }
+    func complete() { continuation?.resume(returning: UIStatusSnapshot(daemonRunning: true)); continuation = nil }
+    func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
+    func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+    func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
 }

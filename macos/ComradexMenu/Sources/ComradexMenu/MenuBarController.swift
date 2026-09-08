@@ -17,6 +17,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private let menu = NSMenu()
     private var refreshTask: Task<Void, Never>?
+    private var pollingTask: Task<Void, Never>?
     private var loginWindowController: NSWindowController?
     private var isMenuOpen = false
     private var hasDeferredMenuUpdate = false
@@ -31,6 +32,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     deinit {
         refreshTask?.cancel()
+        pollingTask?.cancel()
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
         }
@@ -44,11 +46,33 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         rebuildMenu()
+        startPolling()
+    }
+
+    // The controller owns polling so completed requests also update the native menu.
+    func startPolling(intervalNanoseconds: UInt64 = 5_000_000_000) {
+        guard pollingTask == nil else { return }
         refreshStatus()
+        pollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: intervalNanoseconds) }
+                catch { return }
+                guard !Task.isCancelled else { return }
+                self?.refreshStatus()
+            }
+        }
+    }
+
+    func stopPolling() {
+        pollingTask?.cancel()
+        pollingTask = nil
+        refreshTask?.cancel()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        rebuildMenu()
         isMenuOpen = true
+        refreshStatus()
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -67,16 +91,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if #available(macOS 14.4, *) {
             header.subtitle = connectionLabel
         } else {
-            header.title = "Comradex — \(connectionLabel)"
+            header.title = "Comradex · \(connectionLabel)"
         }
         header.image = NSImage(systemSymbolName: connectionIcon, accessibilityDescription: connectionLabel)
+        header.toolTip = [
+            store.lastSuccessfulRefresh.map { "Last updated: \($0.formatted(date: .omitted, time: .standard))" },
+            store.errorMessage,
+        ].compactMap { $0 }.joined(separator: "\n")
         menu.addItem(header)
         menu.addItem(.separator())
 
         if let snapshot = store.snapshot {
-            if store.errorMessage != nil {
-                addInformationalItem("Status may be out of date", icon: "exclamationmark.triangle.fill")
-            }
             addStatus(snapshot)
         } else if let error = store.errorMessage {
             addInformationalItem(
@@ -87,6 +112,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             addInformationalItem("Connecting…", icon: "arrow.triangle.2.circlepath")
         }
 
+        if let error = store.actionErrorMessage {
+            addInformationalItem("Account change failed", icon: "exclamationmark.triangle.fill")
+            menu.items.last?.toolTip = error
+        }
         menu.addItem(.separator())
         menu.addItem(actionItem(
             title: store.isRefreshing ? "Refreshing…" : "Refresh",
@@ -115,7 +144,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             }
             for member in pool.members {
                 guard let account = snapshot.accounts.first(where: { $0.name == member }) else {
-                    addInformationalItem("\(member) — Unavailable", icon: "questionmark.circle")
+                    addInformationalItem("\(member) · Unavailable", icon: "questionmark.circle")
                     continue
                 }
                 addAccount(account, pool: pool)
@@ -148,7 +177,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         item.toolTip = [isPreferred ? "Preferred" : nil, accountDetail(account, expanded: true)]
             .compactMap { $0 }.joined(separator: " · ")
         if !detail.isEmpty {
-            item.title = "\(account.name) — \(detail)"
+            item.title = "\(account.name) · \(detail)"
         }
         item.state = isPreferred ? .on : .off
         item.isEnabled = pool != nil && store.updatingPool == nil
@@ -254,7 +283,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if let error = store.errorMessage, store.snapshot == nil {
             return error.contains("unknown variant") ? "Update required" : "Unavailable"
         }
-        if store.errorMessage != nil { return "Stale" }
+        if store.errorMessage != nil { return "Reconnecting · showing last update" }
         if store.snapshot?.daemonRunning == true { return "Running" }
         return store.isRefreshing ? "Connecting" : "Unavailable"
     }
@@ -270,7 +299,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 if expanded, let retry = retryDescription(account.retryAtUnix) {
                     return "Rate limited · retry in \(retry)"
                 }
-                return "Rate limited"
+                if expanded { return "Rate limited" }
+                // Show the exhausted window, even when a different primary window has quota.
+                let reset = account.usageWindows.values
+                    .filter { ($0.usedPercent ?? 0) >= 100 && $0.limitWindowSeconds != 0 }
+                    .compactMap(\.resetAtUnix)
+                    .filter { $0 > Int64(Date().timeIntervalSince1970) }
+                    .max() ?? account.retryAtUnix
+                return retryDescription(reset).map { "0% left · \($0)" } ?? "0% left"
             case "temporary_failure": return "Temporarily unavailable"
             case "login_in_progress": return "Login in progress"
             case "needs_login": return "Sign-in required"
