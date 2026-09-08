@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import OSLog
 
 @MainActor
 final class ComradexStore: ObservableObject {
@@ -7,7 +8,10 @@ final class ComradexStore: ObservableObject {
     @Published private(set) var login: LoginSnapshot?
     @Published private(set) var isRefreshing = false
     @Published private(set) var updatingPool: String?
-    @Published var errorMessage: String?
+    @Published private(set) var errorMessage: String?
+    @Published private(set) var actionErrorMessage: String?
+    @Published private(set) var lastSuccessfulRefresh: Date?
+    private let logger = Logger(subsystem: "com.nicosuave.comradex.menu", category: "connection")
 
     var isLoginRunning: Bool { login?.state == .running }
 
@@ -26,17 +30,13 @@ final class ComradexStore: ObservableObject {
         defer { isRefreshing = false }
         do {
             apply(status: try await client.status())
-            errorMessage = nil
+        } catch is CancellationError {
+            return
         } catch {
+            if errorMessage != error.localizedDescription {
+                logger.error("Status refresh failed: \(error.localizedDescription, privacy: .private)")
+            }
             errorMessage = error.localizedDescription
-        }
-    }
-
-    func refreshLoop() async {
-        await refresh()
-        while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            if !Task.isCancelled { await refresh() }
         }
     }
 
@@ -48,11 +48,11 @@ final class ComradexStore: ObservableObject {
             if let updated = try await client.setPreferred(pool: pool, account: account) {
                 apply(status: updated)
             } else {
-                apply(status: try await client.status())
+                await refresh()
             }
-            errorMessage = nil
+            actionErrorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            actionErrorMessage = error.localizedDescription
         }
     }
 
@@ -83,7 +83,10 @@ final class ComradexStore: ObservableObject {
     }
 
     func apply(status: UIStatusSnapshot) {
+        if errorMessage != nil { logger.info("Status connection recovered") }
         snapshot = status
+        lastSuccessfulRefresh = Date()
+        errorMessage = nil
     }
 
     func apply(login value: LoginSnapshot) {

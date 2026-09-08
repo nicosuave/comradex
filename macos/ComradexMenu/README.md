@@ -2,13 +2,15 @@
 
 A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; choosing a pool's preferred account; and completing account login when authentication is required.
 
-Each account occupies one line. Healthy managed accounts show the main quota and its reset countdown, such as `sq — 68% left · 6d 4h`; the tooltip labels the countdown explicitly. The primary window is preferred; zero-duration windows are omitted. Authentication or availability errors replace stale usage details. Account rows have no type or health icons: the native check exclusively marks the preferred account, while the menu header's check continues to indicate daemon health.
+Each account occupies one line. Healthy managed accounts show the main quota and its reset countdown, such as `sq · 68% left · 6d 4h`; the tooltip labels the countdown explicitly. The primary window is preferred; zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window’s reset countdown (falling back to the retry deadline); the tooltip explains the rate limit. Other authentication or availability errors replace stale usage details. Account rows have no type or health icons: the native check exclusively marks the preferred account, while the menu header's check continues to indicate daemon health.
 
 The special `app` row explains `Codex App account` in its tooltip because it uses credentials supplied by the Codex desktop app rather than a separately managed account home.
 
 For a single pool, account rows appear without a pool section header. A filled dot marks the last-used account only when it differs from the preferred account; if they are the same, the preferred check is sufficient. Multiple pools retain name-only section headers so repeated account rows remain attributable to their pool.
 
 The app talks directly to the daemon's newline-delimited JSON protocol at `~/.config/comradex/state/control.sock`. It does not invoke the Comradex CLI, read configuration files, expose subprocess output, or handle credentials. Device login polling uses the daemon-issued random session ID and displays only the verification URI, user code, coarse state, and safe error text. Set `COMRADEX_CONTROL_SOCKET` before launching to use another socket path.
+
+Status refreshes automatically every five seconds and when the menu opens. Only one status request runs at a time. While the menu is open, structural updates wait until it closes to avoid moving actions under the pointer. Failed reads preserve the last snapshot and show “Reconnecting · showing last update”; the header tooltip includes the last successful refresh time and failure detail. Recovery clears the connection warning automatically. Account-change errors remain separate and clear on the next successful account change. Connection failures and recovery are recorded in macOS unified logging, with error details private.
 
 ## Build and test
 
