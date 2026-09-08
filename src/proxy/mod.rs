@@ -11,6 +11,8 @@ mod context_tests;
 #[cfg(test)]
 mod context_ws_tests;
 mod headers;
+#[cfg(test)]
+mod http_continuity_tests;
 mod replay_body;
 #[allow(dead_code)]
 mod sse;
@@ -1661,11 +1663,11 @@ impl App {
                         .observe_headers(&account, response.headers())
                         .await;
                     let status = response.status();
-                    // Defer success affinity for native Responses until the
-                    // body terminal confirms a non-quota outcome. Header-time
-                    // binds would otherwise poison affinity when a late body
-                    // (HTTP 200 + SSE `type:error` / quota-shaped
-                    // `incomplete`/`failed`) reclassifies as quota.
+                    // Defer soft success affinity for native Responses until
+                    // the body terminal confirms a non-quota outcome. Returned
+                    // turn-state is different: once exposed to the client, it
+                    // belongs to the issuing account even if the body is aborted
+                    // or later reports quota/capacity failure.
                     let defer_affinity = status.is_success() && is_native_responses(&path);
                     let mut deferred_affinity: Vec<crate::routing::ThreadKey> = Vec::new();
                     if status.is_success()
@@ -1679,10 +1681,15 @@ impl App {
                             .router
                             .affinity
                             .key(&format!("turn-state:{turn_state}"));
-                        if defer_affinity {
-                            deferred_affinity.push(alias);
-                        } else {
-                            self.router.bind(alias, &account).await;
+                        // Codex retains this header before consuming the body and
+                        // may close the HTTP stream after its terminal SSE event.
+                        // Persist its owner before exposing the token, not at EOF.
+                        if !self.router.bind(alias, &account).await {
+                            return Ok(error_response(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "continuity_owner_unavailable",
+                                "could not persist returned turn-state owner",
+                            ));
                         }
                     }
                     if status == StatusCode::UNAUTHORIZED && !capacity {
@@ -4839,7 +4846,7 @@ enum HttpResponseObserverKind {
 }
 
 /// Canonical body observer for the HTTP lane. It defers all success-affinity
-/// binds (previous-response IDs plus header-time affinity keys) until the
+/// binds (previous-response IDs plus soft affinity keys) until the
 /// body terminal confirms a non-quota outcome, and records a quota-terminal
 /// classification for `quota_failure(headers)` with retry-after preserved.
 struct HttpResponseObserver {
@@ -5162,8 +5169,8 @@ impl LeasedIncoming {
             if let Some(quota) = observed.failure {
                 // Late body reclassification as quota: feed
                 // `quota_failure(headers)` preserving retry-after and bind
-                // nothing (no previous-response IDs, no deferred affinity,
-                // no continuation).
+                // no success-affinity (previous-response IDs or deferred soft
+                // keys). Any already-exposed turn-state retains its issuing owner.
                 if quota.kind == FailureKind::Capacity {
                     if !capacity_observation.0.swap(true, Ordering::AcqRel) {
                         router.capacity_failure(&account).await;
