@@ -102,10 +102,17 @@ enum AccountCommand {
     },
     /// Sign an account in through the official Codex device flow
     Login { name: String },
+    /// Connect an inbound account to your existing Codex login
+    Connect {
+        name: String,
+        /// Existing Codex home [default: CODEX_HOME or ~/.codex]
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+    },
     /// Remove an account from the configuration and all pools
     Remove {
         name: String,
-        /// Also delete the account's codex_home directory (credentials)
+        /// Also delete an isolated account home (external logins cannot be purged)
         #[arg(long)]
         purge: bool,
     },
@@ -217,6 +224,13 @@ fn load_config(path: &Path) -> Result<Config> {
 }
 
 fn init(path: &Path) -> Result<()> {
+    init_with_codex_home(
+        path,
+        comradex::accounts::default_codex_home().ok().as_deref(),
+    )
+}
+
+fn init_with_codex_home(path: &Path, codex_home: Option<&Path>) -> Result<()> {
     if path.exists() {
         bail!("{} already exists", path.display())
     }
@@ -254,17 +268,36 @@ kind = "inbound"
         URL_SAFE_NO_PAD.encode(secret),
         URL_SAFE_NO_PAD.encode(key)
     );
-    fs::write(path, text)?;
+    let connected = codex_home
+        .and_then(|home| comradex::accounts::connect_existing_account(&text, "app", home).ok());
+    let uses_existing_login = connected.is_some();
+    let text = connected.unwrap_or(text);
+    write_config_validated(path, &text)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     println!("created {}", path.display());
+    if uses_existing_login {
+        println!("connected app to your existing Codex login");
+    } else {
+        println!(
+            "no supported login found in the local Codex auth.json; app uses the requesting client's login"
+        );
+        println!(
+            "after signing in with Codex, run `comradex account connect app` to enable usage tracking"
+        );
+    }
     Ok(())
 }
 
 async fn serve(path: &Path) -> Result<()> {
+    while serve_once(path).await? {}
+    Ok(())
+}
+
+async fn serve_once(path: &Path) -> Result<bool> {
     #[cfg(unix)]
     if let Some((soft, hard)) = open_file_limits() {
         info!(soft, hard, "open file limits");
@@ -288,6 +321,7 @@ async fn serve(path: &Path) -> Result<()> {
         router.clone(),
         stats.clone(),
     )?;
+    let reload = control_server.reload_requested();
     let mut control_task = tokio::spawn(control_server.run());
     let app = App::new(config.clone(), router.clone(), stats.clone())?;
     let mut tasks = tokio::task::JoinSet::new();
@@ -340,7 +374,12 @@ async fn serve(path: &Path) -> Result<()> {
             usage_refresh_app.refresh_managed_usage_at(now).await;
         }
     });
+    let mut reload_requested = false;
     let listener_error = tokio::select! {
+        _ = reload.notified() => {
+            reload_requested = true;
+            None
+        },
         signal = shutdown_signal() => {
             signal?;
             None
@@ -380,7 +419,7 @@ async fn serve(path: &Path) -> Result<()> {
     if let Some(error) = listener_error {
         return Err(error);
     }
-    Ok(())
+    Ok(reload_requested)
 }
 
 #[cfg(unix)]
@@ -670,7 +709,7 @@ fn account_status_state(
     status: Option<&comradex::routing::AccountRoutingStatus>,
 ) -> String {
     if matches!(account, comradex::config::AccountConfig::Inbound) {
-        return "Codex App login".to_owned();
+        return "Requesting client's login".to_owned();
     }
     let Some(status) = status else {
         return match account {
@@ -763,7 +802,7 @@ fn human_duration(seconds: u64) -> String {
 /// Short, plain-language state for one account.
 fn account_state(account: &comradex::config::AccountConfig) -> String {
     match account {
-        comradex::config::AccountConfig::Inbound => "Codex App login".to_owned(),
+        comradex::config::AccountConfig::Inbound => "Requesting client's login".to_owned(),
         comradex::config::AccountConfig::CodexHome { path } => {
             if path.join("auth.json").exists() {
                 "signed in".to_owned()
@@ -804,6 +843,22 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             Ok(())
         }
         AccountCommand::Login { name } => login(config_path, &name),
+        AccountCommand::Connect { name, codex_home } => {
+            load_config(config_path)?;
+            let home = match codex_home {
+                Some(home) => home,
+                None => comradex::accounts::existing_codex_home()?,
+            };
+            let text = fs::read_to_string(config_path)
+                .with_context(|| format!("read {}", config_path.display()))?;
+            let updated = comradex::accounts::connect_existing_account(&text, &name, &home)?;
+            service::while_daemon_stopped(|| write_config_validated(config_path, &updated))?;
+            println!("connected account {name} to the existing Codex login");
+            println!(
+                "if the daemon is running outside the macOS service, restart it to apply the change"
+            );
+            Ok(())
+        }
         AccountCommand::Prefer { name, pool, clear } => {
             debug_assert!(name.is_some() || clear);
             let config = load_config(config_path)?;
@@ -878,6 +933,12 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
         }
         AccountCommand::Remove { name, purge } => {
             let config = load_config(config_path)?;
+            if purge
+                && let Some(comradex::config::AccountConfig::CodexHome { path }) =
+                    config.accounts.get(&name)
+            {
+                comradex::accounts::validate_purge_home(config_path, &name, path)?;
+            }
             let text = fs::read_to_string(config_path)
                 .with_context(|| format!("read {}", config_path.display()))?;
             let (updated, _) = comradex::accounts::remove_account(&text, &name)?;
@@ -899,10 +960,14 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
                         }
                     }
                 } else if path.exists() {
-                    println!(
-                        "credentials kept at {} (pass --purge to delete them)",
-                        path.display()
-                    );
+                    if comradex::accounts::validate_purge_home(config_path, &name, path).is_ok() {
+                        println!(
+                            "credentials kept at {} (pass --purge to delete them)",
+                            path.display()
+                        );
+                    } else {
+                        println!("existing Codex login kept at {}", path.display());
+                    }
                 }
             }
             Ok(())
@@ -991,7 +1056,9 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
         .get(account_name)
         .with_context(|| format!("unknown account {account_name}"))?;
     let comradex::config::AccountConfig::CodexHome { path } = account else {
-        bail!("this is the Codex App's own login and cannot be logged in here")
+        bail!(
+            "this uses the requesting client's login; use account connect to link an existing login"
+        )
     };
     service::while_daemon_stopped(|| {
         login_managed_home_with(path, |path| {
@@ -1023,6 +1090,86 @@ fn state_dir(config: &Config) -> PathBuf {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn init_links_existing_login_and_falls_back_when_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("custom-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"access_token":"test-access-token"}}"#,
+        )
+        .unwrap();
+        let connected = directory.path().join("connected.toml");
+        init_with_codex_home(&connected, Some(&home)).unwrap();
+        let config = load_config(&connected).unwrap();
+        assert!(
+            matches!(&config.accounts["app"], comradex::config::AccountConfig::CodexHome { path } if path == &fs::canonicalize(&home).unwrap())
+        );
+        assert_eq!(config.pools["default"].members, vec!["app"]);
+        assert_eq!(config.pools["default"].preferred, None);
+        for (index, home) in [
+            None,
+            Some(directory.path()),
+            Some(directory.path().join("missing").as_path()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fallback = directory.path().join(format!("fallback-{index}.toml"));
+            init_with_codex_home(&fallback, home).unwrap();
+            assert!(matches!(
+                load_config(&fallback).unwrap().accounts["app"],
+                comradex::config::AccountConfig::Inbound
+            ));
+        }
+    }
+
+    #[test]
+    fn account_connect_accepts_custom_codex_home() {
+        let cli = Cli::try_parse_from([
+            "comradex",
+            "account",
+            "connect",
+            "app",
+            "--codex-home",
+            "/tmp/custom-codex",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, CommandName::Account { command: AccountCommand::Connect { name, codex_home: Some(path) } } if name == "app" && path == Path::new("/tmp/custom-codex"))
+        );
+    }
+
+    #[test]
+    fn remove_purge_rejects_external_login_before_changing_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("existing-codex");
+        fs::create_dir_all(&home).unwrap();
+        let auth = r#"{"tokens":{"access_token":"test-access-token"}}"#;
+        fs::write(home.join("auth.json"), auth).unwrap();
+        let config_path = directory.path().join("comradex.toml");
+        init_with_codex_home(&config_path, Some(&home)).unwrap();
+        let original = fs::read_to_string(&config_path).unwrap();
+        let updated = comradex::accounts::add_account(&original, "other", "default").unwrap();
+        write_config_validated(&config_path, &updated).unwrap();
+        let error = account_command(
+            &config_path,
+            AccountCommand::Remove {
+                name: "app".to_owned(),
+                purge: true,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot purge an external Codex login")
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), updated);
+        assert_eq!(fs::read_to_string(home.join("auth.json")).unwrap(), auth);
+    }
     use std::ffi::OsString;
 
     #[test]

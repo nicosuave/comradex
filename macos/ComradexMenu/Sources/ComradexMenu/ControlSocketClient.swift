@@ -5,6 +5,7 @@ enum UIControlCommand: Equatable, Sendable {
     case status
     case setPreferred(pool: String, account: String?)
     case startLogin(account: String)
+    case connectExistingLogin(account: String)
     case loginStatus(sessionID: String)
 
     func encoded() throws -> Data {
@@ -20,6 +21,8 @@ enum UIControlCommand: Equatable, Sendable {
             ]
         case .startLogin(let account):
             object = ["command": "ui_start_login", "account": account]
+        case .connectExistingLogin(let account):
+            object = ["command": "ui_connect_existing_login", "account": account]
         case .loginStatus(let sessionID):
             object = ["command": "ui_login_status", "session_id": sessionID]
         }
@@ -59,6 +62,7 @@ protocol ControlServing: Sendable {
     func status() async throws -> UIStatusSnapshot
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot?
     func startLogin(account: String) async throws -> LoginSnapshot
+    func connectExistingLogin(account: String) async throws
     func loginStatus(sessionID: String) async throws -> LoginSnapshot
 }
 
@@ -93,6 +97,13 @@ final class ControlSocketClient: ControlServing, @unchecked Sendable {
     func startLogin(account: String) async throws -> LoginSnapshot {
         let data = try await request(.startLogin(account: account))
         return try Self.decode(LoginSnapshot.self, from: data, preferredKeys: ["login", "login_status", "payload", "result"])
+    }
+
+    func connectExistingLogin(account: String) async throws {
+        struct Acknowledgement: Decodable { let ok: Bool }
+        let data = try await request(.connectExistingLogin(account: account))
+        let response = try Self.decode(Acknowledgement.self, from: data, preferredKeys: [])
+        guard response.ok else { throw ControlSocketError.malformedResponse }
     }
 
     func loginStatus(sessionID: String) async throws -> LoginSnapshot {

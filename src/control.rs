@@ -23,7 +23,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
     net::{UnixListener, UnixStream},
     process::Command,
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Notify, Semaphore},
 };
 use tracing::warn;
 
@@ -62,6 +62,11 @@ enum Request {
     UiStartLogin {
         account: String,
     },
+    UiConnectExistingLogin {
+        account: String,
+        #[serde(default)]
+        codex_home: Option<PathBuf>,
+    },
     UiLoginStatus {
         session_id: String,
     },
@@ -74,6 +79,7 @@ impl Request {
             Self::UiStatus
             | Self::UiSetPreferred { .. }
             | Self::UiStartLogin { .. }
+            | Self::UiConnectExistingLogin { .. }
             | Self::UiLoginStatus { .. } => None,
         }
     }
@@ -489,6 +495,11 @@ impl Drop for SocketGuard {
     }
 }
 
+struct ConfigChanges {
+    edit_lock: Mutex<()>,
+    reload: Arc<Notify>,
+}
+
 pub struct ControlServer {
     listener: UnixListener,
     _guard: SocketGuard,
@@ -497,7 +508,7 @@ pub struct ControlServer {
     router: Arc<Router>,
     stats: Arc<Stats>,
     login_manager: LoginManager,
-    edit_lock: Arc<Mutex<()>>,
+    changes: Arc<ConfigChanges>,
     clients: Arc<Semaphore>,
 }
 
@@ -531,9 +542,16 @@ impl ControlServer {
             router,
             stats,
             login_manager,
-            edit_lock: Arc::new(Mutex::new(())),
+            changes: Arc::new(ConfigChanges {
+                edit_lock: Mutex::new(()),
+                reload: Arc::new(Notify::new()),
+            }),
             clients: Arc::new(Semaphore::new(MAX_CONTROL_CLIENTS)),
         })
+    }
+
+    pub fn reload_requested(&self) -> Arc<Notify> {
+        self.changes.reload.clone()
     }
 
     pub async fn run(self) -> Result<()> {
@@ -544,8 +562,12 @@ impl ControlServer {
             }
         }
         let _login_shutdown = LoginShutdownGuard(self.login_manager.clone());
+        let mut handlers = tokio::task::JoinSet::new();
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            let (stream, _) = tokio::select! {
+                connection = self.listener.accept() => connection?,
+                Some(_) = handlers.join_next(), if !handlers.is_empty() => continue,
+            };
             let Ok(permit) = self.clients.clone().try_acquire_owned() else {
                 continue;
             };
@@ -554,8 +576,8 @@ impl ControlServer {
             let router = self.router.clone();
             let stats = self.stats.clone();
             let login_manager = self.login_manager.clone();
-            let edit_lock = self.edit_lock.clone();
-            tokio::spawn(async move {
+            let changes = self.changes.clone();
+            handlers.spawn(async move {
                 let _permit = permit;
                 if let Err(error) = handle(
                     stream,
@@ -564,7 +586,7 @@ impl ControlServer {
                     router,
                     stats,
                     login_manager,
-                    edit_lock,
+                    changes,
                 )
                 .await
                 {
@@ -603,7 +625,7 @@ async fn handle(
     router: Arc<Router>,
     stats: Arc<Stats>,
     login_manager: LoginManager,
-    edit_lock: Arc<Mutex<()>>,
+    changes: Arc<ConfigChanges>,
 ) -> Result<()> {
     if !peer_is_current_user(&stream)? {
         bail!("control peer is not the daemon user")
@@ -615,6 +637,7 @@ async fn handle(
         .await
         .context("control request timed out")?
         .context("read control request")?;
+    let mut reload_after_response = false;
     let response = if read == 0 || bytes.len() > MAX_MESSAGE_BYTES || !bytes.ends_with(b"\n") {
         Response {
             ok: false,
@@ -626,6 +649,7 @@ async fn handle(
     } else {
         match serde_json::from_slice::<Request>(&bytes) {
             Ok(request) => {
+                reload_after_response = matches!(request, Request::UiConnectExistingLogin { .. });
                 process(
                     request,
                     &config_path,
@@ -633,7 +657,7 @@ async fn handle(
                     &router,
                     &stats,
                     &login_manager,
-                    &edit_lock,
+                    &changes.edit_lock,
                 )
                 .await
             }
@@ -646,17 +670,24 @@ async fn handle(
             },
         }
     };
+    let reload_after_response = reload_after_response && response.ok;
     let mut encoded = serde_json::to_vec(&response)?;
     if encoded.len() > MAX_RESPONSE_BYTES {
         encoded = serde_json::to_vec(&Response::error("control response is too large"))?;
     }
     encoded.push(b'\n');
-    tokio::time::timeout(RESPONSE_TIMEOUT, async {
+    let sent = tokio::time::timeout(RESPONSE_TIMEOUT, async {
         writer.write_all(&encoded).await?;
         writer.shutdown().await
     })
     .await
-    .context("control response timed out")??;
+    .context("control response timed out");
+    // The config is already persisted. Reload even if the client disconnected while
+    // receiving its acknowledgement, but never tear down a successful response early.
+    if reload_after_response {
+        changes.reload.notify_one();
+    }
+    sent??;
     Ok(())
 }
 
@@ -688,6 +719,17 @@ async fn process(
             Request::UiStartLogin { account } => {
                 let home = managed_account_home(config, &account)?.to_owned();
                 Response::login(login_manager.start(account, home).await?)
+            }
+            Request::UiConnectExistingLogin {
+                account,
+                codex_home,
+            } => {
+                let home = match codex_home {
+                    Some(home) => home,
+                    None => accounts::existing_codex_home()?,
+                };
+                connect_existing_login(config_path, edit_lock, &account, &home).await?;
+                Response::routing(router.routing_snapshot().await)
             }
             Request::UiLoginStatus { session_id } => {
                 Response::login(login_manager.status(&session_id)?)
@@ -767,6 +809,18 @@ async fn update_preferred(
     config::write_validated(config_path, &updated)?;
     router.set_preferred(pool, account).await;
     Ok(())
+}
+
+async fn connect_existing_login(
+    config_path: &Path,
+    edit_lock: &Mutex<()>,
+    account: &str,
+    home: &Path,
+) -> Result<()> {
+    let _guard = edit_lock.lock().await;
+    let text = fs::read_to_string(config_path).context("read Comradex configuration")?;
+    let updated = accounts::connect_existing_account(&text, account, home)?;
+    config::write_validated(config_path, &updated)
 }
 
 async fn build_ui_status(
@@ -892,7 +946,9 @@ fn managed_account_home<'a>(config: &'a Config, account: &str) -> Result<&'a Pat
         .with_context(|| format!("unknown account {account}"))?
     {
         crate::config::AccountConfig::Inbound => {
-            bail!("inbound accounts use the Codex App login and cannot be logged in here")
+            bail!(
+                "this account uses the requesting client's login; connect an existing Codex login first"
+            )
         }
         crate::config::AccountConfig::CodexHome { path } => Ok(path),
     }
@@ -1251,6 +1307,106 @@ path = "accounts/work"
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_existing_login_acknowledges_then_reloads_and_rejects_invalid_login() {
+        let (dir, config, router) = managed_login_fixture();
+        let config_path = dir.path().join("comradex.toml");
+        let state = config.proxy.state_dir.clone().unwrap();
+        let server = ControlServer::bind(
+            &state,
+            config_path.clone(),
+            config.clone(),
+            router,
+            Arc::new(Stats::default()),
+        )
+        .unwrap();
+        let reload = server.reload_requested();
+        let task = tokio::spawn(server.run());
+        let original = fs::read_to_string(&config_path).unwrap();
+        let home = dir.path().join("existing-login");
+        let state_copy = state.clone();
+        let home_copy = home.clone();
+        let rejected = tokio::task::spawn_blocking(move || send_raw(&state_copy, serde_json::json!({
+            "command": "ui_connect_existing_login", "account": "app", "codex_home": home_copy,
+        }))).await.unwrap();
+        assert!(!rejected.ok);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reload.notified())
+                .await
+                .is_err()
+        );
+
+        fs::create_dir_all(&home).unwrap();
+        let auth =
+            r#"{"tokens":{"access_token":"fixture-access","refresh_token":"fixture-refresh"}}"#;
+        fs::write(home.join("auth.json"), auth).unwrap();
+        let state_copy = state.clone();
+        let home_copy = home.clone();
+        let accepted = tokio::task::spawn_blocking(move || send_raw(&state_copy, serde_json::json!({
+            "command": "ui_connect_existing_login", "account": "app", "codex_home": home_copy,
+        }))).await.unwrap();
+        assert!(accepted.ok, "{:?}", accepted.error);
+        tokio::time::timeout(Duration::from_secs(1), reload.notified())
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(home.join("auth.json")).unwrap(), auth);
+        assert!(
+            !serde_json::to_string(&accepted)
+                .unwrap()
+                .contains("fixture-access")
+        );
+        task.abort();
+        let _ = task.await;
+        let updated = Arc::new(Config::load(&config_path).unwrap());
+        assert_eq!(
+            updated.pools["default"].members,
+            config.pools["default"].members
+        );
+        assert_eq!(
+            updated.pools["default"].preferred,
+            config.pools["default"].preferred
+        );
+        assert!(matches!(
+            updated.accounts["app"],
+            config::AccountConfig::CodexHome { .. }
+        ));
+        let affinity = Arc::new(
+            AffinityStore::load(
+                state.join("affinity.json"),
+                &updated.proxy.affinity_key,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(Router::new(&updated, affinity));
+        let server = ControlServer::bind(
+            &state,
+            config_path,
+            updated,
+            router,
+            Arc::new(Stats::default()),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.run());
+        let status = tokio::task::spawn_blocking(move || {
+            send_raw(&state, serde_json::json!({"command":"ui_status"}))
+        })
+        .await
+        .unwrap();
+        let app = status
+            .status
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|account| account.name == "app")
+            .unwrap();
+        assert!(app.signed_in);
+        assert_eq!(app.auth_state, UiAccountAuthState::SignedIn);
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

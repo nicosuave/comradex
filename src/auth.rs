@@ -622,6 +622,26 @@ fn inbound_credentials(inbound: &HeaderMap) -> Result<Credentials> {
     })
 }
 
+/// Check a local ChatGPT login without refreshing it or exposing credential contents.
+pub fn validate_existing_login(home: &Path) -> Result<()> {
+    let document = read_auth(&home.join("auth.json")).map_err(|_| {
+        anyhow::anyhow!("No readable Codex login found. Sign in with `codex login` using file credential storage, then try again.")
+    })?;
+    if ![
+        &["tokens", "access_token"][..],
+        &["tokens", "accessToken"][..],
+        &["access_token"][..],
+    ]
+    .iter()
+    .any(|keys| lookup(&document.value, keys).is_some_and(|token| !token.is_empty()))
+    {
+        bail!(
+            "Connect a ChatGPT login from `codex login`; API-key logins do not provide ChatGPT usage."
+        )
+    }
+    Ok(())
+}
+
 fn read_auth(path: &Path) -> Result<AuthDocument> {
     let value: Value = serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read {}", path.display()))?,

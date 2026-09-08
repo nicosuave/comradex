@@ -180,18 +180,31 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             item.title = "\(account.name) · \(detail)"
         }
         item.state = isPreferred ? .on : .off
-        item.isEnabled = pool != nil && store.updatingPool == nil
+        item.isEnabled = pool != nil && store.updatingPool == nil && store.connectingAccount == nil
         if let pool {
             item.representedObject = PreferredAccountAction(pool: pool.name, account: account.name)
         }
         menu.addItem(item)
+
+        if account.isInbound {
+            let connect = actionItem(
+                title: store.connectingAccount == account.name ? "Connecting Codex login…" : "Connect existing Codex login…",
+                icon: "person.crop.circle.badge.checkmark",
+                action: #selector(connectExistingLoginSelected(_:)),
+                enabled: store.connectingAccount == nil && !store.isLoginRunning && store.updatingPool == nil
+            )
+            connect.representedObject = account.name
+            connect.indentationLevel = 1
+            connect.toolTip = "Reuse your local Codex login and show its usage."
+            menu.addItem(connect)
+        }
 
         if account.needsLoginAction {
             let login = actionItem(
                 title: "Re-login \(account.name)…",
                 icon: "person.crop.circle.badge.exclamationmark",
                 action: #selector(reloginSelected(_:)),
-                enabled: !store.isLoginRunning
+                enabled: !store.isLoginRunning && store.connectingAccount == nil
             )
             login.representedObject = account.name
             login.indentationLevel = 1
@@ -258,6 +271,22 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         showLoginWindow()
     }
 
+    @objc private func connectExistingLoginSelected(_ sender: NSMenuItem) {
+        guard let account = sender.representedObject as? String else { return }
+        let alert = NSAlert()
+        alert.messageText = "Connect existing Codex login to \(account)?"
+        alert.informativeText = "Reuse the local Codex login to show usage and route requests with that account. No tokens are copied and your preferred account stays the same. Comradex will reload, interrupting active requests."
+        alert.addButton(withTitle: "Connect Login")
+        alert.addButton(withTitle: "Cancel")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await store.connectExistingLogin(account: account)
+            rebuildMenu()
+        }
+    }
+
     private func showLoginWindow() {
         if loginWindowController == nil {
             let window = NSWindow(
@@ -315,7 +344,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         switch account.authState?.lowercased() {
         case "login_in_progress": return "Login in progress"
-        case "inbound": return "Codex App account"
+        case "inbound": return "Requesting client’s login"
         case "signed_in": return "Signed in"
         case "signed_out": return "Sign-in required"
         default: return account.isSignedIn ? "Signed in" : "Sign-in required"
@@ -330,7 +359,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         {
             return accountState(account, expanded: expanded)
         }
-        if account.isInbound { return expanded ? "Codex App account" : "" }
+        if account.isInbound { return "Requesting client’s login" }
         return usageDescription(account, expanded: expanded) ?? "Usage pending"
     }
 

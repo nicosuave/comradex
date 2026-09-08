@@ -5,7 +5,94 @@
 //! result through `Config::load` before persisting it.
 
 use anyhow::{Context, Result, bail};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 use toml_edit::{DocumentMut, Item, value};
+
+/// Locate the login used by the requesting user's Codex CLI.
+pub fn default_codex_home() -> Result<PathBuf> {
+    default_codex_home_from(std::env::var_os("CODEX_HOME"), std::env::var_os("HOME"))
+}
+
+fn default_codex_home_from(
+    codex_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf> {
+    let path = match codex_home.filter(|value| !value.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(
+            home.filter(|value| !value.is_empty())
+                .context("HOME is not set")?,
+        )
+        .join(".codex"),
+    };
+    let absolute = std::path::absolute(path).context("resolve Codex home")?;
+    crate::config::normalize_codex_home(&absolute)
+}
+
+/// Discover a supported existing login without refreshing or changing credentials.
+pub fn existing_codex_home() -> Result<PathBuf> {
+    let home = default_codex_home()?;
+    crate::auth::validate_existing_login(&home)?;
+    Ok(home)
+}
+
+/// Link an inbound account to an existing login, keeping its pool membership and preferences.
+/// The caller must validate the result with Config::load to reject duplicate homes.
+pub fn connect_existing_account(text: &str, name: &str, home: &Path) -> Result<String> {
+    validate_name(name)?;
+    let mut doc: DocumentMut = text.parse().context("parse comradex.toml")?;
+    let account = doc
+        .get_mut("accounts")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|accounts| accounts.get_mut(name))
+        .with_context(|| format!("unknown account {name}"))?;
+    if account.get("kind").and_then(Item::as_str) != Some("inbound") {
+        bail!(
+            "account {name} already has its own login; only inbound accounts can connect an existing login"
+        )
+    }
+    let home = crate::config::normalize_codex_home(&std::path::absolute(home)?)?;
+    crate::auth::validate_existing_login(&home)?;
+    let path = home
+        .to_str()
+        .context("Codex home path is not valid UTF-8")?;
+    // Preserve inline comments attached to the original kind value.
+    let decor = account["kind"]
+        .as_value()
+        .map(|value| value.decor().clone());
+    account["kind"] = value("codex_home");
+    if let Some(decor) = decor {
+        *account["kind"]
+            .as_value_mut()
+            .expect("kind is a value")
+            .decor_mut() = decor;
+    }
+    account["path"] = value(path);
+    Ok(doc.to_string())
+}
+
+/// Purging is restricted to the isolated home allocated for this account.
+pub fn validate_purge_home(config_path: &Path, name: &str, home: &Path) -> Result<()> {
+    validate_name(name)?;
+    let config_path = std::path::absolute(config_path)?;
+    let parent = config_path
+        .parent()
+        .context("configuration has no parent directory")?;
+    let expected = parent.join("accounts").join(name);
+    // Do not follow a symlink at the isolated account directory to an external login.
+    if std::fs::symlink_metadata(&expected).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!("cannot purge a linked Codex home; remove the account without --purge")
+    }
+    let accounts = crate::config::normalize_codex_home(&parent.join("accounts"))?;
+    let home = crate::config::normalize_codex_home(&std::path::absolute(home)?)?;
+    if home != accounts.join(name) {
+        bail!("cannot purge an external Codex login; remove the account without --purge")
+    }
+    Ok(())
+}
 
 /// Account names become directory names under the config directory, so keep
 /// them to a safe character set.
@@ -135,6 +222,117 @@ members = ["caller"]
 [accounts.caller]
 kind = "inbound"
 "#;
+
+    fn login_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"test-access-token"}}"#,
+        )
+        .unwrap();
+        home
+    }
+
+    #[test]
+    fn discover_home_honors_custom_home_and_empty_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let custom = directory.path().join("custom");
+        let user = directory.path().join("user");
+        assert_eq!(
+            default_codex_home_from(
+                Some(custom.clone().into_os_string()),
+                Some(user.clone().into_os_string())
+            )
+            .unwrap(),
+            crate::config::normalize_codex_home(&custom).unwrap()
+        );
+        assert_eq!(
+            default_codex_home_from(Some(OsString::new()), Some(user.clone().into_os_string()))
+                .unwrap(),
+            crate::config::normalize_codex_home(&user.join(".codex")).unwrap()
+        );
+        assert!(default_codex_home_from(None, None).is_err());
+    }
+
+    #[test]
+    fn connect_preserves_preferences_members_comments_and_credentials() {
+        let home = login_home();
+        let auth_before = std::fs::read(home.path().join("auth.json")).unwrap();
+        let original = set_preferred_account(TEMPLATE, "default", Some("caller"))
+            .unwrap()
+            .replace(
+                "kind = \"inbound\"",
+                "kind = \"inbound\" # existing comment",
+            );
+        let updated =
+            connect_existing_account(&original, "caller", &home.path().join(".")).unwrap();
+        let config: crate::config::Config = toml::from_str(&updated).unwrap();
+        assert_eq!(config.pools["default"].preferred.as_deref(), Some("caller"));
+        assert_eq!(config.pools["default"].members, vec!["caller"]);
+        assert!(updated.contains("# my listener"));
+        assert!(updated.contains("# existing comment"));
+        let crate::config::AccountConfig::CodexHome { path } = &config.accounts["caller"] else {
+            panic!("expected linked login")
+        };
+        assert_eq!(path, &std::fs::canonicalize(home.path()).unwrap());
+        assert_eq!(
+            std::fs::read(home.path().join("auth.json")).unwrap(),
+            auth_before
+        );
+        assert!(connect_existing_account(&updated, "caller", home.path()).is_err());
+        assert!(connect_existing_account(TEMPLATE, "missing", home.path()).is_err());
+    }
+
+    #[test]
+    fn connect_rejects_missing_malformed_and_unsupported_logins_without_exposing_contents() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(connect_existing_account(TEMPLATE, "caller", home.path()).is_err());
+        for auth in [
+            "secret-malformed-json",
+            r#"{"OPENAI_API_KEY":"secret-key"}"#,
+            r#"{"tokens":{"access_token":""}}"#,
+        ] {
+            std::fs::write(home.path().join("auth.json"), auth).unwrap();
+            let error = connect_existing_account(TEMPLATE, "caller", home.path()).unwrap_err();
+            assert!(!format!("{error:#}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn caller_validation_rejects_duplicate_linked_home() {
+        let home = login_home();
+        let added = add_account(TEMPLATE, "other", "default").unwrap();
+        let added = added.replace(
+            "path = \"accounts/other\"",
+            &format!("path = {:?}", home.path().to_str().unwrap()),
+        );
+        let updated = connect_existing_account(&added, "caller", home.path()).unwrap();
+        let config_directory = tempfile::tempdir().unwrap();
+        let config_path = config_directory.path().join("comradex.toml");
+        std::fs::write(&config_path, &updated).unwrap();
+        assert!(crate::config::Config::load(&config_path).is_err());
+    }
+
+    #[test]
+    fn purge_accepts_only_the_accounts_own_isolated_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("comradex.toml");
+        assert!(validate_purge_home(&config, "app", &dir.path().join("accounts/app")).is_ok());
+        for path in [
+            dir.path().join(".codex"),
+            dir.path().join("accounts"),
+            dir.path().join("accounts/other"),
+        ] {
+            assert!(validate_purge_home(&config, "app", &path).is_err());
+        }
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(dir.path().join("accounts")).unwrap();
+            let external = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(external.path(), dir.path().join("accounts/app")).unwrap();
+            assert!(validate_purge_home(&config, "app", external.path()).is_err());
+        }
+    }
 
     #[test]
     fn add_appends_account_and_pool_member_preserving_comments() {
