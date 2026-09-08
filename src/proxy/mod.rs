@@ -417,6 +417,7 @@ fn materialize_http_bridge_continuation(
 struct CapacityObservation(Arc<AtomicBool>);
 
 struct HttpBridgeCapture {
+    quota_owner: auth::QuotaOwner,
     capacity_observation: CapacityObservation,
     input: Vec<serde_json::Value>,
     response_id: Option<String>,
@@ -947,7 +948,7 @@ impl App {
         let observed_at_unix = i64::try_from(now).unwrap_or(i64::MAX);
         let snapshot = usage::parse_usage_response(&bytes, observed_at_unix)?;
         self.router
-            .observe_usage_snapshot(account_id, snapshot)
+            .observe_usage_snapshot_for_owner(account_id, snapshot, &credentials.quota_owner())
             .await;
         Ok(())
     }
@@ -1660,7 +1661,11 @@ impl App {
                         payload_dispatch_owner.get_or_insert_with(|| account.clone());
                     }
                     self.router
-                        .observe_headers(&account, response.headers())
+                        .observe_headers_for_owner(
+                            &account,
+                            response.headers(),
+                            &credentials.quota_owner(),
+                        )
                         .await;
                     let status = response.status();
                     // Defer soft success affinity for native Responses until
@@ -1805,7 +1810,11 @@ impl App {
                             || status == StatusCode::PAYMENT_REQUIRED
                         {
                             self.router
-                                .quota_failure(&account, response.headers())
+                                .quota_failure_for_owner(
+                                    &account,
+                                    response.headers(),
+                                    &credentials.quota_owner(),
+                                )
                                 .await;
                         } else {
                             self.router.soft_failure(&account).await;
@@ -1887,8 +1896,11 @@ impl App {
         let _ = inbound;
         self.auth
             .ensure_bearer_usable(&self.config.accounts[account], &credentials)?;
+        let quota_owner = credentials.quota_owner();
         apply_credentials(headers, credentials)?;
-        Ok(self.client.request(builder.body(body)?).await?)
+        let mut response = self.client.request(builder.body(body)?).await?;
+        response.extensions_mut().insert(quota_owner);
+        Ok(response)
     }
 
     async fn map_file_create_response(
@@ -2856,7 +2868,13 @@ impl App {
             if capacity {
                 // The body classification takes precedence over quota/gateway status.
             } else if is_quota_status(status) {
-                self.router.quota_failure(account, response.headers()).await;
+                self.router
+                    .quota_failure_for_owner(
+                        account,
+                        response.headers(),
+                        &credentials.quota_owner(),
+                    )
+                    .await;
             } else if is_selected_gateway_failure(status) {
                 self.router.soft_failure(account).await;
             } else if status == StatusCode::UNAUTHORIZED
@@ -3239,7 +3257,7 @@ impl App {
                                 match failure.kind {
                                     FailureKind::Quota => {
                                         self.router
-                                            .quota_failure(&account, &hyper::HeaderMap::new())
+                                            .quota_failure_for_owner(&account, &hyper::HeaderMap::new(), &upstream_credentials.quota_owner())
                                             .await;
                                     }
                                     FailureKind::Capacity => {
@@ -3507,7 +3525,11 @@ impl App {
         match failure {
             FailureKind::Quota => {
                 self.router
-                    .quota_failure(account, &hyper::HeaderMap::new())
+                    .quota_failure_for_owner(
+                        account,
+                        &hyper::HeaderMap::new(),
+                        &failed_credentials.quota_owner(),
+                    )
                     .await;
             }
             FailureKind::Capacity => self.router.capacity_failure(account).await,
@@ -4260,7 +4282,11 @@ impl App {
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYMENT_REQUIRED
             ) {
                 self.router
-                    .quota_failure(&selection.account_id, response.headers())
+                    .quota_failure_for_owner(
+                        &selection.account_id,
+                        response.headers(),
+                        &credentials.quota_owner(),
+                    )
                     .await;
             } else if is_selected_gateway_failure(response.status()) {
                 self.router.soft_failure(&selection.account_id).await;
@@ -4798,6 +4824,11 @@ where
         .unwrap_or_default();
     parts.extensions.insert(capacity_observation.clone());
     let account = selection.account_id.clone();
+    let quota_owner = parts
+        .extensions
+        .get::<auth::QuotaOwner>()
+        .cloned()
+        .unwrap_or_default();
     let response_headers = parts.headers.clone();
     let observer = observe_response_ids.then(|| {
         HttpResponseObserver::new(response_observer_for_content_type(
@@ -4807,6 +4838,7 @@ where
     Response::from_parts(
         parts,
         BodyExt::boxed(LeasedIncoming {
+            quota_owner,
             inner: body.map_err(std::io::Error::other).boxed(),
             capacity_observation,
             router,
@@ -4823,6 +4855,7 @@ where
 }
 
 struct LeasedIncoming {
+    quota_owner: auth::QuotaOwner,
     inner: ProxyBody,
     capacity_observation: CapacityObservation,
     router: Arc<Router>,
@@ -5159,6 +5192,7 @@ impl LeasedIncoming {
         observed: HttpObservedBody,
     ) -> Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>> {
         let account = self.account.clone()?;
+        let quota_owner = self.quota_owner.clone();
         // Without an observer there is no deferred work; immediate
         // header-time binds (non-native paths) already ran.
         let router = self.router.clone();
@@ -5176,7 +5210,9 @@ impl LeasedIncoming {
                         router.capacity_failure(&account).await;
                     }
                 } else {
-                    router.quota_failure(&account, &headers).await;
+                    router
+                        .quota_failure_for_owner(&account, &headers, &quota_owner)
+                        .await;
                 }
                 return;
             }
@@ -5602,6 +5638,11 @@ async fn pump_http_response_to_websocket(
     retry_policy: HttpBridgeRetryPolicy,
 ) -> std::result::Result<Option<HttpBridgeCapacityRetry>, HttpBridgePumpFailure> {
     let mut capture = HttpBridgeCapture {
+        quota_owner: response
+            .extensions()
+            .get::<auth::QuotaOwner>()
+            .cloned()
+            .unwrap_or_default(),
         capacity_observation: response
             .extensions()
             .get::<CapacityObservation>()
@@ -5674,7 +5715,7 @@ async fn pump_http_response_to_websocket(
                         app.router.capacity_failure(account).await;
                     }
                 } else {
-                    app.router.quota_failure(account, &response_headers).await;
+                    app.router.quota_failure_for_owner(account, &response_headers, &capture.quota_owner).await;
                 }
             }
         }
@@ -5904,7 +5945,9 @@ async fn send_protocol_events(
         if is_quota || classification.kind == FailureKind::Capacity {
             if let Some(account) = account {
                 if is_quota {
-                    app.router.quota_failure(account, response_headers).await;
+                    app.router
+                        .quota_failure_for_owner(account, response_headers, &capture.quota_owner)
+                        .await;
                 } else if !capture.capacity_observation.0.swap(true, Ordering::AcqRel) {
                     app.router.capacity_failure(account).await;
                 }
@@ -6197,6 +6240,7 @@ async fn collect_proxy_body_with_initial(
 #[cfg(test)]
 mod tests {
     include!("capacity_tests.rs");
+    include!("quota_identity_tests.rs");
     use super::*;
     use crate::{
         config::{AccountConfig, ProxyConfig, ResponsesWebsocketMode},
