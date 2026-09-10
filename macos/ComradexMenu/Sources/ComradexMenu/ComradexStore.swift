@@ -18,6 +18,7 @@ final class ComradexStore: ObservableObject {
 
     private let client: any ControlServing
     private var loginTask: Task<Void, Never>?
+    private var statusGeneration: UInt64 = 0
 
     init(client: any ControlServing = ControlSocketClient()) {
         self.client = client
@@ -26,14 +27,22 @@ final class ComradexStore: ObservableObject {
     deinit { loginTask?.cancel() }
 
     func refresh() async {
-        guard !isRefreshing else { return }
+        guard !isRefreshing, updatingPool == nil else { return }
+        let generation = statusGeneration
         isRefreshing = true
         defer { isRefreshing = false }
+        await readStatus(generation: generation)
+    }
+
+    private func readStatus(generation: UInt64) async {
         do {
-            apply(status: try await client.status())
+            let status = try await client.status()
+            guard generation == statusGeneration else { return }
+            apply(status: status)
         } catch is CancellationError {
             return
         } catch {
+            guard generation == statusGeneration else { return }
             if errorMessage != error.localizedDescription {
                 logger.error("Status refresh failed: \(error.localizedDescription, privacy: .private)")
             }
@@ -44,12 +53,15 @@ final class ComradexStore: ObservableObject {
     func setPreferred(pool: String, account: String?) async {
         guard updatingPool == nil else { return }
         updatingPool = pool
+        // A poll already in flight can contain the previous preference. Never let
+        // it overwrite the authoritative read after the user's selection.
+        statusGeneration &+= 1
         defer { updatingPool = nil }
         do {
             if let updated = try await client.setPreferred(pool: pool, account: account) {
                 apply(status: updated)
             } else {
-                await refresh()
+                await readStatus(generation: statusGeneration)
             }
             actionErrorMessage = nil
         } catch {
@@ -60,7 +72,8 @@ final class ComradexStore: ObservableObject {
     func beginLogin(account: String) {
         guard !isLoginRunning else { return }
         loginTask?.cancel()
-        apply(login: LoginSnapshot(account: account, state: .running))
+        // A new attempt must not inherit the previous account's code or session.
+        login = LoginSnapshot(account: account, state: .running)
         loginTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -117,12 +130,15 @@ final class ComradexStore: ObservableObject {
     }
 
     func apply(login value: LoginSnapshot) {
+        let sameAccount = value.account.isEmpty || value.account == login?.account
+        let sameSession = value.sessionID == nil || login?.sessionID == nil || value.sessionID == login?.sessionID
+        let previous = sameAccount && sameSession ? login : nil
         login = LoginSnapshot(
-            account: value.account.isEmpty ? (login?.account ?? "") : value.account,
-            sessionID: value.sessionID ?? login?.sessionID,
+            account: value.account.isEmpty ? (previous?.account ?? "") : value.account,
+            sessionID: value.sessionID ?? previous?.sessionID,
             state: value.state,
-            verificationURI: value.verificationURI ?? login?.verificationURI,
-            userCode: value.userCode ?? login?.userCode,
+            verificationURI: value.verificationURI ?? previous?.verificationURI,
+            userCode: value.userCode ?? previous?.userCode,
             error: value.error
         )
     }

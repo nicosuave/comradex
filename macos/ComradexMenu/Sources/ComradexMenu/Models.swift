@@ -71,7 +71,13 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     }
     var needsLoginAction: Bool {
         guard !isInbound else { return false }
-        return authState?.caseInsensitiveCompare("signed_out") == .orderedSame
+        return reauthRequired
+            || authState?.caseInsensitiveCompare("signed_out") == .orderedSame
+            || unavailableReason?.caseInsensitiveCompare("needs_login") == .orderedSame
+    }
+    var isLoginInProgress: Bool {
+        authState?.caseInsensitiveCompare("login_in_progress") == .orderedSame
+            || unavailableReason?.caseInsensitiveCompare("login_in_progress") == .orderedSame
     }
 
     enum CodingKeys: String, CodingKey {
@@ -181,6 +187,16 @@ struct LoginSnapshot: Codable, Equatable, Sendable {
     let verificationURI: String?
     let userCode: String?
     let error: String?
+
+    var statusLabel: String {
+        switch state {
+        case .idle, .notStarted: return "Idle"
+        case .running:
+            return userCode?.isEmpty == false ? "Waiting for device authorization" : "Requesting a device code"
+        case .succeeded: return "Signed in"
+        case .failed: return "Login failed"
+        }
+    }
 
     init(
         account: String,

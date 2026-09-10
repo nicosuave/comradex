@@ -268,8 +268,10 @@ impl App {
         let scope = &listener.pool;
         if self.context_store.lookup(scope, session).await?.is_none() {
             let pool = self.pool(listener)?;
+            // Preferences can change without reloading the startup configuration.
+            let preferred = self.router.preferred_account(scope).await;
             let mut selected = None;
-            for account in pool.preferred.iter().chain(pool.members.iter()) {
+            for account in preferred.iter().chain(pool.members.iter()) {
                 if self.router.context_account_available(pool, account).await {
                     selected = Some(account);
                     break;

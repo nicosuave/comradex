@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct LoginWindowView: View {
     @EnvironmentObject private var store: ComradexStore
@@ -15,7 +16,7 @@ struct LoginWindowView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Login: \(login.account)")
                             .font(.title3.weight(.semibold))
-                        Label(stateLabel(login.state), systemImage: stateIcon(login.state))
+                        Label(login.statusLabel, systemImage: stateIcon(login.state))
                             .foregroundStyle(stateColor(login.state))
                     }
                     Spacer()
@@ -30,7 +31,13 @@ struct LoginWindowView: View {
                         Text(code)
                             .font(.system(.title, design: .monospaced, weight: .semibold))
                             .textSelection(.enabled)
-                        Link("Open OpenAI device login", destination: login.safeVerificationURL)
+                        HStack {
+                            Button("Copy Code") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(code, forType: .string)
+                            }
+                            Link("Open OpenAI device login", destination: login.safeVerificationURL)
+                        }
                     }
                 } else if login.state == .running {
                     Text("Waiting for a device code…")
@@ -58,15 +65,6 @@ struct LoginWindowView: View {
         }
         .padding(20)
         .frame(width: 420)
-    }
-
-    private func stateLabel(_ state: LoginState) -> String {
-        switch state {
-        case .idle, .notStarted: return "Idle"
-        case .running: return "Waiting for device authorization"
-        case .succeeded: return "Signed in"
-        case .failed: return "Login failed"
-        }
     }
 
     private func stateIcon(_ state: LoginState) -> String {

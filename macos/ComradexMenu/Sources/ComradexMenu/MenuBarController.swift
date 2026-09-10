@@ -164,24 +164,29 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private func addAccount(_ account: AccountSnapshot, pool: PoolSnapshot?) {
         let isPreferred = pool?.preferred == account.name
         let isLastUsed = pool?.active == account.name
+        let hasRunningLogin = store.isLoginRunning && store.login?.account == account.name
+        let loginAction = account.needsLoginAction || account.isLoginInProgress || hasRunningLogin
         let item = NSMenuItem(
             title: account.name,
-            action: pool == nil ? nil : #selector(preferredAccountSelected(_:)),
+            action: loginAction ? #selector(reloginSelected(_:)) : pool == nil ? nil : #selector(preferredAccountSelected(_:)),
             keyEquivalent: ""
         )
         item.target = self
-        let detail = accountDetail(account)
+        let detail = hasRunningLogin ? "Login in progress…" : accountDetail(account)
         if isLastUsed && !isPreferred {
             item.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Last used · \(detail)")
         }
-        item.toolTip = [isPreferred ? "Preferred" : nil, accountDetail(account, expanded: true)]
+        item.toolTip = [isPreferred ? "Preferred" : nil, accountDetail(account, expanded: true), loginAction ? "Click to sign in; keeps your preferred account unchanged" : nil]
             .compactMap { $0 }.joined(separator: " · ")
         if !detail.isEmpty {
             item.title = "\(account.name) · \(detail)"
         }
         item.state = isPreferred ? .on : .off
-        item.isEnabled = pool != nil && store.updatingPool == nil && store.connectingAccount == nil
-        if let pool {
+        item.isEnabled = store.updatingPool == nil && store.connectingAccount == nil
+            && (loginAction ? (hasRunningLogin || (!store.isLoginRunning && !account.isLoginInProgress)) : pool != nil)
+        if loginAction {
+            item.representedObject = account.name
+        } else if let pool {
             item.representedObject = PreferredAccountAction(pool: pool.name, account: account.name)
         }
         menu.addItem(item)
@@ -197,18 +202,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             connect.indentationLevel = 1
             connect.toolTip = "Reuse your local Codex login and show its usage."
             menu.addItem(connect)
-        }
-
-        if account.needsLoginAction {
-            let login = actionItem(
-                title: "Re-login \(account.name)…",
-                icon: "person.crop.circle.badge.exclamationmark",
-                action: #selector(reloginSelected(_:)),
-                enabled: !store.isLoginRunning && store.connectingAccount == nil
-            )
-            login.representedObject = account.name
-            login.indentationLevel = 1
-            menu.addItem(login)
         }
     }
 
@@ -268,6 +261,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func reloginSelected(_ sender: NSMenuItem) {
         guard let account = sender.representedObject as? String else { return }
         store.beginLogin(account: account)
+        rebuildMenu()
         showLoginWindow()
     }
 
@@ -352,6 +346,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private func accountDetail(_ account: AccountSnapshot, expanded: Bool = false) -> String {
+        if account.isLoginInProgress { return "Login in progress" }
         if account.reauthRequired { return "Sign-in needed for renewal" }
         if !account.available
             || account.authState?.lowercased() == "login_in_progress"

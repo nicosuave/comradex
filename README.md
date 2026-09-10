@@ -209,8 +209,10 @@ Both authenticated URL forms remain supported. Start a new task after enabling i
 track its history from the first inference request.
 
 The first context operation or qualifying inference dispatch establishes a durable notes owner for
-the root session. After inference switches from account A to B, notes reads and writes still use A's
-credentials, and their results are delivered to inference on B. No notes are copied between accounts.
+the root session. New context sessions consult the pool's current preference, including changes
+made without restarting Comradex. After inference switches from account A to B, notes reads and
+writes still use A's credentials, and their results are delivered to inference on B. No notes are
+copied between accounts.
 Inference quota exhaustion does not prevent accessing notes, but missing credentials, an account
 being logged into, removal from the pool, or a different user signing into the same account alias
 make that owner's context unavailable. Notes writes never fail over to another account.
