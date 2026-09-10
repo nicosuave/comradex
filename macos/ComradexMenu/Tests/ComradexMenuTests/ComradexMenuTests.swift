@@ -61,6 +61,9 @@ final class ComradexMenuTests: XCTestCase {
         let bad = try XCTUnwrap(items.first(where: { $0.title == "bad · Sign-in required" }))
         XCTAssertNil(bad.subtitle)
         XCTAssertNil(bad.image)
+        XCTAssertEqual(bad.action.map(NSStringFromSelector), "reloginSelected:")
+        XCTAssertEqual(bad.representedObject as? String, "bad")
+        XCTAssertFalse(items.contains { $0.title.hasPrefix("Re-login ") })
         XCTAssertEqual(snapshot.accounts.first(where: { $0.name == "sq" })?.usageUpdatedAtUnix, 1788800000)
         XCTAssertEqual(snapshot.accounts.first(where: { $0.name == "sq" })?.usageWindows["secondary"]?.resetAtUnix, 4103049600)
         XCTAssertEqual(items.first(where: { $0.title == "Refresh" })?.keyEquivalent, "r")
@@ -188,6 +191,89 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertFalse(inbound.needsLoginAction)
         XCTAssertFalse(inProgress.needsLoginAction)
         XCTAssertFalse(unknown.needsLoginAction)
+    }
+
+    @MainActor
+    func testAccountRowHandlesRenewalAndSignedOutWithoutChangingPreference() throws {
+        let cases = [
+            #""reauth_required":true,"signed_in":true,"auth_state":"signed_in""#,
+            #""auth_state":"signed_out","signed_in":false"#,
+            #""auth_state":"signed_in","available":false,"unavailable_reason":"needs_login""#,
+        ]
+        for fields in cases {
+            let account = try decodeAccount("{\"name\":\"sq\",\"kind\":\"codex_home\",\(fields)}")
+            let pm = try decodeAccount(#"{"name":"pm","kind":"codex_home","auth_state":"signed_in"}"#)
+            let store = ComradexStore(client: StubClient())
+            store.apply(status: UIStatusSnapshot(accounts: [account, pm], pools: [
+                PoolSnapshot(name: "default", members: ["sq", "pm"], preferred: "pm", active: "pm")
+            ]))
+            let controller = MenuBarController(store: store)
+            controller.rebuildMenu()
+            let rows = controller.renderedMenu.items
+            let sq = try XCTUnwrap(rows.first { $0.title.hasPrefix("sq · ") })
+            XCTAssertEqual(sq.action.map(NSStringFromSelector), "reloginSelected:")
+            XCTAssertEqual(sq.representedObject as? String, "sq")
+            XCTAssertTrue(sq.isEnabled)
+            XCTAssertEqual(sq.state, .off)
+            XCTAssertTrue(sq.toolTip?.contains("keeps your preferred account unchanged") == true)
+            XCTAssertFalse(rows.contains { $0.title.hasPrefix("Re-login ") })
+            let preferred = try XCTUnwrap(rows.first { $0.title.hasPrefix("pm · ") })
+            XCTAssertEqual(preferred.action.map(NSStringFromSelector), "preferredAccountSelected:")
+            XCTAssertEqual(preferred.state, .on)
+        }
+    }
+
+    @MainActor
+    func testRunningLoginRowReopensSameSessionAndDisablesOtherLoginRows() throws {
+        let accounts = try ["sq", "pm"].map { name in
+            try decodeAccount("{\"name\":\"\(name)\",\"kind\":\"codex_home\",\"auth_state\":\"signed_out\"}")
+        }
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: accounts))
+        store.apply(login: LoginSnapshot(account: "sq", sessionID: "session", state: .running))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        let sq = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "sq · Login in progress…" })
+        XCTAssertTrue(sq.isEnabled)
+        XCTAssertEqual(sq.action.map(NSStringFromSelector), "reloginSelected:")
+        let pm = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("pm · ") })
+        XCTAssertFalse(pm.isEnabled)
+    }
+
+    @MainActor
+    func testLoginInAnotherClientCannotChangePreferenceOrStartDuplicateLogin() throws {
+        let account = try decodeAccount(#"{"name":"sq","kind":"codex_home","reauth_required":true,"auth_state":"login_in_progress"}"#)
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: [account], pools: [
+            PoolSnapshot(name: "default", members: ["sq"], preferred: nil, active: nil)
+        ]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        let sq = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "sq · Login in progress" })
+        XCTAssertFalse(sq.isEnabled)
+        XCTAssertEqual(sq.state, .off)
+        XCTAssertFalse(controller.renderedMenu.items.contains { $0.title.hasPrefix("Re-login ") })
+    }
+
+    func testDeviceLoginLabelOnlyRequestsAuthorizationOnceCodeExists() {
+        XCTAssertEqual(LoginSnapshot(account: "sq", state: .running).statusLabel, "Requesting a device code")
+        XCTAssertEqual(LoginSnapshot(account: "sq", state: .running, userCode: "").statusLabel, "Requesting a device code")
+        XCTAssertEqual(LoginSnapshot(account: "sq", state: .running, userCode: "ABCD-EFGH").statusLabel, "Waiting for device authorization")
+    }
+
+    @MainActor
+    func testLoginUpdatesKeepCodeOnlyWithinSameAccountAndSession() {
+        let store = ComradexStore(client: StubClient())
+        store.apply(login: LoginSnapshot(account: "sq", sessionID: "one", state: .running, userCode: "ABCD-EFGH"))
+        store.apply(login: LoginSnapshot(account: "", sessionID: "one", state: .running))
+        XCTAssertEqual(store.login?.userCode, "ABCD-EFGH")
+        store.apply(login: LoginSnapshot(account: "sq", sessionID: "two", state: .running))
+        XCTAssertNil(store.login?.userCode)
+        store.apply(login: LoginSnapshot(account: "sq", sessionID: "two", state: .failed, userCode: "WXYZ-ABCD"))
+        store.beginLogin(account: "pm")
+        XCTAssertEqual(store.login?.account, "pm")
+        XCTAssertNil(store.login?.sessionID)
+        XCTAssertNil(store.login?.userCode)
     }
 
     func testLoginDecodesOnlyAllowlistedDeviceFlowFields() throws {
@@ -365,6 +451,34 @@ final class ComradexMenuTests: XCTestCase {
         await first.value
         XCTAssertFalse(store.isRefreshing)
         XCTAssertEqual(store.snapshot?.daemonRunning, true)
+    }
+
+    @MainActor
+    func testPollStartedBeforeSelectionCannotRestoreOldPreferenceOrError() async throws {
+        for staleFailure in [false, true] {
+            let entered = expectation(description: "old poll entered")
+            let client = PreferenceRaceClient(staleFailure: staleFailure, onStatus: { entered.fulfill() })
+            let store = ComradexStore(client: client)
+            let poll = Task { await store.refresh() }
+            await fulfillment(of: [entered], timeout: 2)
+            await store.setPreferred(pool: "default", account: "pm")
+            XCTAssertEqual(store.snapshot?.pools.first?.preferred, "pm")
+            await client.completeOldPoll()
+            await poll.value
+            XCTAssertEqual(store.snapshot?.pools.first?.preferred, "pm")
+            XCTAssertNil(store.errorMessage)
+            XCTAssertNil(store.actionErrorMessage)
+            XCTAssertFalse(store.isRefreshing)
+        }
+    }
+
+    @MainActor
+    func testSuccessfulSelectionWithFailedStatusReadReportsConnectionFailure() async {
+        let store = ComradexStore(client: SelectionWithoutStatusClient())
+        await store.setPreferred(pool: "default", account: "pm")
+        XCTAssertNil(store.actionErrorMessage)
+        XCTAssertNotNil(store.errorMessage)
+        XCTAssertNil(store.updatingPool)
     }
 
     @MainActor
@@ -548,6 +662,54 @@ private actor ConnectingClient: ControlServing {
         return UIStatusSnapshot(daemonRunning: true, accounts: [account])
     }
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
+    func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+    func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+}
+
+private actor PreferenceRaceClient: ControlServing {
+    let staleFailure: Bool
+    let onStatus: @Sendable () -> Void
+    private var calls = 0
+    private var preference = "sq"
+    private var continuation: CheckedContinuation<UIStatusSnapshot, Error>?
+
+    init(staleFailure: Bool, onStatus: @escaping @Sendable () -> Void) {
+        self.staleFailure = staleFailure
+        self.onStatus = onStatus
+    }
+    func status() async throws -> UIStatusSnapshot {
+        calls += 1
+        if calls == 1 {
+            return try await withCheckedThrowingContinuation {
+                continuation = $0
+                onStatus()
+            }
+        }
+        return snapshot(preferred: preference)
+    }
+    func completeOldPoll() {
+        if staleFailure { continuation?.resume(throwing: ControlSocketError.daemon("old failure")) }
+        else { continuation?.resume(returning: snapshot(preferred: "sq")) }
+        continuation = nil
+    }
+    private func snapshot(preferred: String) -> UIStatusSnapshot {
+        UIStatusSnapshot(daemonRunning: true, pools: [
+            PoolSnapshot(name: "default", members: ["sq", "pm"], preferred: preferred, active: nil)
+        ])
+    }
+    func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? {
+        preference = account ?? ""
+        return nil
+    }
+    func connectExistingLogin(account: String) async throws { throw ControlSocketError.emptyResponse }
+    func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+    func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
+}
+
+private struct SelectionWithoutStatusClient: ControlServing {
+    func status() async throws -> UIStatusSnapshot { throw ControlSocketError.daemon("status unavailable") }
+    func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
+    func connectExistingLogin(account: String) async throws { throw ControlSocketError.emptyResponse }
     func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
     func loginStatus(sessionID: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }
 }

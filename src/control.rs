@@ -188,7 +188,30 @@ impl BoundedLoginOutput {
     }
 
     fn allowed_fields(&self) -> (Option<String>, Option<String>) {
-        let text = String::from_utf8_lossy(&self.bytes);
+        // Codex emits SGR colors even to piped stdout. Normalize the accumulated
+        // bytes so an escape split across reads is handled on the next poll too.
+        let mut plain = Vec::with_capacity(self.bytes.len());
+        let mut remaining = self.bytes.as_slice();
+        while let Some((&byte, rest)) = remaining.split_first() {
+            if let Some(parameters) = remaining.strip_prefix(b"\x1b[") {
+                let length = parameters
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
+                    .count();
+                if parameters.get(length) == Some(&b'm') {
+                    remaining = &parameters[length + 1..];
+                    continue;
+                }
+            }
+            plain.push(byte);
+            remaining = rest;
+        }
+        let text = String::from_utf8_lossy(&plain);
+        // A live read may end halfway through a code (or its trailing reset).
+        // Codex terminates prompt lines with newlines; expose only complete tokens.
+        let text = text
+            .rfind(char::is_whitespace)
+            .map_or("", |end| &text[..end]);
         let verification_uri = text.split_whitespace().find_map(|token| {
             let token = token.trim_matches(|character: char| {
                 matches!(
@@ -1414,7 +1437,7 @@ path = "accounts/work"
         let (_dir, config, router) = managed_login_fixture();
         let started = Arc::new(Notify::new());
         let finish = Arc::new(Notify::new());
-        let mut output = b"visit https://evil.example/device secret=never-return\nvisit https://auth.openai.com/codex/device\ncode ABCD-EFGH\n".to_vec();
+        let mut output = b"visit https://evil.example/device secret=never-return\nvisit \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\ncode \x1b[94mABCD-EFGH\x1b[0m\n".to_vec();
         output.extend(std::iter::repeat_n(b'x', MAX_LOGIN_OUTPUT_BYTES * 2));
         let manager = LoginManager::new(
             Arc::new(FakeLoginRunner {
@@ -1585,6 +1608,42 @@ path = "accounts/work"
         ));
         let (_dir, config, _) = managed_login_fixture();
         assert!(managed_account_home(&config, "app").is_err());
+    }
+
+    #[test]
+    fn bounded_login_output_reads_codex_colored_device_prompt_across_chunks() {
+        // Codex prints these ANSI colors even when stdout is a pipe.
+        let prompt = b"\nWelcome to Codex [v\x1b[90m0.153.4\x1b[0m]\n\
+            \x1b[90mOpenAI's command-line coding agent\x1b[0m\n\
+            \nFollow these steps to sign in with ChatGPT using device code authorization:\n\
+            \n1. Open this link in your browser and sign in to your account\n\
+               \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n\
+            \n2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n\
+               \x1b[94mABCD-EFGH\x1b[0m\n";
+        for split in 0..=prompt.len() {
+            let mut output = BoundedLoginOutput::default();
+            output.append(&prompt[..split]);
+            if split < prompt.len() {
+                assert_eq!(output.allowed_fields().1, None, "split at {split}");
+            }
+            output.append(&prompt[split..]);
+            let (uri, code) = output.allowed_fields();
+            assert_eq!(uri.as_deref(), Some("https://auth.openai.com/codex/device"));
+            assert_eq!(code.as_deref(), Some("ABCD-EFGH"));
+        }
+    }
+
+    #[test]
+    fn bounded_login_output_keeps_colored_url_allowlist_exact() {
+        for url in [
+            "https://evil.example/codex/device",
+            "https://auth.openai.com/codex/device/other",
+            "https://auth.openai.com/codex/device?secret=never-return",
+        ] {
+            let mut output = BoundedLoginOutput::default();
+            output.append(format!("\x1b[1;94m{url}\x1b[0m\n").as_bytes());
+            assert_eq!(output.allowed_fields(), (None, None));
+        }
     }
 
     #[test]

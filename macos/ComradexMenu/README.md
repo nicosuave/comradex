@@ -4,6 +4,8 @@ A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, acco
 
 Each account occupies one line. Healthy managed accounts show the main quota and its reset countdown, such as `sq · 68% left · 6d 4h`; the tooltip labels the countdown explicitly. The primary window is preferred; zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window’s reset countdown (falling back to the retry deadline); the tooltip explains the rate limit. Other authentication or availability errors replace stale usage details. Account rows have no type or health icons: the native check exclusively marks the preferred account, while the menu header's check continues to indicate daemon health.
 
+Click an account that needs sign-in or renewal to open its device login without changing your preferred account. There is no separate re-login row. While this app is handling login, the same row reopens the login window. The window distinguishes requesting a code from waiting for authorization, shows the selectable code, and provides Copy Code and browser controls. Starting another login attempt clears the previous attempt's code.
+
 The special `app` row explains `Codex App account` in its tooltip because it uses credentials supplied by the Codex desktop app rather than a separately managed account home.
 
 For a single pool, account rows appear without a pool section header. A filled dot marks the last-used account only when it differs from the preferred account; if they are the same, the preferred check is sufficient. Multiple pools retain name-only section headers so repeated account rows remain attributable to their pool.

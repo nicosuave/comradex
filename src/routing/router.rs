@@ -518,6 +518,10 @@ impl Router {
         }
     }
 
+    pub async fn preferred_account(&self, pool: &str) -> Option<String> {
+        self.preferred.lock().await.get(pool).cloned()
+    }
+
     pub async fn routing_snapshot(&self) -> RoutingSnapshot {
         let now = Instant::now();
         let wall_now = Utc::now();

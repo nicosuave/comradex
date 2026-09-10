@@ -156,6 +156,14 @@ fn write_auth(home: &Path, workspace: &str, user: &str) {
 }
 
 fn context_test_app(dir: &Path, upstream: std::net::SocketAddr) -> ContextTestApp {
+    context_test_app_with_preference(dir, upstream, None)
+}
+
+fn context_test_app_with_preference(
+    dir: &Path,
+    upstream: std::net::SocketAddr,
+    preferred: Option<&str>,
+) -> ContextTestApp {
     let account_a = dir.join("a");
     let account_b = dir.join("b");
     write_auth(&account_a, "workspace-a", "user-a");
@@ -177,7 +185,7 @@ fn context_test_app(dir: &Path, upstream: std::net::SocketAddr) -> ContextTestAp
             "default".into(),
             PoolConfig {
                 members: vec!["a".into(), "b".into()],
-                preferred: None,
+                preferred: preferred.map(str::to_owned),
             },
         )]),
         accounts: BTreeMap::from([
@@ -721,6 +729,55 @@ async fn notes_owner_quota_failure_never_calls_an_alternate_account() {
     let seen = upstream.seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].account_id, "workspace-a");
+}
+
+#[tokio::test]
+async fn first_context_read_uses_current_preference_and_preserves_its_owner() {
+    for (startup, current, expected) in [
+        (Some("a"), Some("b"), "workspace-b"),
+        (Some("b"), None, "workspace-a"),
+    ] {
+        let upstream = start_upstream(Arc::new(|request| {
+            (
+                StatusCode::OK,
+                json!({"encrypted_output": format!("cipher-{}", request.account_id)}),
+            )
+        }))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let test = context_test_app_with_preference(dir.path(), upstream.address, startup);
+        test.app
+            .router
+            .set_preferred("default", current.map(str::to_owned))
+            .await;
+
+        for read in 0..2 {
+            if read == 1 {
+                // Once notes have an owner, later preference changes must not move them.
+                let other = if current == Some("b") { "a" } else { "b" };
+                test.app
+                    .router
+                    .set_preferred("default", Some(other.to_owned()))
+                    .await;
+            }
+            let (status, _) = post(
+                &test.app,
+                &test.listener,
+                "/alpha/notes/v2/read_file",
+                hyper::HeaderMap::new(),
+                Bytes::from_static(
+                    br#"{"context":{"session_id":"123e4567-e89b-12d3-a456-426614174000","current_agent_name":"/root"}}"#,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let seen = upstream.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for request in seen.iter() {
+            assert_eq!(request.account_id, expected);
+        }
+    }
 }
 
 #[tokio::test]
