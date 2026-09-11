@@ -52,6 +52,32 @@ pub fn install(config_path: &Path, state_dir: &Path) -> Result<PathBuf> {
     let stdout = state_dir.join("service.stdout.log");
     let stderr = state_dir.join("service.stderr.log");
     let working_directory = config_path.parent().unwrap_or(Path::new("/"));
+    let previous = match fs::read(&plist_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
+    };
+    // Retain the readiness identity when comparing an existing installation.
+    // Reinstalling the same service must not kill a launch still in progress.
+    let service_nonce = previous
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|plist| plist_string_after(plist, "<key>COMRADEX_SERVICE_NONCE</key><string>"))
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+    let plist = render_plist(
+        &executable,
+        &config_path,
+        working_directory,
+        &stdout,
+        &stderr,
+        &service_nonce,
+    );
+    if previous.as_deref() == Some(plist.as_bytes()) {
+        start()?;
+        return Ok(plist_path);
+    }
+    // A changed definition gets a new identity: an old listener must not
+    // satisfy readiness for its replacement.
     let service_nonce = format!("{:032x}", rand::random::<u128>());
     let plist = render_plist(
         &executable,
@@ -66,11 +92,6 @@ pub fn install(config_path: &Path, state_dir: &Path) -> Result<PathBuf> {
     candidate.as_file().sync_all()?;
     validate_plist(candidate.path())?;
 
-    let previous = match fs::read(&plist_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
-    };
     let domain = launchctl_domain();
     let was_loaded = is_loaded(&domain)?;
     if was_loaded && previous.is_none() {
@@ -187,6 +208,12 @@ where
     let Err(start_error) = start_new(plist_path) else {
         return Ok(());
     };
+    if start_error.is::<ReadinessTimeout>() {
+        // A deadline is an observation, not a failed bootstrap. In particular,
+        // xpcproxy may still be waiting for macOS to launch the executable.
+        // Leave KeepAlive and the installed job intact so it can finish.
+        return Err(start_error);
+    }
 
     let rollback_result = stop()
         .and_then(|()| match previous {
@@ -388,9 +415,9 @@ pub fn restart() -> Result<()> {
     let previous_pid = state.pid();
     match state {
         LaunchAgentState::Unloaded => bootstrap(&domain, &service.plist_path)?,
-        LaunchAgentState::LoadedStopped { .. } | LaunchAgentState::Running { .. } => {
-            kickstart(&domain)?
-        }
+        LaunchAgentState::Starting
+        | LaunchAgentState::LoadedStopped { .. }
+        | LaunchAgentState::Running { .. } => kickstart(&domain)?,
     }
     service.wait_until_ready(&domain, previous_pid)
 }
@@ -483,6 +510,7 @@ fn installed_service() -> Result<InstalledService> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchAgentState {
     Unloaded,
+    Starting,
     LoadedStopped { previous_pid: Option<u32> },
     Running { pid: u32 },
 }
@@ -490,7 +518,7 @@ enum LaunchAgentState {
 impl LaunchAgentState {
     fn pid(self) -> Option<u32> {
         match self {
-            Self::Unloaded => None,
+            Self::Unloaded | Self::Starting => None,
             Self::LoadedStopped { previous_pid } => previous_pid,
             Self::Running { pid } => Some(pid),
         }
@@ -503,6 +531,17 @@ fn launchctl_output_state(output: &str) -> LaunchAgentState {
         && let Some(pid) = pid
     {
         LaunchAgentState::Running { pid }
+    } else if output.lines().any(|line| {
+        matches!(
+            line.trim(),
+            "state = spawn scheduled"
+                | "state = spawning"
+                | "state = xpcproxy"
+                | "state = pre-exec"
+                | "state = spawn pending"
+        )
+    }) {
+        LaunchAgentState::Starting
     } else {
         LaunchAgentState::LoadedStopped { previous_pid: pid }
     }
@@ -523,7 +562,7 @@ fn execute_start(
             kickstart_job()?;
             previous_pid
         }
-        LaunchAgentState::Running { .. } => None,
+        LaunchAgentState::Running { .. } | LaunchAgentState::Starting => None,
     };
     wait(previous_pid)
 }
@@ -677,13 +716,155 @@ fn wait_until_ready(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            if targets.is_empty() {
-                bail!("LaunchAgent did not reach a running state within {timeout:?}")
-            }
-            bail!("LaunchAgent did not become ready on {targets} within {timeout:?}")
+            return Err(readiness_deadline_error(
+                launchctl.as_deref(),
+                targets,
+                timeout,
+            ));
         }
         thread::sleep(READY_POLL_INTERVAL);
     }
+}
+
+fn readiness_deadline_error(
+    output: Option<&str>,
+    targets: String,
+    timeout: Duration,
+) -> anyhow::Error {
+    let Some(output) = output else {
+        return anyhow::anyhow!(
+            "LaunchAgent disappeared while waiting for readiness; run `comradex service logs`"
+        );
+    };
+    let state = launchctl_state_summary(output);
+    if matches!(
+        launchctl_output_state(output),
+        LaunchAgentState::LoadedStopped { .. }
+    ) && (launchctl_last_exit(output).is_some_and(|code| code != 0)
+        || output
+            .lines()
+            .any(|line| line.trim().starts_with("last terminating signal = ")))
+    {
+        return anyhow::anyhow!(
+            "LaunchAgent failed to start ({state}); run `comradex service logs`"
+        );
+    }
+    ReadinessTimeout {
+        targets,
+        timeout,
+        state,
+    }
+    .into()
+}
+
+#[derive(Debug)]
+struct ReadinessTimeout {
+    targets: String,
+    timeout: Duration,
+    state: String,
+}
+
+impl std::fmt::Display for ReadinessTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "service is not ready after {:?} ({}; listeners: {}). The LaunchAgent is still installed and loaded; startup has not been cancelled. Run `comradex service status` or `comradex service logs`; reinstalling is unnecessary",
+            self.timeout, self.state, self.targets
+        )
+    }
+}
+
+impl std::error::Error for ReadinessTimeout {}
+
+fn launchctl_last_exit(output: &str) -> Option<i32> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("last exit code = ")?.parse().ok())
+}
+
+fn launchctl_state_summary(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("state = ")
+                || line.starts_with("pid = ")
+                || line.starts_with("last exit code = ")
+                || line.starts_with("last terminating signal = ")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn status_description() -> Result<String> {
+    platform_check()?;
+    if !installed()? {
+        return Ok("service is not installed (run `comradex service install`)".into());
+    }
+    let Some(output) = launchctl_print(&launchctl_domain())? else {
+        return Ok("service is installed but not loaded; run `comradex service start`\nLogs: `comradex service logs` (includes historical output)".into());
+    };
+    let state = launchctl_output_state(&output);
+    let description = match state {
+        LaunchAgentState::Starting => "service is starting; macOS has not finished launching it",
+        LaunchAgentState::Running { .. } => {
+            let service = installed_service()?;
+            let (listeners, nonce) = readiness_probe(
+                &service.listener_addresses,
+                service.service_nonce.as_deref(),
+            );
+            if listeners_ready(listeners, nonce) {
+                "service is running and ready"
+            } else {
+                "service process is running but its listeners are not ready"
+            }
+        }
+        _ => "service is loaded but stopped; run `comradex service start`",
+    };
+    Ok(format!(
+        "{description}\n{}\nLogs: `comradex service logs` (includes historical output)",
+        launchctl_state_summary(&output)
+    ))
+}
+
+pub fn logs() -> Result<String> {
+    platform_check()?;
+    let plist = fs::read_to_string(plist_path()?)
+        .context("read installed LaunchAgent; service logs require an installed service")?;
+    let mut result = String::new();
+    for key in ["StandardOutPath", "StandardErrorPath"] {
+        if let Some(path) = plist_string_after(&plist, &format!("<key>{key}</key><string>")) {
+            result.push_str(&log_excerpt(Path::new(&path))?);
+        }
+    }
+    Ok(result)
+}
+
+fn log_excerpt(path: &Path) -> Result<String> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(format!("{}: no log yet\n", path.display()));
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let metadata = file.metadata()?;
+    let modified = metadata
+        .modified()
+        .map(|time| chrono::DateTime::<chrono::Local>::from(time).to_rfc3339())
+        .unwrap_or_else(|_| "unknown".into());
+    let start = metadata.len().saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(64 * 1024).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<_> = text.lines().rev().take(40).collect();
+    Ok(format!(
+        "{} (last modified {modified}; historical output, last {} lines):\n{}\n",
+        path.display(),
+        lines.len(),
+        lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+    ))
 }
 
 fn listeners_ready(listeners: &[SocketAddr], service_nonce: Option<&str>) -> bool {
@@ -923,6 +1104,106 @@ mod tests {
         assert_eq!(stops.get(), 2);
         assert_eq!(new_starts.get(), 1);
         assert_eq!(previous_starts.get(), 1);
+    }
+
+    #[test]
+    fn slow_replacement_stays_installed_and_is_not_killed_or_rolled_back() {
+        for previous in [None, Some(b"old".as_slice())] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("service.plist");
+            if let Some(bytes) = previous {
+                fs::write(&path, bytes).unwrap();
+            }
+            let mut candidate = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+            candidate.write_all(b"new").unwrap();
+            let stops = Cell::new(0);
+            let result = replace_plist_transaction(
+                &path,
+                candidate,
+                previous,
+                previous.is_some(),
+                || {
+                    stops.set(stops.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    Err(ReadinessTimeout {
+                        targets: "127.0.0.1:10100".into(),
+                        timeout: READY_TIMEOUT,
+                        state: "state = xpcproxy".into(),
+                    }
+                    .into())
+                },
+                |_| panic!("a slow launch must not restore the old job"),
+            );
+            assert!(result.unwrap_err().is::<ReadinessTimeout>());
+            assert_eq!(fs::read(&path).unwrap(), b"new");
+            assert_eq!(stops.get(), usize::from(previous.is_some()));
+        }
+    }
+
+    #[test]
+    fn readiness_deadline_distinguishes_current_failure_from_historical_exit() {
+        for state in ["xpcproxy", "spawning", "running"] {
+            let output = format!("state = {state}\npid = 42\nlast exit code = 1\n");
+            assert!(
+                readiness_deadline_error(Some(&output), String::new(), READY_TIMEOUT)
+                    .is::<ReadinessTimeout>()
+            );
+        }
+        let failed = "state = waiting\nlast exit code = 1\n";
+        let error = readiness_deadline_error(Some(failed), String::new(), READY_TIMEOUT);
+        assert!(!error.is::<ReadinessTimeout>());
+        assert!(error.to_string().contains("last exit code = 1"));
+        let crashed = "state = waiting\nlast terminating signal = Segmentation fault: 11\n";
+        let error = readiness_deadline_error(Some(crashed), String::new(), READY_TIMEOUT);
+        assert!(!error.is::<ReadinessTimeout>());
+        assert!(error.to_string().contains("Segmentation fault"));
+        assert!(
+            !readiness_deadline_error(None, String::new(), READY_TIMEOUT).is::<ReadinessTimeout>()
+        );
+    }
+
+    #[test]
+    fn start_does_not_kill_a_process_still_being_launched() {
+        for state in [
+            "spawn scheduled",
+            "spawning",
+            "xpcproxy",
+            "pre-exec",
+            "spawn pending",
+        ] {
+            let state = launchctl_output_state(&format!("state = {state}\npid = 42\n"));
+            assert_eq!(state, LaunchAgentState::Starting);
+            execute_start(
+                state,
+                || panic!("already loaded"),
+                || panic!("must not kill an in-progress launch"),
+                |previous| {
+                    assert_eq!(previous, None);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn logs_show_bounded_history_with_path_and_readable_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        fs::write(
+            &path,
+            (0..100)
+                .map(|n| format!("record {n}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let result = log_excerpt(&path).unwrap();
+        assert!(result.contains("last modified "));
+        assert!(result.contains("historical output, last 40 lines"));
+        assert!(!result.contains("record 59\n"));
+        assert!(result.ends_with("record 99\n"));
     }
 
     #[test]

@@ -125,6 +125,8 @@ enum ServiceCommand {
     Start,
     Uninstall,
     Status,
+    /// Show recent service stdout and stderr with log paths and modification times
+    Logs,
     /// Restart the daemon so it reloads comradex.toml (needed after config
     /// edits such as adding an account)
     Restart,
@@ -298,6 +300,12 @@ async fn serve(path: &Path) -> Result<()> {
 }
 
 async fn serve_once(path: &Path) -> Result<bool> {
+    let startup = std::time::Instant::now();
+    info!(
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        "daemon startup: loading configuration and routing state"
+    );
     #[cfg(unix)]
     if let Some((soft, hard)) = open_file_limits() {
         info!(soft, hard, "open file limits");
@@ -313,6 +321,10 @@ async fn serve_once(path: &Path) -> Result<bool> {
         Duration::from_secs(config.proxy.affinity_idle_days * 86_400),
     )?);
     let router = Arc::new(Router::new(&config, affinity));
+    info!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "daemon startup: routing state loaded; opening control socket"
+    );
     let stats = Arc::new(Stats::default());
     let control_server = control::ControlServer::bind(
         &state,
@@ -323,7 +335,15 @@ async fn serve_once(path: &Path) -> Result<bool> {
     )?;
     let reload = control_server.reload_requested();
     let mut control_task = tokio::spawn(control_server.run());
+    info!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "daemon startup: control socket bound; initializing transports and stores"
+    );
     let app = App::new(config.clone(), router.clone(), stats.clone())?;
+    info!(
+        elapsed_ms = startup.elapsed().as_millis(),
+        "daemon startup: initialization complete; starting listeners"
+    );
     let mut tasks = tokio::task::JoinSet::new();
     for (name, listener) in config.listeners.clone() {
         tasks.spawn(app.clone().run_listener(name, listener));
@@ -466,21 +486,10 @@ fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
             None => println!("service is not installed"),
         },
         ServiceCommand::Status => {
-            if service::status()? {
-                println!("service is running");
-            } else if service::installed()? {
-                println!("service is installed but not running");
-                if let Some(stderr) = service::last_stderr_line()? {
-                    println!(
-                        "last stderr line{}: {}",
-                        stderr_timestamp_suffix(stderr.log_modified_at_unix),
-                        stderr.line
-                    );
-                }
-                println!("run `comradex service start`");
-            } else {
-                println!("service is not installed (run `comradex service install`)");
-            }
+            println!("{}", service::status_description()?);
+        }
+        ServiceCommand::Logs => {
+            println!("{}", service::logs()?);
         }
         ServiceCommand::Restart => {
             service::restart()?;
@@ -1337,6 +1346,17 @@ mod tests {
             cli.command,
             CommandName::Service {
                 command: ServiceCommand::Start
+            }
+        ));
+    }
+
+    #[test]
+    fn service_logs_is_a_first_class_command() {
+        let cli = Cli::try_parse_from(["comradex", "service", "logs"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Service {
+                command: ServiceCommand::Logs
             }
         ));
     }

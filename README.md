@@ -185,17 +185,20 @@ An installed Comradex binary can manage its own LaunchAgent:
 comradex service install
 comradex service start
 comradex service status
+comradex service logs
 comradex service restart
 comradex service uninstall
 ```
 
-`service start` is idempotent: it loads an installed but unloaded LaunchAgent, revives a stopped job, and leaves an already-running daemon uninterrupted after verifying its listeners. `service restart` validates the edited configuration before stopping anything, then restarts the LaunchAgent and waits for every listener to answer a health probe. A broken edit fails validation and leaves the running daemon untouched. Both commands use the configuration path recorded in the installed plist regardless of `--config`.
+`service start` is idempotent: it loads an installed but unloaded LaunchAgent, revives a stopped job, and leaves an already-running or starting job uninterrupted while waiting for its listeners. `service restart` validates the edited configuration before stopping anything, then restarts the LaunchAgent and waits for every listener to answer a health probe. A broken edit fails validation and leaves the running daemon untouched. Both commands use the configuration path recorded in the installed plist regardless of `--config`.
 
-The installer records the exact executable and configuration paths, validates the generated plist, starts the daemon at login, and writes logs beneath Comradex's state directory. Early-login platform certificate loading is retried for up to 7.75 seconds so a temporarily unavailable macOS trust store does not strand the LaunchAgent. Installation waits for launchd to report a running PID and verifies every configured listener with a Comradex-specific HTTP probe. A failed replacement restores the previous Comradex plist and loaded job when possible.
+The installer records the exact executable and configuration paths, validates the generated plist, starts the daemon at login, and writes logs beneath Comradex's state directory. Repeating `service install` with the same service definition starts or waits for the existing job without replacing it. WebSocket TLS uses bundled Mozilla roots, avoiding macOS trust-store enumeration during startup. Installation waits for launchd to report a running PID and verifies every configured listener with a Comradex-specific HTTP probe. If the readiness wait expires while the job is still starting, it remains loaded so macOS can finish launching it; the timeout does not kill and replace it. A failed replacement restores the previous Comradex plist and loaded job when possible.
 
 The service manages only `com.nicosuave.comradex`; it does not inspect, stop, or remove OpenCodex or any other relay. Stop OpenCodex first if it owns the same listener port. Codex configuration installation and service installation are separate reversible operations.
 
-`service status` reports whether launchd currently has a running Comradex process. When an installed service is down, it shows the last bounded stderr line and the exact start command; launchctl permission and communication failures are reported as errors instead of being mistaken for an unloaded job. On SIGTERM, Comradex stops the listeners, aborts and joins tracked HTTP/WebSocket connection tasks, clears in-flight counters, and only then writes final affinity, file-owner, and statistics snapshots. Active requests are terminated rather than gracefully completed during shutdown.
+`service status` distinguishes a ready daemon, a running process whose listeners are not ready, a starting job, a stopped job, and an unloaded service. It includes the last exit result when available and directs you to `service logs`, which shows up to 40 lines from the final 64 KiB of each stdout and stderr log, their paths, and human-readable modification times. These logs are historical: an old stderr line is not evidence of the current startup failure. Launchctl permission and communication failures are reported as errors instead of being mistaken for an unloaded job.
+
+On SIGTERM, Comradex stops the listeners, aborts and joins tracked HTTP/WebSocket connection tasks, clears in-flight counters, and only then writes final affinity, file-owner, and statistics snapshots. Active requests are terminated rather than gracefully completed during shutdown.
 
 ## How routing works
 
