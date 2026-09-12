@@ -310,6 +310,7 @@ async fn start_context_proxy(
             PoolConfig {
                 members: vec!["a".into(), "b".into()],
                 preferred: None,
+                preserved: None,
             },
         )]),
         accounts: BTreeMap::from([

@@ -186,6 +186,7 @@ fn context_test_app_with_preference(
             PoolConfig {
                 members: vec!["a".into(), "b".into()],
                 preferred: preferred.map(str::to_owned),
+                preserved: None,
             },
         )]),
         accounts: BTreeMap::from([

@@ -248,6 +248,7 @@ impl Fixture {
                 PoolConfig {
                     members: members.iter().map(|name| (*name).to_owned()).collect(),
                     preferred: Some("a".into()),
+                    preserved: None,
                 },
             )]),
             accounts,

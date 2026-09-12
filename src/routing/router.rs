@@ -49,6 +49,7 @@ pub enum SelectionStaleReason {
     EpochChanged,
     BindingChanged,
     PreferredSuperseded,
+    PreservedSuperseded,
 }
 
 impl std::fmt::Display for SelectionStaleReason {
@@ -63,6 +64,7 @@ impl std::fmt::Display for SelectionStaleReason {
             Self::EpochChanged => "epoch_changed",
             Self::BindingChanged => "binding_changed",
             Self::PreferredSuperseded => "preferred_superseded",
+            Self::PreservedSuperseded => "preserved_superseded",
         };
         write!(f, "{reason}")
     }
@@ -72,6 +74,8 @@ impl std::fmt::Display for SelectionStaleReason {
 pub struct RoutingSnapshot {
     #[serde(default)]
     pub preferred_accounts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub preserved_accounts: BTreeMap<String, String>,
     // NOTE (fix1 display honesty): `active_accounts` is the last *fresh pick* per pool. It is
     // only updated on fresh (unbound) selections and never on bound/select_exact traffic, so it
     // must not be read as "the account carrying traffic". Use `wired_accounts` for last-wired.
@@ -208,6 +212,7 @@ pub struct Router {
     pub affinity: Arc<AffinityStore>,
     accounts: Mutex<HashMap<String, AccountRuntime>>,
     preferred: Mutex<HashMap<String, String>>,
+    preserved: Mutex<HashMap<String, String>>,
     active: Mutex<HashMap<String, String>>,
     wired: Mutex<HashMap<String, String>>,
     sequence: AtomicU64,
@@ -332,6 +337,18 @@ impl Router {
                     })
                     .collect(),
             ),
+            preserved: Mutex::new(
+                config
+                    .pools
+                    .iter()
+                    .filter_map(|(pool, config)| {
+                        config
+                            .preserved
+                            .as_ref()
+                            .map(|account| (pool.clone(), account.clone()))
+                    })
+                    .collect(),
+            ),
             active: Mutex::new(HashMap::new()),
             wired: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
@@ -424,6 +441,13 @@ impl Router {
                         && a.avoid_until.is_none_or(|v| v <= now)
                 })
         };
+        let preserved = self.preserved.lock().await.get(pool_name).cloned();
+        let has_unpreserved = pool
+            .members
+            .iter()
+            .any(|id| preserved.as_ref() != Some(id) && eligible(id));
+        let eligible =
+            |id: &str| eligible(id) && (!has_unpreserved || preserved.as_deref() != Some(id));
         // Apply the soft capacity preference only after normal eligibility. An
         // unavailable sibling must never turn this preference into an empty pool.
         let has_capacity_alternative = pool
@@ -522,6 +546,20 @@ impl Router {
         self.preferred.lock().await.get(pool).cloned()
     }
 
+    /// Change the preserved account used for new work without disturbing bindings or in-flight
+    /// requests. The caller validates pool membership before invoking this method.
+    pub async fn set_preserved(&self, pool: &str, account: Option<String>) {
+        let mut preserved = self.preserved.lock().await;
+        match account {
+            Some(account) => {
+                preserved.insert(pool.to_owned(), account);
+            }
+            None => {
+                preserved.remove(pool);
+            }
+        }
+    }
+
     pub async fn routing_snapshot(&self) -> RoutingSnapshot {
         let now = Instant::now();
         let wall_now = Utc::now();
@@ -537,6 +575,13 @@ impl Router {
         RoutingSnapshot {
             preferred_accounts: self
                 .preferred
+                .lock()
+                .await
+                .iter()
+                .map(|(pool, account)| (pool.clone(), account.clone()))
+                .collect(),
+            preserved_accounts: self
+                .preserved
                 .lock()
                 .await
                 .iter()
@@ -678,6 +723,23 @@ impl Router {
         // Fresh work: a configured-preferred flip to another eligible account mid-resolve
         // supersedes this selection. Bound work ignores preference by design.
         if !selection.bound {
+            let preserved = self.preserved.lock().await.get(pool_name).cloned();
+            if preserved.as_deref() == Some(selection.account_id.as_str()) {
+                let accounts = self.account_runtimes().await;
+                let has_alternative = pool.members.iter().any(|id| {
+                    id != &selection.account_id
+                        && selection.excluded_account.as_ref() != Some(id)
+                        && accounts.get(id).is_some_and(|runtime| {
+                            !runtime.auth_unavailable()
+                                && !runtime.login_in_progress
+                                && runtime.quota_until.is_none_or(|until| until <= now)
+                                && runtime.avoid_until.is_none_or(|until| until <= now)
+                        })
+                });
+                if has_alternative {
+                    return Err(SelectionStaleReason::PreservedSuperseded);
+                }
+            }
             let configured = self.preferred.lock().await.get(pool_name).cloned();
             if let Some(preferred_id) = configured
                 && preferred_id != selection.account_id
@@ -1372,6 +1434,7 @@ mod tests {
                 PoolConfig {
                     members: vec!["a".into(), "b".into()],
                     preferred: None,
+                    preserved: None,
                 },
             )]),
             accounts: BTreeMap::from([
@@ -1379,6 +1442,139 @@ mod tests {
                 ("b".into(), AccountConfig::Inbound),
             ]),
         }
+    }
+
+    #[tokio::test]
+    async fn preserve_applies_to_fresh_work_and_pre_wire_changes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, affinity, router, pool) = stale_test_router(dir.path());
+        let key = affinity.key("existing");
+        router
+            .select("default", &pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        let selected = router.select("default", &pool, None, None).await.unwrap();
+        router.set_preserved("default", Some("a".into())).await;
+        assert_eq!(
+            router.validate_selection(&selected, "default", &pool).await,
+            Err(SelectionStaleReason::PreservedSuperseded)
+        );
+        let bound = router
+            .select("default", &pool, Some(key), None)
+            .await
+            .unwrap();
+        assert_eq!(bound.account_id, "a");
+        assert!(bound.bound);
+        assert!(
+            router
+                .validate_selection(&bound, "default", &pool)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            router
+                .select_preferred("default", &pool, "a")
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+        router.set_preserved("default", None).await;
+        assert_eq!(
+            router
+                .select_preferred("default", &pool, "a")
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        assert!(
+            router
+                .routing_snapshot()
+                .await
+                .preserved_accounts
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn preserved_account_is_last_even_when_other_accounts_have_higher_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cfg, affinity, _, _) = stale_test_router(dir.path());
+        cfg.pools.get_mut("default").unwrap().preserved = Some("a".into());
+        cfg.pools
+            .get_mut("default")
+            .unwrap()
+            .members
+            .push("c".into());
+        cfg.accounts.insert("c".into(), AccountConfig::Inbound);
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        router.accounts.lock().await.get_mut("b").unwrap().usage = Some(99);
+        router.accounts.lock().await.get_mut("c").unwrap().usage = Some(98);
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "c"
+        );
+        router.reauth_required("c").await;
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+        router.quota_failure("b", &HeaderMap::new()).await;
+        let last = router.select("default", pool, None, None).await.unwrap();
+        assert_eq!(last.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&last, "default", pool)
+                .await
+                .is_ok()
+        );
+        router.reauth_required("a").await;
+        assert!(router.select("default", pool, None, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn preserve_respects_retry_exclusions_single_account_pools_and_pool_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, router, mut pool) = stale_test_router(dir.path());
+        router.set_preserved("default", Some("a".into())).await;
+        let retry = router
+            .select("default", &pool, None, Some("b"))
+            .await
+            .unwrap();
+        assert_eq!(retry.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&retry, "default", &pool)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            router
+                .select_preferred("other", &pool, "a")
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
+        pool.members = vec!["a".into()];
+        assert_eq!(
+            router
+                .select("default", &pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "a"
+        );
     }
 
     #[tokio::test]
@@ -1459,6 +1655,7 @@ mod tests {
             router.routing_snapshot().await,
             RoutingSnapshot {
                 preferred_accounts: BTreeMap::from([("default".into(), "b".into())]),
+                preserved_accounts: BTreeMap::new(),
                 active_accounts: BTreeMap::from([("default".into(), "b".into())]),
                 // `wired` tracks last actually-sent traffic, not fresh picks; no wire happened here.
                 wired_accounts: BTreeMap::new(),

@@ -100,6 +100,16 @@ enum AccountCommand {
         #[arg(long, conflicts_with = "name", required_unless_present = "name")]
         clear: bool,
     },
+    /// Use an account last for new work without interrupting active turns
+    Preserve {
+        /// Account to preserve; omit when using --clear
+        name: Option<String>,
+        #[arg(long, default_value = "default")]
+        pool: String,
+        /// Clear the preserved account for this pool
+        #[arg(long, conflicts_with = "name", required_unless_present = "name")]
+        clear: bool,
+    },
     /// Sign an account in through the official Codex device flow
     Login { name: String },
     /// Connect an inbound account to your existing Codex login
@@ -616,6 +626,11 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
             .and_then(|routing| routing.preferred_accounts.get(name))
             .or(pool.preferred.as_ref())
             .map_or("automatic", String::as_str);
+        let preserved = match routing {
+            Some(routing) => routing.preserved_accounts.get(name),
+            None => pool.preserved.as_ref(),
+        }
+        .map_or("none", String::as_str);
         let active = routing
             .and_then(|routing| routing.active_accounts.get(name))
             .map_or("no fresh work yet", String::as_str);
@@ -624,7 +639,9 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         let wired = routing
             .and_then(|routing| routing.wired_accounts.get(name))
             .map_or("nothing wired yet", String::as_str);
-        println!("  {name:width$}  preferred {preferred}, active {active}, wired {wired}");
+        println!(
+            "  {name:width$}  preferred {preferred}, preserved {preserved}, active {active}, wired {wired}"
+        );
     }
 
     println!("\ntraffic");
@@ -913,6 +930,59 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
                         ),
                         None => println!(
                             "saved automatic selection for pool {pool}; it will apply when the daemon starts"
+                        ),
+                    }
+                    Ok(())
+                }
+                Err(control_error) => Err(control_error).context(
+                    "live routing request did not complete; check `comradex status` before retrying",
+                ),
+            }
+        }
+        AccountCommand::Preserve { name, pool, clear } => {
+            debug_assert!(name.is_some() || clear);
+            let config = load_config(config_path)?;
+            let pool_config = config
+                .pools
+                .get(&pool)
+                .with_context(|| format!("unknown pool {pool}"))?;
+            if let Some(name) = &name
+                && !pool_config.members.contains(name)
+            {
+                bail!("account {name} is not a member of pool {pool}")
+            }
+            match control::set_preserved(
+                &state_dir(&config),
+                &config.proxy.installation_secret,
+                &pool,
+                name.as_deref(),
+            ) {
+                Ok(routing) => {
+                    match name {
+                        Some(name) => println!(
+                            "pool {pool} now uses {name} last for new work; active turns were not interrupted"
+                        ),
+                        None => println!(
+                            "pool {pool} no longer preserves an account; active turns were not interrupted"
+                        ),
+                    }
+                    if let Some(active) = routing.active_accounts.get(&pool) {
+                        println!("active account for fresh work: {active}");
+                    }
+                    Ok(())
+                }
+                Err(_control_error) if !control::socket_path(&state_dir(&config)).exists() => {
+                    let text = fs::read_to_string(config_path)
+                        .with_context(|| format!("read {}", config_path.display()))?;
+                    let updated =
+                        comradex::accounts::set_preserved_account(&text, &pool, name.as_deref())?;
+                    write_config_validated(config_path, &updated)?;
+                    match name {
+                        Some(name) => println!(
+                            "saved {name} as the preserved account for pool {pool}; it will apply when the daemon starts"
+                        ),
+                        None => println!(
+                            "cleared the preserved account for pool {pool}; it will apply when the daemon starts"
                         ),
                     }
                     Ok(())
@@ -1338,6 +1408,39 @@ mod tests {
 
         assert!(Cli::try_parse_from(["comradex", "account", "prefer", "work", "--clear"]).is_err());
         assert!(Cli::try_parse_from(["comradex", "account", "prefer"]).is_err());
+    }
+
+    #[test]
+    fn account_preserve_cli_accepts_an_account_or_clear_but_not_both() {
+        let cli = Cli::try_parse_from(["comradex", "account", "preserve", "work", "--pool", "p"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Account {
+                command: AccountCommand::Preserve {
+                    name: Some(name),
+                    pool,
+                    clear: false,
+                },
+            } if name == "work" && pool == "p"
+        ));
+
+        let cli = Cli::try_parse_from(["comradex", "account", "preserve", "--clear"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandName::Account {
+                command: AccountCommand::Preserve {
+                    name: None,
+                    pool,
+                    clear: true,
+                },
+            } if pool == "default"
+        ));
+
+        assert!(
+            Cli::try_parse_from(["comradex", "account", "preserve", "work", "--clear"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["comradex", "account", "preserve"]).is_err());
     }
 
     #[test]
