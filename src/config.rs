@@ -94,6 +94,9 @@ pub struct ProxyConfig {
     pub affinity_idle_days: u64,
     #[serde(default = "default_flush_seconds")]
     pub snapshot_interval_seconds: u64,
+    /// Start freshly reset weekly windows with a minimal account-specific request.
+    #[serde(default)]
+    pub auto_activate_weekly_usage: bool,
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
     #[serde(default)]
@@ -118,6 +121,7 @@ impl Default for ProxyConfig {
             max_spool_bytes: default_global_spool(),
             affinity_idle_days: default_affinity_days(),
             snapshot_interval_seconds: default_flush_seconds(),
+            auto_activate_weekly_usage: false,
             state_dir: None,
             installation_secret: String::new(),
             affinity_key: String::new(),
@@ -368,6 +372,19 @@ members = ["caller"]
 kind = "inbound"
 "#
         )
+    }
+
+    #[test]
+    fn weekly_usage_activation_requires_explicit_opt_in() {
+        assert!(!ProxyConfig::default().auto_activate_weekly_usage);
+        for (text, enabled) in [
+            ("", false),
+            ("auto_activate_weekly_usage = false", false),
+            ("auto_activate_weekly_usage = true", true),
+        ] {
+            let config: ProxyConfig = toml::from_str(text).unwrap();
+            assert_eq!(config.auto_activate_weekly_usage, enabled);
+        }
     }
 
     #[test]

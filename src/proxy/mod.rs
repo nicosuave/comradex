@@ -16,6 +16,7 @@ mod http_continuity_tests;
 mod replay_body;
 #[allow(dead_code)]
 mod sse;
+mod usage_activation;
 #[allow(dead_code)]
 mod websocket_protocol;
 
@@ -743,6 +744,7 @@ pub struct App {
     live_calls: LiveCallStore,
     auth: auth::Resolver,
     usage_url: Uri,
+    usage_activation: AsyncMutex<Result<crate::usage_activation::UsageActivationLedger>>,
     file_owners: Arc<AffinityStore>,
     context_store: context_store::ContextStore,
     context_codec: context_codec::ContextCodec,
@@ -804,6 +806,11 @@ impl App {
             ),
             auth,
             usage_url: usage::USAGE_URL.parse().expect("static usage URL is valid"),
+            usage_activation: AsyncMutex::new(
+                crate::usage_activation::UsageActivationLedger::open(
+                    state_dir.join("usage-activation.json"),
+                ),
+            ),
             file_owners,
             context_store: context_store::ContextStore::open(
                 &state_dir.join("context.sqlite3"),
@@ -886,7 +893,7 @@ impl App {
             .usage_fetch_accounts_checked
             .fetch_add(accounts.len() as u64, Ordering::Relaxed);
 
-        let results = futures_util::stream::iter(accounts)
+        let mut results = futures_util::stream::iter(accounts)
             .map(|(account_id, account)| async move {
                 let result = tokio::time::timeout(
                     USAGE_FETCH_ACCOUNT_TIMEOUT,
@@ -905,15 +912,24 @@ impl App {
             .collect::<Vec<_>>()
             .await;
 
+        // Usage fetches remain concurrent; activation requests are sent one at a time.
+        results.sort_by(|left, right| left.0.cmp(&right.0));
         for (account_id, result) in results {
             match result {
-                Ok(()) => {
+                Ok((snapshot, credentials)) => {
                     self.stats
                         .usage_fetch_successes
                         .fetch_add(1, Ordering::Relaxed);
                     self.stats
                         .usage_fetch_last_success_unix
                         .store(now, Ordering::Relaxed);
+                    if self.config.proxy.auto_activate_weekly_usage
+                        && let Err(error) = self
+                            .activate_weekly_usage(&account_id, &snapshot, &credentials)
+                            .await
+                    {
+                        warn!(account = account_id, %error, "weekly usage activation failed");
+                    }
                 }
                 Err(error) => {
                     self.stats
@@ -930,7 +946,7 @@ impl App {
         account_id: &str,
         account: &crate::config::AccountConfig,
         now: u64,
-    ) -> Result<()> {
+    ) -> Result<(usage::UsageSnapshot, Credentials)> {
         let inbound = hyper::HeaderMap::new();
         let mut credentials = self.auth.resolve(account, &inbound).await?;
         let (mut status, mut bytes) = self.fetch_usage_once(&credentials).await?;
@@ -948,9 +964,13 @@ impl App {
         let observed_at_unix = i64::try_from(now).unwrap_or(i64::MAX);
         let snapshot = usage::parse_usage_response(&bytes, observed_at_unix)?;
         self.router
-            .observe_usage_snapshot_for_owner(account_id, snapshot, &credentials.quota_owner())
+            .observe_usage_snapshot_for_owner(
+                account_id,
+                snapshot.clone(),
+                &credentials.quota_owner(),
+            )
             .await;
-        Ok(())
+        Ok((snapshot, credentials))
     }
 
     async fn fetch_usage_once(&self, credentials: &Credentials) -> Result<(StatusCode, Vec<u8>)> {
@@ -6241,6 +6261,7 @@ async fn collect_proxy_body_with_initial(
 mod tests {
     include!("capacity_tests.rs");
     include!("quota_identity_tests.rs");
+    include!("usage_activation_tests.rs");
     use super::*;
     use crate::{
         config::{AccountConfig, ProxyConfig, ResponsesWebsocketMode},

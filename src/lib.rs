@@ -11,3 +11,4 @@ pub mod service;
 pub mod state;
 mod transport;
 pub mod usage;
+mod usage_activation;
