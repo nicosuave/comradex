@@ -385,6 +385,7 @@ async fn serve_once(path: &Path) -> Result<bool> {
         let mut interval = tokio::time::interval(Duration::from_secs(
             comradex::usage::REFRESH_INTERVAL_SECONDS,
         ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             let now = SystemTime::now()
