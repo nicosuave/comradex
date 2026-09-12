@@ -111,6 +111,7 @@ async fn fixture(dir: &Path, first_event: Bytes, keep_open: bool) -> ContinuityF
             PoolConfig {
                 members: vec!["a".into(), "b".into()],
                 preferred: Some("a".into()),
+                preserved: None,
             },
         )]),
         accounts,

@@ -158,10 +158,12 @@ pub fn remove_account(text: &str, name: &str) -> Result<(String, Option<String>)
                 members.retain(|member| member.as_str() != Some(name));
                 members.fmt();
             }
-            if pool.get("preferred").and_then(Item::as_str) == Some(name) {
-                pool.as_table_like_mut()
-                    .expect("pool was already accessed as a table")
-                    .remove("preferred");
+            for field in ["preferred", "preserved"] {
+                if pool.get(field).and_then(Item::as_str) == Some(name) {
+                    pool.as_table_like_mut()
+                        .expect("pool was already accessed as a table")
+                        .remove(field);
+                }
             }
         }
     }
@@ -170,6 +172,21 @@ pub fn remove_account(text: &str, name: &str) -> Result<(String, Option<String>)
 
 /// Set or clear the preferred account for a pool while preserving surrounding formatting.
 pub fn set_preferred_account(text: &str, pool_name: &str, account: Option<&str>) -> Result<String> {
+    set_account_order(text, pool_name, account, "preferred", "preserved")
+}
+
+/// Set or clear the account reserved for last use in a pool.
+pub fn set_preserved_account(text: &str, pool_name: &str, account: Option<&str>) -> Result<String> {
+    set_account_order(text, pool_name, account, "preserved", "preferred")
+}
+
+fn set_account_order(
+    text: &str,
+    pool_name: &str,
+    account: Option<&str>,
+    field: &str,
+    opposite: &str,
+) -> Result<String> {
     if let Some(account) = account {
         validate_name(account)?;
     }
@@ -194,10 +211,15 @@ pub fn set_preferred_account(text: &str, pool_name: &str, account: Option<&str>)
             if !is_member {
                 bail!("account {account} is not a member of pool {pool_name}")
             }
-            pool.insert("preferred", value(account));
+            if pool.get(opposite).and_then(Item::as_str) == Some(account) {
+                bail!(
+                    "pool {pool_name} cannot prefer and preserve the same account; clear {opposite} first"
+                )
+            }
+            pool.insert(field, value(account));
         }
         None => {
-            pool.remove("preferred");
+            pool.remove(field);
         }
     }
     Ok(doc.to_string())
@@ -391,6 +413,30 @@ kind = "inbound"
 
         let (removed, _) = remove_account(&preferred, "work2").unwrap();
         assert!(!removed.contains("preferred"));
+    }
+
+    #[test]
+    fn preserved_account_is_validated_cleared_and_removed() {
+        let added = add_account(TEMPLATE, "work2", "default").unwrap();
+        let saved = set_preserved_account(&added, "default", Some("work2")).unwrap();
+        assert!(saved.contains("preserved = \"work2\""));
+        assert!(
+            !set_preserved_account(&saved, "default", None)
+                .unwrap()
+                .contains("preserved")
+        );
+        assert!(
+            !remove_account(&saved, "work2")
+                .unwrap()
+                .0
+                .contains("preserved")
+        );
+        assert!(set_preserved_account(&added, "default", Some("missing")).is_err());
+        assert!(set_preserved_account(&added, "missing", Some("work2")).is_err());
+        assert!(set_preferred_account(&saved, "default", Some("work2")).is_err());
+        let preferred = set_preferred_account(&added, "default", Some("work2")).unwrap();
+        assert!(set_preserved_account(&preferred, "default", Some("work2")).is_err());
+        assert!(set_preferred_account(&saved, "default", Some("caller")).is_ok());
     }
 
     #[test]

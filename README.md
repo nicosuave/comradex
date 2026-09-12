@@ -101,12 +101,16 @@ comradex account list
 comradex account login personal_2
 comradex account prefer personal_2
 comradex account prefer --clear
+comradex account preserve personal
+comradex account preserve --clear
 comradex account remove personal_2
 ```
 
 `account list` shows each account's login state. `account remove` removes it from the configuration and every pool but keeps its credential directory. `--purge` can delete only the isolated home created for that account; it refuses external or linked Codex homes.
 
 `account prefer <name>` immediately makes that account the first choice for new, unbound work in the default pool. Use `--pool <name>` for another pool and `--clear` to restore automatic selection. The daemon applies the change through an authenticated, user-only Unix socket and persists it in `comradex.toml`; it does not restart, interrupt active turns, or move sticky conversations. An unavailable, quota-limited, or over-threshold preferred account is skipped by the normal quota-aware fallback. If the daemon is not running, the preference is saved and takes effect on its next start.
+
+`account preserve <name>` reserves that account for last use in the pool. New, unbound work uses other eligible accounts first, even when their usage is above the rotation threshold. The preserved account remains available when all others are unavailable or excluded from a retry. Existing conversations keep their account bindings. Use `--pool <name>` to select a pool or `--clear` to remove preservation. Changes apply live without restarting the daemon and persist as `preserved` in the pool's configuration. A pool can prefer one account and preserve another; it cannot prefer and preserve the same account.
 
 The equivalent manual configuration is:
 

@@ -142,6 +142,9 @@ pub struct PoolConfig {
     /// always take precedence, and an unhealthy or quota-limited account is skipped.
     #[serde(default)]
     pub preferred: Option<String>,
+    /// Account used last for fresh work; existing bindings keep their owner.
+    #[serde(default)]
+    pub preserved: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +303,16 @@ impl Config {
             bail!("at least one listener is required")
         }
         for (pool_name, pool) in &self.pools {
+            if let Some(preserved) = &pool.preserved {
+                if !pool.members.contains(preserved) {
+                    bail!(
+                        "pool {pool_name} preserves account {preserved}, which is not one of its members"
+                    )
+                }
+                if pool.preferred.as_ref() == Some(preserved) {
+                    bail!("pool {pool_name} cannot prefer and preserve the same account")
+                }
+            }
             if let Some(preferred) = &pool.preferred
                 && !pool.members.contains(preferred)
             {
@@ -464,6 +477,23 @@ kind = "inbound"
         fs::write(&path, text).unwrap();
         let error = Config::load(&path).unwrap_err();
         assert!(error.to_string().contains("not one of its members"));
+    }
+
+    #[test]
+    fn preserved_account_must_be_a_member_and_cannot_be_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comradex.toml");
+        for settings in [
+            "preserved = \"missing\"",
+            "preserved = \"caller\"\npreferred = \"caller\"",
+        ] {
+            let text = config_text(None).replace(
+                "members = [\"caller\"]",
+                &format!("members = [\"caller\"]\n{settings}"),
+            );
+            fs::write(&path, text).unwrap();
+            assert!(Config::load(&path).is_err());
+        }
     }
 
     #[test]

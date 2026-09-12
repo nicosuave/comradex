@@ -51,6 +51,11 @@ enum Request {
         pool: String,
         account: Option<String>,
     },
+    SetPreserved {
+        secret: String,
+        pool: String,
+        account: Option<String>,
+    },
     RoutingStatus {
         secret: String,
     },
@@ -75,7 +80,9 @@ enum Request {
 impl Request {
     fn secret(&self) -> Option<&str> {
         match self {
-            Self::SetPreferred { secret, .. } | Self::RoutingStatus { secret } => Some(secret),
+            Self::SetPreferred { secret, .. }
+            | Self::SetPreserved { secret, .. }
+            | Self::RoutingStatus { secret } => Some(secret),
             Self::UiStatus
             | Self::UiSetPreferred { .. }
             | Self::UiStartLogin { .. }
@@ -736,6 +743,10 @@ async fn process(
                 update_preferred(config_path, config, router, edit_lock, &pool, account).await?;
                 Response::routing(router.routing_snapshot().await)
             }
+            Request::SetPreserved { pool, account, .. } => {
+                update_preserved(config_path, config, router, edit_lock, &pool, account).await?;
+                Response::routing(router.routing_snapshot().await)
+            }
             Request::UiStatus => {
                 Response::status(build_ui_status(config, router, stats, login_manager).await)
             }
@@ -831,6 +842,32 @@ async fn update_preferred(
     let updated = accounts::set_preferred_account(&text, pool, account.as_deref())?;
     config::write_validated(config_path, &updated)?;
     router.set_preferred(pool, account).await;
+    Ok(())
+}
+
+async fn update_preserved(
+    config_path: &Path,
+    config: &Config,
+    router: &Router,
+    edit_lock: &Mutex<()>,
+    pool: &str,
+    account: Option<String>,
+) -> Result<()> {
+    let pool_config = config
+        .pools
+        .get(pool)
+        .with_context(|| format!("unknown pool {pool}"))?;
+    if let Some(account) = &account
+        && !pool_config.members.contains(account)
+    {
+        bail!("account {account} is not a member of pool {pool}")
+    }
+    let _guard = edit_lock.lock().await;
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let updated = accounts::set_preserved_account(&text, pool, account.as_deref())?;
+    config::write_validated(config_path, &updated)?;
+    router.set_preserved(pool, account).await;
     Ok(())
 }
 
@@ -1013,6 +1050,22 @@ pub fn set_preferred(
     send(
         state_dir,
         &Request::SetPreferred {
+            secret: secret.to_owned(),
+            pool: pool.to_owned(),
+            account: account.map(str::to_owned),
+        },
+    )
+}
+
+pub fn set_preserved(
+    state_dir: &Path,
+    secret: &str,
+    pool: &str,
+    account: Option<&str>,
+) -> Result<RoutingSnapshot> {
+    send(
+        state_dir,
+        &Request::SetPreserved {
             secret: secret.to_owned(),
             pool: pool.to_owned(),
             account: account.map(str::to_owned),
@@ -1234,6 +1287,59 @@ kind = "inbound"
                 .unwrap()
                 .unwrap();
         assert_eq!(routing.active_accounts["default"], "b");
+
+        let state = state_dir.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || {
+                set_preserved(&state, "wrong-secret", "default", Some("a"))
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        for account in [Some("a"), None] {
+            let state = state_dir.clone();
+            let routing = tokio::task::spawn_blocking(move || {
+                set_preserved(&state, "0123456789abcdef", "default", account)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                routing
+                    .preserved_accounts
+                    .get("default")
+                    .map(String::as_str),
+                account
+            );
+            let saved = Config::load(&config_path).unwrap();
+            assert_eq!(saved.pools["default"].preserved.as_deref(), account);
+            let restarted = Router::new(&saved, router.affinity.clone());
+            assert_eq!(
+                restarted.routing_snapshot().await.preserved_accounts,
+                routing.preserved_accounts
+            );
+        }
+        for account in ["b", "missing"] {
+            let before = fs::read_to_string(&config_path).unwrap();
+            let state = state_dir.clone();
+            assert!(
+                tokio::task::spawn_blocking(move || {
+                    set_preserved(&state, "0123456789abcdef", "default", Some(account))
+                })
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+            assert!(
+                router
+                    .routing_snapshot()
+                    .await
+                    .preserved_accounts
+                    .is_empty()
+            );
+        }
 
         task.abort();
         let _ = task.await;
