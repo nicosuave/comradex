@@ -9429,6 +9429,115 @@ data: {"type":"response.completed","response":{"id":"resp_compact","status":"com
     }
 
     #[tokio::test]
+    async fn quota_retry_reaches_preserved_account_past_fully_used_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = seen.clone();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = upstream.accept().await.unwrap();
+                let seen = server_seen.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let token = req.headers()[AUTHORIZATION].to_str().unwrap().to_owned();
+                        seen.lock().unwrap().push(token.clone());
+                        async move {
+                            let (status, body) = if token == "Bearer token-p" {
+                                (StatusCode::OK, &b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_p\",\"status\":\"completed\"}}\n\n"[..])
+                            } else {
+                                (
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    &br#"{"error":{"code":"usage_limit_reached"}}"#[..],
+                                )
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from_static(body)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let mut accounts = BTreeMap::new();
+        for name in ["a", "c", "p"] {
+            let home = dir.path().join(name);
+            fs::create_dir_all(&home).unwrap();
+            fs::write(
+                home.join("auth.json"),
+                format!(r#"{{"tokens":{{"access_token":"token-{name}"}}}}"#),
+            )
+            .unwrap();
+            accounts.insert(name.to_owned(), AccountConfig::CodexHome { path: home });
+        }
+        let proxy_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_tcp.local_addr().unwrap();
+        let listener = ListenerConfig {
+            address: proxy_addr,
+            pool: "default".into(),
+        };
+        let config = Arc::new(Config {
+            proxy: ProxyConfig {
+                upstream: format!("http://{upstream_addr}/backend-api/codex"),
+                responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
+                installation_secret: "0123456789abcdef".into(),
+                affinity_key: "0123456789abcdef0123456789abcdef".into(),
+                state_dir: Some(dir.path().join("state")),
+                ..ProxyConfig::default()
+            },
+            listeners: BTreeMap::from([("default".into(), listener.clone())]),
+            pools: BTreeMap::from([(
+                "default".into(),
+                PoolConfig {
+                    members: vec!["a".into(), "c".into(), "p".into()],
+                    preserved: Some("p".into()),
+                    ..Default::default()
+                },
+            )]),
+            accounts,
+        });
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("affinity.json"),
+                &config.proxy.affinity_key,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Arc::new(Router::new(&config, affinity));
+        // c is known to be fully used; a's usage is unknown until upstream rejects it.
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-codex-secondary-used-percent", "100".parse().unwrap());
+        router.observe_headers("c", &headers).await;
+        let app = App::new_unvalidated(config, router.clone(), Arc::new(Stats::default())).unwrap();
+        let proxy_task = tokio::spawn(app.serve_tcp("default".into(), listener, proxy_tcp));
+        let client = TestClient::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+        let response = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{proxy_addr}/0123456789abcdef/v1/responses"))
+                    .body(Full::new(Bytes::from_static(br#"{"input":[]}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["Bearer token-a", "Bearer token-p"]);
+
+        proxy_task.abort();
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn dns_failure_does_not_make_the_account_ineligible() {
         let dir = tempfile::tempdir().unwrap();
         let (proxy_addr, proxy_task, router) = start_caller_proxy_with_router(

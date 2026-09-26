@@ -223,6 +223,12 @@ impl AccountRuntime {
     fn auth_unavailable(&self) -> bool {
         self.needs_login || self.bearer_unusable
     }
+
+    /// Usage reports an account-wide window as fully consumed. Upstream has not
+    /// necessarily rejected it yet, so it stays a last resort rather than ineligible.
+    fn fully_used(&self) -> bool {
+        self.usage.is_some_and(|usage| usage >= 100)
+    }
 }
 
 impl Router {
@@ -447,7 +453,7 @@ impl Router {
         let has_unpreserved = pool
             .members
             .iter()
-            .any(|id| preserved.as_ref() != Some(id) && eligible(id));
+            .any(|id| preserved.as_ref() != Some(id) && eligible(id) && !accounts[id].fully_used());
         let eligible =
             |id: &str| eligible(id) && (!has_unpreserved || preserved.as_deref() != Some(id));
         // Apply the soft capacity preference only after normal eligibility. An
@@ -756,6 +762,7 @@ impl Router {
                                 && !runtime.login_in_progress
                                 && runtime.quota_until.is_none_or(|until| until <= now)
                                 && runtime.avoid_until.is_none_or(|until| until <= now)
+                                && !runtime.fully_used()
                         })
                 });
                 if has_alternative {
@@ -1562,6 +1569,55 @@ mod tests {
         );
         router.reauth_required("a").await;
         assert!(router.select("default", pool, None, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fully_used_accounts_do_not_hold_back_the_preserved_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cfg, affinity, _, _) = stale_test_router(dir.path());
+        cfg.pools.get_mut("default").unwrap().preserved = Some("a".into());
+        cfg.pools
+            .get_mut("default")
+            .unwrap()
+            .members
+            .push("c".into());
+        cfg.accounts.insert("c".into(), AccountConfig::Inbound);
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        // A usage poll reports b's weekly window fully used before any upstream rejection.
+        let snapshot = crate::usage::UsageSnapshot {
+            observed_at_unix: Utc::now().timestamp(),
+            windows: BTreeMap::from([(
+                "secondary".into(),
+                QuotaWindowStatus {
+                    used_percent: Some(100),
+                    reset_at_unix: Some(Utc::now().timestamp() + 18 * 3600),
+                    limit_window_seconds: Some(7 * 24 * 3600),
+                },
+            )]),
+        };
+        router
+            .observe_usage_snapshot_for_owner("b", snapshot, &QuotaOwner::default())
+            .await;
+        router.reauth_required("c").await;
+        let selected = router.select("default", pool, None, None).await.unwrap();
+        assert_eq!(selected.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&selected, "default", pool)
+                .await
+                .is_ok()
+        );
+        // With the preserved account unavailable too, the fully used account is still tried.
+        router.reauth_required("a").await;
+        assert_eq!(
+            router
+                .select("default", pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
     }
 
     #[tokio::test]
