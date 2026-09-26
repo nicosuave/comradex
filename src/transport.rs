@@ -6,6 +6,17 @@ use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::{ClientConfig, RootCertStore};
 
+/// Ordinary HTTP/1.1 gateway transport. This does not claim byte-identical native
+/// Claude TLS fingerprints; the relay preserves the real client's application headers.
+pub(crate) fn claude_http_connector() -> Result<HttpsConnector<HttpConnector>> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let tls = native_tls::TlsConnector::builder()
+        .build()
+        .context("build Claude gateway TLS")?;
+    Ok(HttpsConnector::from((http, tls.into())))
+}
+
 /// Builds the same transport-default TLS shape used by Codex's reqwest 0.12 client.
 ///
 /// In Codex 0.149.0 the normal Responses HTTP path uses `native-tls` without

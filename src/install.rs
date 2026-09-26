@@ -9,6 +9,81 @@ use toml_edit::{DocumentMut, Item, value};
 
 const DESKTOP_ENV: &str = "CODEX_API_BASE_URL";
 
+#[derive(Serialize, Deserialize)]
+struct ClaudeInstallRecord {
+    destination: PathBuf,
+    installed_url: String,
+    previous: Option<serde_json::Value>,
+}
+
+fn claude_settings(path: &Path) -> Result<serde_json::Value> {
+    let doc = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("parse Claude settings.json")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        doc.is_object() && doc.get("env").is_none_or(serde_json::Value::is_object),
+        "Claude settings and env must be objects"
+    );
+    Ok(doc)
+}
+
+pub fn install_claude(settings: &Path, record_path: &Path, url: &str) -> Result<()> {
+    let destination = resolve_destination(&std::path::absolute(settings)?)?;
+    let mut doc = claude_settings(&destination)?;
+    let previous = doc
+        .get("env")
+        .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+        .cloned();
+    let record = if record_path.exists() {
+        let record: ClaudeInstallRecord = serde_json::from_slice(&fs::read(record_path)?)?;
+        anyhow::ensure!(
+            record.destination == destination && record.installed_url == url,
+            "uninstall the existing Claude gateway before changing its URL or settings path"
+        );
+        anyhow::ensure!(
+            previous.as_ref().and_then(|v| v.as_str()) == Some(url) || previous == record.previous,
+            "ANTHROPIC_BASE_URL changed since install"
+        );
+        record
+    } else {
+        ClaudeInstallRecord {
+            destination: destination.clone(),
+            installed_url: url.into(),
+            previous,
+        }
+    };
+    if doc.get("env").is_none() {
+        doc["env"] = serde_json::json!({});
+    }
+    doc["env"]["ANTHROPIC_BASE_URL"] = url.into();
+    atomic_write(record_path, &serde_json::to_vec_pretty(&record)?)?;
+    atomic_write(&destination, &serde_json::to_vec_pretty(&doc)?)
+}
+
+pub fn uninstall_claude(record_path: &Path) -> Result<()> {
+    if !record_path.exists() {
+        return Ok(());
+    }
+    let record: ClaudeInstallRecord = serde_json::from_slice(&fs::read(record_path)?)?;
+    let mut doc = claude_settings(&record.destination)?;
+    let current = doc.get("env").and_then(|v| v.get("ANTHROPIC_BASE_URL"));
+    anyhow::ensure!(
+        current.and_then(|v| v.as_str()) == Some(&record.installed_url)
+            || current == record.previous.as_ref(),
+        "ANTHROPIC_BASE_URL changed since install; refusing to overwrite it"
+    );
+    if let Some(previous) = record.previous {
+        doc["env"]["ANTHROPIC_BASE_URL"] = previous;
+    } else if let Some(env) = doc.get_mut("env").and_then(|v| v.as_object_mut()) {
+        env.remove("ANTHROPIC_BASE_URL");
+    }
+    atomic_write(&record.destination, &serde_json::to_vec_pretty(&doc)?)?;
+    fs::remove_file(record_path)?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct DesktopInstallRecord {
     installed_url: String,
@@ -397,6 +472,48 @@ fn recorded_destination(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_install_restores_only_its_url_and_preserves_other_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let record = dir.path().join("claude-install.json");
+        for previous in [None, Some("https://previous.example")] {
+            let mut original =
+                serde_json::json!({"permissions":{"allow":["Read"]},"env":{"KEEP":"yes"}});
+            if let Some(url) = previous {
+                original["env"]["ANTHROPIC_BASE_URL"] = url.into();
+            }
+            fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+            install_claude(&path, &record, "http://127.0.0.1:10101/secret").unwrap();
+            install_claude(&path, &record, "http://127.0.0.1:10101/secret").unwrap();
+            let mut installed = claude_settings(&path).unwrap();
+            assert_eq!(installed["permissions"], original["permissions"]);
+            assert_eq!(installed["env"].as_object().unwrap().len(), 2);
+            installed["env"]["LATER"] = "kept".into();
+            fs::write(&path, serde_json::to_vec(&installed).unwrap()).unwrap();
+            uninstall_claude(&record).unwrap();
+            original["env"]["LATER"] = "kept".into();
+            assert_eq!(claude_settings(&path).unwrap(), original);
+            assert!(!record.exists());
+        }
+    }
+
+    #[test]
+    fn claude_install_rejects_invalid_settings_and_uninstall_respects_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let record = dir.path().join("record.json");
+        fs::write(&path, b"{\"env\":[]}").unwrap();
+        assert!(install_claude(&path, &record, "http://127.0.0.1:10101/secret").is_err());
+        assert!(!record.exists());
+        fs::write(&path, b"{}").unwrap();
+        install_claude(&path, &record, "http://127.0.0.1:10101/secret").unwrap();
+        let other = br#"{"env":{"ANTHROPIC_BASE_URL":"https://new.example"}}"#;
+        fs::write(&path, other).unwrap();
+        assert!(uninstall_claude(&record).is_err());
+        assert_eq!(fs::read(&path).unwrap(), other);
+        assert!(record.exists());
+    }
     #[test]
     fn desktop_launchctl_output_preserves_absent_empty_and_trailing_newlines() {
         assert_eq!(decode_launchctl_environment(vec![]).unwrap(), None);

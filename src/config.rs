@@ -100,6 +100,9 @@ pub struct ProxyConfig {
     /// Start freshly reset weekly windows with a minimal account-specific request.
     #[serde(default)]
     pub auto_activate_weekly_usage: bool,
+    /// Warm elapsed Claude 5-hour/7-day windows through genuine Claude Code.
+    #[serde(default)]
+    pub auto_activate_claude_usage: bool,
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
     #[serde(default)]
@@ -126,6 +129,7 @@ impl Default for ProxyConfig {
             affinity_idle_days: default_affinity_days(),
             snapshot_interval_seconds: default_flush_seconds(),
             auto_activate_weekly_usage: false,
+            auto_activate_claude_usage: false,
             state_dir: None,
             installation_secret: String::new(),
             affinity_key: String::new(),
@@ -162,6 +166,21 @@ pub struct PoolConfig {
 pub enum AccountConfig {
     Inbound,
     CodexHome { path: PathBuf },
+    ClaudeInbound,
+    ClaudeHome { path: PathBuf },
+}
+
+impl AccountConfig {
+    pub fn is_claude(&self) -> bool {
+        matches!(self, Self::ClaudeInbound | Self::ClaudeHome { .. })
+    }
+
+    pub fn home(&self) -> Option<&Path> {
+        match self {
+            Self::CodexHome { path } | Self::ClaudeHome { path } => Some(path),
+            _ => None,
+        }
+    }
 }
 
 /// Return the stable identity used for a managed CODEX_HOME. This removes
@@ -233,7 +252,8 @@ impl Config {
             config_dir.join(state_dir)
         });
         for account in value.accounts.values_mut() {
-            if let AccountConfig::CodexHome { path } = account {
+            if let AccountConfig::CodexHome { path } | AccountConfig::ClaudeHome { path } = account
+            {
                 if path.as_os_str().is_empty() {
                     bail!("codex_home account path must not be empty")
                 }
@@ -279,7 +299,8 @@ impl Config {
             if name.len() > 256 {
                 bail!("account name exceeds the 256-byte limit")
             }
-            if let AccountConfig::CodexHome { path } = account {
+            if let AccountConfig::CodexHome { path } | AccountConfig::ClaudeHome { path } = account
+            {
                 if path.as_os_str().is_empty() {
                     bail!("account {name} has an empty codex_home path")
                 }
@@ -338,7 +359,25 @@ impl Config {
             }
         }
         for (pool_name, pool) in &self.pools {
+            let claude = self.is_claude_pool(pool_name);
+            if pool.members.iter().any(|member| {
+                self.accounts
+                    .get(member)
+                    .is_none_or(|account| account.is_claude() != claude)
+            }) {
+                bail!("pool {pool_name} must contain accounts from a single provider")
+            }
+            if claude
+                && self
+                    .proxy
+                    .desktop
+                    .as_ref()
+                    .is_some_and(|listener| &listener.pool == pool_name)
+            {
+                bail!("the Codex Desktop listener cannot use a Claude pool")
+            }
             if !pool.model_accounts.is_empty()
+                && !claude
                 && self.proxy.responses_websocket_mode == ResponsesWebsocketMode::Raw
             {
                 bail!(
@@ -392,6 +431,16 @@ impl Config {
             }
         }
         for (name, listener) in &self.listeners {
+            if self
+                .listeners
+                .iter()
+                .any(|(other_name, other)| other_name != name && other.address == listener.address)
+            {
+                bail!("listener {name} shares its address with another listener")
+            }
+            if self.is_claude_pool(&listener.pool) && !listener.address.ip().is_loopback() {
+                bail!("Claude listener {name} must use a loopback address")
+            }
             let pool = self.pools.get(&listener.pool).with_context(|| {
                 format!("listener {name} references missing pool {}", listener.pool)
             })?;
@@ -409,6 +458,14 @@ impl Config {
 
     pub fn snapshot_interval(&self) -> Duration {
         Duration::from_secs(self.proxy.snapshot_interval_seconds.max(1))
+    }
+
+    pub fn is_claude_pool(&self, name: &str) -> bool {
+        self.pools
+            .get(name)
+            .and_then(|pool| pool.members.first())
+            .and_then(|member| self.accounts.get(member))
+            .is_some_and(AccountConfig::is_claude)
     }
 }
 
@@ -434,6 +491,32 @@ pub fn write_validated(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_pools_are_separate_loopback_only_and_not_codex_desktop() {
+        let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+        config
+            .accounts
+            .insert("ada".into(), AccountConfig::ClaudeInbound);
+        config
+            .pools
+            .get_mut("default")
+            .unwrap()
+            .members
+            .push("ada".into());
+        assert!(config.validate().is_err());
+        config.pools.get_mut("default").unwrap().members = vec!["ada".into()];
+        assert!(config.is_claude_pool("default"));
+        assert!(config.validate().is_ok());
+        config.listeners.get_mut("default").unwrap().address = "0.0.0.0:10101".parse().unwrap();
+        assert!(config.validate().is_err());
+        config.listeners.get_mut("default").unwrap().address = "127.0.0.1:10101".parse().unwrap();
+        config.proxy.desktop = Some(ListenerConfig {
+            address: "127.0.0.1:8000".parse().unwrap(),
+            pool: "default".into(),
+        });
+        assert!(config.validate().is_err());
+    }
 
     fn config_text(state_dir: Option<&str>) -> String {
         let state_dir = state_dir

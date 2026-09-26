@@ -39,6 +39,12 @@ struct LoginWindowView: View {
                             Link("Open OpenAI device login", destination: login.safeVerificationURL)
                         }
                     }
+                } else if login.state == .running && login.isClaude {
+                    Text("Finish signing in to Claude in the browser opened by Claude Code.")
+                        .foregroundStyle(.secondary)
+                    if login.verificationURI != nil {
+                        Link("Open Claude sign-in", destination: login.safeVerificationURL)
+                    }
                 } else if login.state == .running {
                     Text("Waiting for a device code…")
                         .foregroundStyle(.secondary)

@@ -154,6 +154,8 @@ pub struct UiAccountStatus {
 pub enum UiAccountKind {
     Inbound,
     CodexHome,
+    ClaudeHome,
+    ClaudeInbound,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +183,8 @@ pub struct UiPoolStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiLoginStatus {
+    #[serde(default)]
+    pub provider: String,
     pub session_id: String,
     pub account: String,
     pub state: UiLoginState,
@@ -243,7 +247,14 @@ impl BoundedLoginOutput {
                     '(' | ')' | '[' | ']' | '<' | '>' | ',' | '"' | '\''
                 )
             });
-            (token == "https://auth.openai.com/codex/device").then(|| token.to_owned())
+            (token == "https://auth.openai.com/codex/device"
+                || token.parse::<hyper::Uri>().is_ok_and(|uri| {
+                    uri.scheme_str() == Some("https")
+                        && uri.authority().is_some_and(|a| a.as_str() == "claude.ai")
+                        && uri.path() == "/oauth/authorize"
+                        && uri.query().is_some()
+                }))
+            .then(|| token.to_owned())
         });
         let user_code = text.split_whitespace().find_map(|token| {
             let token = token.trim_matches(|character: char| {
@@ -267,19 +278,26 @@ type SharedLoginOutput = Arc<StdMutex<BoundedLoginOutput>>;
 type LoginFuture = Pin<Box<dyn Future<Output = Result<bool>> + Send>>;
 
 trait LoginRunner: Send + Sync {
-    fn run(&self, home: PathBuf, output: SharedLoginOutput) -> LoginFuture;
+    fn run(&self, home: PathBuf, output: SharedLoginOutput, claude: bool) -> LoginFuture;
 }
 
 struct SystemLoginRunner;
 
 impl LoginRunner for SystemLoginRunner {
-    fn run(&self, home: PathBuf, output: SharedLoginOutput) -> LoginFuture {
-        Box::pin(run_codex_login(home, output))
+    fn run(&self, home: PathBuf, output: SharedLoginOutput, claude: bool) -> LoginFuture {
+        Box::pin(async move {
+            if claude {
+                run_claude_login(home, output).await
+            } else {
+                run_codex_login(home, output).await
+            }
+        })
     }
 }
 
 #[derive(Clone)]
 struct LoginSession {
+    claude: bool,
     account: String,
     state: UiLoginState,
     output: SharedLoginOutput,
@@ -303,7 +321,7 @@ impl LoginManager {
         }
     }
 
-    async fn start(&self, account: String, home: PathBuf) -> Result<UiLoginStatus> {
+    async fn start(&self, account: String, home: PathBuf, claude: bool) -> Result<UiLoginStatus> {
         const MAX_LOGIN_SESSIONS: usize = 16;
         {
             let mut sessions = self.sessions.lock().expect("login sessions mutex poisoned");
@@ -333,6 +351,7 @@ impl LoginManager {
             sessions.insert(
                 session_id.clone(),
                 LoginSession {
+                    claude,
                     account: account.clone(),
                     state: UiLoginState::Running,
                     output: output.clone(),
@@ -348,7 +367,7 @@ impl LoginManager {
         let task = tokio::spawn(async move {
             let result: Result<bool> = async {
                 let _auth_lock = HomeAuthLock::acquire_async(&home).await?;
-                manager.runner.run(home, output.clone()).await
+                manager.runner.run(home, output.clone(), claude).await
             }
             .await;
             let state = match &result {
@@ -368,8 +387,22 @@ impl LoginManager {
                 session.state = state;
                 session.abort = None;
                 session.error = match &result {
-                    Ok(false) => Some("codex_login_failed".to_owned()),
-                    Err(_) => Some("codex_login_unavailable".to_owned()),
+                    Ok(false) => Some(
+                        if claude {
+                            "claude_login_failed"
+                        } else {
+                            "codex_login_failed"
+                        }
+                        .to_owned(),
+                    ),
+                    Err(_) => Some(
+                        if claude {
+                            "claude_login_unavailable"
+                        } else {
+                            "codex_login_unavailable"
+                        }
+                        .to_owned(),
+                    ),
                     Ok(true) => None,
                 };
             }
@@ -384,6 +417,7 @@ impl LoginManager {
         }
 
         Ok(UiLoginStatus {
+            provider: if claude { "claude" } else { "codex" }.into(),
             session_id,
             account,
             state: UiLoginState::Running,
@@ -407,6 +441,7 @@ impl LoginManager {
             .expect("login output mutex poisoned")
             .allowed_fields();
         Ok(UiLoginStatus {
+            provider: if session.claude { "claude" } else { "codex" }.into(),
             session_id: session_id.to_owned(),
             account: session.account,
             state: session.state,
@@ -462,6 +497,35 @@ async fn run_codex_login(home: PathBuf, output: SharedLoginOutput) -> Result<boo
         .await
         .context("join codex login stderr reader")??;
     Ok(status.success())
+}
+
+async fn run_claude_login(home: PathBuf, output: SharedLoginOutput) -> Result<bool> {
+    let mut command = Command::from(crate::claude::auth::login_command(&home)?);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("launch Claude login")?;
+    let stdout = child.stdout.take().context("capture Claude login stdout")?;
+    let stderr = child.stderr.take().context("capture Claude login stderr")?;
+    let capture = async {
+        tokio::try_join!(
+            capture_login_output(stdout, output.clone()),
+            capture_login_output(stderr, output)
+        )?;
+        Ok::<_, anyhow::Error>(())
+    };
+    let (status, ()) = tokio::try_join!(
+        async { child.wait().await.map_err(anyhow::Error::from) },
+        capture
+    )?;
+    if !status.success() {
+        return Ok(false);
+    }
+    tokio::task::spawn_blocking(move || crate::claude::auth::complete_login(&home)).await??;
+    Ok(true)
 }
 
 async fn capture_login_output(
@@ -795,7 +859,8 @@ async fn process(
             }
             Request::UiStartLogin { account } => {
                 let home = managed_account_home(config, &account)?.to_owned();
-                Response::login(login_manager.start(account, home).await?)
+                let claude = config.accounts[&account].is_claude();
+                Response::login(login_manager.start(account, home, claude).await?)
             }
             Request::UiConnectExistingLogin {
                 account,
@@ -987,6 +1052,33 @@ async fn build_ui_status(
                 .map(|(pool_name, _)| pool_name.clone())
                 .collect();
             let (kind, signed_in, auth_state) = match account {
+                crate::config::AccountConfig::ClaudeInbound => (
+                    UiAccountKind::ClaudeInbound,
+                    true,
+                    UiAccountAuthState::Inbound,
+                ),
+                crate::config::AccountConfig::ClaudeHome { .. }
+                    if login_manager.account_in_progress(name) =>
+                {
+                    (
+                        UiAccountKind::ClaudeHome,
+                        false,
+                        UiAccountAuthState::LoginInProgress,
+                    )
+                }
+                crate::config::AccountConfig::ClaudeHome { path } => {
+                    let ready = crate::claude::auth::read(path).is_ok()
+                        && !accounts_needing_login.contains(name);
+                    (
+                        UiAccountKind::ClaudeHome,
+                        ready,
+                        if ready {
+                            UiAccountAuthState::SignedIn
+                        } else {
+                            UiAccountAuthState::SignedOut
+                        },
+                    )
+                }
                 crate::config::AccountConfig::Inbound => {
                     (UiAccountKind::Inbound, true, UiAccountAuthState::Inbound)
                 }
@@ -1086,6 +1178,10 @@ fn managed_account_home<'a>(config: &'a Config, account: &str) -> Result<&'a Pat
         .get(account)
         .with_context(|| format!("unknown account {account}"))?
     {
+        crate::config::AccountConfig::ClaudeHome { path } => Ok(path),
+        crate::config::AccountConfig::ClaudeInbound => {
+            bail!("use `comradex account login` for Claude accounts")
+        }
         crate::config::AccountConfig::Inbound => {
             bail!(
                 "this account uses the requesting client's login; connect an existing Codex login first"
@@ -1546,7 +1642,7 @@ kind = "inbound"
     }
 
     impl LoginRunner for FakeLoginRunner {
-        fn run(&self, home: PathBuf, output: SharedLoginOutput) -> LoginFuture {
+        fn run(&self, home: PathBuf, output: SharedLoginOutput, _claude: bool) -> LoginFuture {
             let started = self.started.clone();
             let finish = self.finish.clone();
             let bytes = self.output.clone();
@@ -1743,7 +1839,7 @@ path = "accounts/work"
         let home = managed_account_home(&config, "work").unwrap().to_owned();
 
         let started_status = manager
-            .start("work".to_owned(), home.clone())
+            .start("work".to_owned(), home.clone(), false)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), started.notified())
@@ -1753,7 +1849,7 @@ path = "accounts/work"
         assert_eq!(started_status.session_id.len(), 32);
         assert!(
             manager
-                .start("work".to_owned(), home.clone())
+                .start("work".to_owned(), home.clone(), false)
                 .await
                 .is_err()
         );
@@ -1785,6 +1881,43 @@ path = "accounts/work"
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn claude_menu_login_exposes_browser_authorization_and_tracks_account_availability() {
+        let (_dir, mut config, router) = managed_login_fixture();
+        let home = managed_account_home(&config, "work").unwrap().to_owned();
+        Arc::make_mut(&mut config).accounts.insert(
+            "work".into(),
+            crate::config::AccountConfig::ClaudeHome { path: home.clone() },
+        );
+        Arc::make_mut(&mut config)
+            .accounts
+            .insert("app".into(), crate::config::AccountConfig::ClaudeInbound);
+        let router = Arc::new(Router::new(&config, router.affinity.clone()));
+        let started = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let manager=LoginManager::new(Arc::new(FakeLoginRunner{started:started.clone(),finish:finish.clone(),output:b"Ignore https://claude.ai.evil.example/oauth/authorize?state=evil\nOpen https://claude.ai/oauth/authorize?state=synthetic\n".to_vec(),outcome:FakeLoginOutcome::Success}),router.clone());
+        let session = manager.start("work".into(), home, true).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        let progress = manager.status(&session.session_id).unwrap();
+        assert_eq!(progress.provider, "claude");
+        assert_eq!(
+            progress.verification_uri.as_deref(),
+            Some("https://claude.ai/oauth/authorize?state=synthetic")
+        );
+        let status = build_ui_status(&config, &router, &Stats::default(), &manager).await;
+        let account = status.accounts.iter().find(|a| a.name == "work").unwrap();
+        assert_eq!(account.auth_state, UiAccountAuthState::LoginInProgress);
+        assert!(!account.available);
+        finish.notify_one();
+        assert_eq!(
+            wait_for_login(&manager, &session.session_id).await.state,
+            UiLoginState::Succeeded
+        );
+        assert!(router.routing_snapshot().await.account_states["work"].available);
     }
 
     #[tokio::test]
@@ -1868,7 +2001,7 @@ path = "accounts/work"
                 router.clone(),
             );
             let home = managed_account_home(&config, "work").unwrap().to_owned();
-            let session = manager.start("work".to_owned(), home).await.unwrap();
+            let session = manager.start("work".to_owned(), home, false).await.unwrap();
             tokio::time::timeout(Duration::from_secs(1), started.notified())
                 .await
                 .unwrap();

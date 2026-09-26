@@ -3,6 +3,37 @@ import XCTest
 @testable import ComradexMenu
 
 final class ComradexMenuTests: XCTestCase {
+    func testClaudeBrowserLoginUsesOnlyItsOwnAuthorizationOrigin() throws {
+        let good = LoginSnapshot(account: "grace", provider: "claude", state: .running, verificationURI: "https://claude.ai/oauth/authorize?state=synthetic")
+        XCTAssertEqual(good.safeVerificationURL.host, "claude.ai")
+        XCTAssertEqual(good.safeVerificationURL.path, "/oauth/authorize")
+        XCTAssertEqual(good.statusLabel, "Complete sign-in in your browser")
+        for address in ["https://evil.example/oauth/authorize", "https://claude.ai.evil.example/oauth/authorize", "https://claude.ai@evil.example/oauth/authorize", "http://claude.ai/oauth/authorize", "https://claude.ai/other"] {
+            let invalid = LoginSnapshot(account: "grace", provider: "claude", state: .running, verificationURI: address)
+            XCTAssertEqual(invalid.safeVerificationURL.absoluteString, "https://claude.ai/login")
+        }
+    }
+    @MainActor
+    @available(macOS 14.4, *)
+    func testClaudeAccountsNeverOfferCodexLoginActions() throws {
+        let managed = try decodeAccount(#"{"name":"grace","kind":"claude_home","signed_in":false,"auth_state":"signed_out","pools":["claude"]}"#)
+        let inbound = try decodeAccount(#"{"name":"ada","kind":"claude_inbound","signed_in":true,"auth_state":"inbound","pools":["claude"]}"#)
+        XCTAssertTrue(managed.isClaude)
+        XCTAssertTrue(inbound.isClaude)
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: [managed, inbound], pools: [
+            PoolSnapshot(name: "claude", members: ["grace", "ada"], preferred: nil, active: nil)
+        ]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        let grace = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("grace ·") })
+        let login = try XCTUnwrap(grace.submenu?.items.first { $0.title == "Sign In…" })
+        XCTAssertTrue(login.isEnabled)
+        XCTAssertEqual(login.action.map(NSStringFromSelector), "reloginSelected:")
+        let ada = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("ada ·") })
+        XCTAssertFalse(ada.submenu?.items.contains { $0.title.contains("Connect existing Codex") } ?? true)
+    }
+
     func testStatusIconIsAValidTemplateImage() {
         XCTAssertTrue(StatusIcon.image.isValid)
         XCTAssertTrue(StatusIcon.image.isTemplate)
@@ -604,6 +635,37 @@ final class ComradexMenuTests: XCTestCase {
 
         XCTAssertThrowsError(try ControlSocketClient.send(Data(repeating: 0x41, count: 64 * 1024), to: path))
         wait(for: [closed], timeout: 2)
+    }
+
+    @MainActor
+    @available(macOS 14.4, *)
+    func testPoolSectionsNameTheirProviderWithCodexFirst() throws {
+        let accounts = try [
+            decodeAccount(#"{"name":"grace","kind":"claude_home","signed_in":true,"auth_state":"signed_in","pools":["claude"]}"#),
+            decodeAccount(#"{"name":"ada","kind":"codex_home","signed_in":true,"auth_state":"signed_in","pools":["default"]}"#),
+        ]
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: accounts, pools: [
+            PoolSnapshot(name: "claude", members: ["grace"], preferred: nil, active: nil),
+            PoolSnapshot(name: "default", members: ["ada"], preferred: nil, active: nil),
+        ]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        XCTAssertEqual(controller.renderedMenu.items.filter(\.isSectionHeader).map(\.title), ["Codex", "Claude"])
+        let grace = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("grace") })
+        XCTAssertEqual(grace.submenu?.items.first?.title, "Routing in Claude")
+
+        let hopper = try decodeAccount(#"{"name":"hopper","kind":"codex_home","signed_in":true,"auth_state":"signed_in","pools":["work"]}"#)
+        store.apply(status: UIStatusSnapshot(accounts: accounts + [hopper], pools: [
+            PoolSnapshot(name: "claude", members: ["grace"], preferred: nil, active: nil),
+            PoolSnapshot(name: "default", members: ["ada"], preferred: nil, active: nil),
+            PoolSnapshot(name: "work", members: ["hopper"], preferred: nil, active: nil),
+        ]))
+        controller.rebuildMenu()
+        XCTAssertEqual(
+            controller.renderedMenu.items.filter(\.isSectionHeader).map(\.title),
+            ["Codex · default", "Codex · work", "Claude"]
+        )
     }
 
     @MainActor

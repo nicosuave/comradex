@@ -137,6 +137,27 @@ pub fn add_account(text: &str, name: &str, pool: &str) -> Result<String> {
     Ok(doc.to_string())
 }
 
+/// Claude pools use their own listener and never mix credentials with Codex.
+pub fn add_claude_account(text: &str, name: &str, pool: &str) -> Result<String> {
+    validate_name(name)?;
+    validate_name(pool)?;
+    let mut doc: DocumentMut = text.parse()?;
+    if doc.get("accounts").and_then(|v| v.get(name)).is_some() {
+        bail!("account {name} already exists")
+    }
+    if doc.get("pools").and_then(|v| v.get(pool)).is_none() {
+        doc["pools"][pool]["members"] = value(toml_edit::Array::new());
+        if doc.get("listeners").and_then(|v| v.get(pool)).is_some() {
+            bail!("listener {pool} already exists")
+        }
+        doc["listeners"][pool]["address"] = value("127.0.0.1:10101");
+        doc["listeners"][pool]["pool"] = value(pool);
+    }
+    let mut updated = add_account(&doc.to_string(), name, pool)?.parse::<DocumentMut>()?;
+    updated["accounts"][name]["kind"] = value("claude_home");
+    Ok(updated.to_string())
+}
+
 /// Remove an account from the accounts table and every pool's members.
 /// Returns the new text and the removed account's `path` value, if any.
 pub fn remove_account(text: &str, name: &str) -> Result<(String, Option<String>)> {
@@ -241,6 +262,30 @@ fn set_account_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_add_creates_a_separate_pool_and_listener() {
+        let text = add_claude_account(TEMPLATE, "grace", "claude").unwrap();
+        let text = add_claude_account(&text, "ada", "claude").unwrap();
+        let doc: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(
+            doc["accounts"]["grace"]["kind"].as_str(),
+            Some("claude_home")
+        );
+        assert_eq!(doc["accounts"]["ada"]["kind"].as_str(), Some("claude_home"));
+        assert_eq!(
+            doc["listeners"]["claude"]["address"].as_str(),
+            Some("127.0.0.1:10101")
+        );
+        assert_eq!(
+            doc["pools"]["claude"]["members"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            doc["pools"]["default"]["members"].as_array().unwrap().len(),
+            1
+        );
+    }
 
     const TEMPLATE: &str = r#"[proxy]
 installation_secret = "0123456789abcdef"

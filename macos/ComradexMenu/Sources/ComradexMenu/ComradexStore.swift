@@ -95,7 +95,8 @@ final class ComradexStore: ObservableObject {
         guard !isLoginRunning else { return }
         loginTask?.cancel()
         // A new attempt must not inherit the previous account's code or session.
-        login = LoginSnapshot(account: account, state: .running)
+        let provider = snapshot?.accounts.first(where: { $0.name == account })?.isClaude == true ? "claude" : "codex"
+        login = LoginSnapshot(account: account, provider: provider, state: .running)
         loginTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -109,11 +110,11 @@ final class ComradexStore: ObservableObject {
                     current = try await client.loginStatus(sessionID: sessionID)
                     apply(login: current)
                 }
-                if current.state == .succeeded { await refresh() }
+                if current.state == .succeeded { await refresh(fetchUsage: current.isClaude) }
             } catch is CancellationError {
                 return
             } catch {
-                apply(login: LoginSnapshot(account: account, sessionID: login?.sessionID, state: .failed, error: error.localizedDescription))
+                apply(login: LoginSnapshot(account: account, provider: provider, sessionID: login?.sessionID, state: .failed, error: error.localizedDescription))
             }
         }
     }

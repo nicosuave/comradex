@@ -39,6 +39,9 @@ enum CommandName {
     Check,
     Serve,
     Install {
+        /// Claude settings.json to update (only for a Claude listener)
+        #[arg(long, conflicts_with_all = ["codex_config", "desktop", "restart_codex"])]
+        claude_settings: Option<PathBuf>,
         /// Codex config.toml to point at Comradex
         /// [default: $CODEX_HOME/config.toml, or ~/.codex/config.toml]
         #[arg(long)]
@@ -85,6 +88,9 @@ enum AccountCommand {
     /// pool, log it in, and restart the daemon
     Add {
         name: String,
+        /// Add a Claude subscription account (use --pool claude)
+        #[arg(long)]
+        claude: bool,
         #[arg(long, default_value = "default")]
         pool: String,
         /// Skip the interactive sign-in (run `comradex account login <name>` later)
@@ -183,11 +189,50 @@ async fn main() -> Result<()> {
         }
         CommandName::Serve => serve(&config_path).await,
         CommandName::Install {
+            claude_settings,
             codex_config,
             listener,
             restart_codex,
             desktop,
         } => {
+            let config = load_config(&config_path)?;
+            let listener_config = config
+                .listeners
+                .get(&listener)
+                .context("unknown listener")?;
+            if config.is_claude_pool(&listener_config.pool) {
+                anyhow::ensure!(
+                    !desktop && !restart_codex && codex_config.is_none(),
+                    "Codex install options cannot target a Claude pool"
+                );
+                let settings = claude_settings.unwrap_or_else(|| {
+                    let home = std::env::var_os("CLAUDE_CONFIG_DIR")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                                .join(".claude")
+                        });
+                    home.join("settings.json")
+                });
+                let url = format!(
+                    "http://{}/{}",
+                    listener_config.address, config.proxy.installation_secret
+                );
+                install::install_claude(
+                    &settings,
+                    &state_dir(&config).join("claude-install.json"),
+                    &url,
+                )?;
+                println!(
+                    "installed Claude Code gateway in {}; restart Claude Code to apply it",
+                    settings.display()
+                );
+                return Ok(());
+            }
+            anyhow::ensure!(
+                claude_settings.is_none(),
+                "--claude-settings requires a Claude listener"
+            );
             let desktop_install = if desktop {
                 let config = load_config(&config_path)?;
                 let listener = config.proxy.desktop.as_ref().context(
@@ -225,6 +270,7 @@ async fn main() -> Result<()> {
         }
         CommandName::Uninstall { restart_codex } => {
             let config = load_config(&config_path)?;
+            install::uninstall_claude(&state_dir(&config).join("claude-install.json"))?;
             let desktop_record = state_dir(&config).join("desktop-install.json");
             let desktop_installed = desktop_record.exists();
             install::uninstall_desktop(&desktop_record)?;
@@ -547,6 +593,10 @@ fn install_config(config_path: &Path, codex_config: &Path, listener_name: &str) 
         .listeners
         .get(listener_name)
         .with_context(|| format!("unknown listener {listener_name}"))?;
+    anyhow::ensure!(
+        !config.is_claude_pool(&listener.pool),
+        "Codex installation requires a Codex listener"
+    );
     let url = format!(
         "http://{}/{}/v1",
         listener.address, config.proxy.installation_secret
@@ -766,11 +816,19 @@ fn account_status_state(
     account: &comradex::config::AccountConfig,
     status: Option<&comradex::routing::AccountRoutingStatus>,
 ) -> String {
-    if matches!(account, comradex::config::AccountConfig::Inbound) {
+    if matches!(
+        account,
+        comradex::config::AccountConfig::Inbound | comradex::config::AccountConfig::ClaudeInbound
+    ) {
         return "Requesting client's login".to_owned();
     }
     let Some(status) = status else {
         return match account {
+            comradex::config::AccountConfig::ClaudeHome { path }
+                if comradex::claude::auth::read(path).is_ok() =>
+            {
+                "usage unavailable".into()
+            }
             comradex::config::AccountConfig::CodexHome { path }
                 if path.join("auth.json").exists() =>
             {
@@ -860,6 +918,14 @@ fn human_duration(seconds: u64) -> String {
 /// Short, plain-language state for one account.
 fn account_state(account: &comradex::config::AccountConfig) -> String {
     match account {
+        comradex::config::AccountConfig::ClaudeInbound => "Claude Code client's login".to_owned(),
+        comradex::config::AccountConfig::ClaudeHome { path } => {
+            if comradex::claude::auth::read(path).is_ok() {
+                "Claude signed in".into()
+            } else {
+                "Claude sign-in required".into()
+            }
+        }
         comradex::config::AccountConfig::Inbound => "Requesting client's login".to_owned(),
         comradex::config::AccountConfig::CodexHome { path } => {
             if path.join("auth.json").exists() {
@@ -885,11 +951,16 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             name,
             pool,
             no_login,
+            claude,
         } => {
             load_config(config_path)?;
             let text = fs::read_to_string(config_path)
                 .with_context(|| format!("read {}", config_path.display()))?;
-            let updated = comradex::accounts::add_account(&text, &name, &pool)?;
+            let updated = if claude {
+                comradex::accounts::add_claude_account(&text, &name, &pool)?
+            } else {
+                comradex::accounts::add_account(&text, &name, &pool)?
+            };
             write_config_validated(config_path, &updated)?;
             println!("added account {name} to pool {pool}");
             reload_daemon()?;
@@ -1045,8 +1116,10 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
         AccountCommand::Remove { name, purge } => {
             let config = load_config(config_path)?;
             if purge
-                && let Some(comradex::config::AccountConfig::CodexHome { path }) =
-                    config.accounts.get(&name)
+                && let Some(path) = config
+                    .accounts
+                    .get(&name)
+                    .and_then(|account| account.home())
             {
                 comradex::accounts::validate_purge_home(config_path, &name, path)?;
             }
@@ -1058,8 +1131,10 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             reload_daemon()?;
             // Resolve the home from the already-loaded config so relative
             // paths are anchored to the config directory, not the CWD.
-            if let Some(comradex::config::AccountConfig::CodexHome { path }) =
-                config.accounts.get(&name)
+            if let Some(path) = config
+                .accounts
+                .get(&name)
+                .and_then(|account| account.home())
             {
                 if purge {
                     match fs::remove_dir_all(path) {
@@ -1166,6 +1241,9 @@ fn login(config_path: &Path, account_name: &str) -> Result<()> {
         .accounts
         .get(account_name)
         .with_context(|| format!("unknown account {account_name}"))?;
+    if let comradex::config::AccountConfig::ClaudeHome { path } = account {
+        return service::while_daemon_stopped(|| comradex::claude::auth::login(path));
+    }
     let comradex::config::AccountConfig::CodexHome { path } = account else {
         bail!(
             "this uses the requesting client's login; use account connect to link an existing login"

@@ -63,6 +63,11 @@ pub struct Credentials {
 pub struct QuotaOwner(Option<blake3::Hash>);
 
 impl QuotaOwner {
+    pub(crate) fn claude(organization: &str, account: &str) -> Self {
+        Self(Some(blake3::hash(
+            format!("claude:{organization}:{account}").as_bytes(),
+        )))
+    }
     pub fn is_known(&self) -> bool {
         self.0.is_some()
     }
@@ -250,6 +255,8 @@ impl Resolver {
     /// Inspect current credentials without refreshing tokens or starting a login.
     pub fn credentials_usable(&self, account: &AccountConfig, inbound: &HeaderMap) -> bool {
         match account {
+            AccountConfig::ClaudeHome { path } => crate::claude::auth::read(path).is_ok(),
+            AccountConfig::ClaudeInbound => inbound.get("authorization").is_some(),
             AccountConfig::Inbound => inbound
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
@@ -280,7 +287,9 @@ impl Resolver {
                     normalize_codex_home(path).expect("Config::validate normalized account home"),
                     Arc::new(Mutex::new(())),
                 )),
-                AccountConfig::Inbound => None,
+                AccountConfig::Inbound
+                | AccountConfig::ClaudeInbound
+                | AccountConfig::ClaudeHome { .. } => None,
             })
             .collect();
         Self {
@@ -324,6 +333,9 @@ impl Resolver {
         inbound: &HeaderMap,
     ) -> Result<Credentials> {
         match account {
+            AccountConfig::ClaudeInbound | AccountConfig::ClaudeHome { .. } => {
+                bail!("Claude credentials require the native Claude handler")
+            }
             AccountConfig::Inbound => inbound_credentials(inbound),
             AccountConfig::CodexHome { path } => {
                 let path = &normalize_codex_home(path)?;

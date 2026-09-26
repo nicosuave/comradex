@@ -24,6 +24,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var isMenuOpen = false
     private var hasDeferredMenuUpdate = false
     private var usageRefreshPending = false
+    private var poolLabels: [String: String] = [:]
 
     var renderedMenu: NSMenu { menu }
 
@@ -141,9 +142,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
 
         let showsPoolHeaders = snapshot.pools.count > 1
-        for pool in snapshot.pools {
+        poolLabels = Self.poolLabels(snapshot)
+        // Pools hold one provider each. List Codex before Claude, keeping configured order.
+        let pools = snapshot.pools.filter { !Self.isClaudePool($0, in: snapshot) }
+            + snapshot.pools.filter { Self.isClaudePool($0, in: snapshot) }
+        for pool in pools {
             if showsPoolHeaders {
-                menu.addItem(.sectionHeader(title: pool.name))
+                menu.addItem(.sectionHeader(title: poolLabels[pool.name] ?? pool.name))
             }
             for member in pool.members {
                 guard let account = snapshot.accounts.first(where: { $0.name == member }) else {
@@ -164,6 +169,21 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    private static func isClaudePool(_ pool: PoolSnapshot, in snapshot: UIStatusSnapshot) -> Bool {
+        snapshot.accounts.contains { pool.members.contains($0.name) && $0.isClaude }
+    }
+
+    /// Names each pool by its provider. A provider with several pools adds the pool name.
+    private static func poolLabels(_ snapshot: UIStatusSnapshot) -> [String: String] {
+        let providers = Dictionary(uniqueKeysWithValues: snapshot.pools.map {
+            ($0.name, isClaudePool($0, in: snapshot) ? "Claude" : "Codex")
+        })
+        return Dictionary(uniqueKeysWithValues: providers.map { pool, provider in
+            let shared = providers.values.filter { $0 == provider }.count > 1
+            return (pool, shared ? "\(provider) · \(pool)" : provider)
+        })
+    }
+
     private func addAccount(_ account: AccountSnapshot, pool: PoolSnapshot?) {
         let isPreferred = pool?.preferred == account.name
         let isPreserved = pool?.preserved == account.name
@@ -181,7 +201,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         if let pool {
-            submenu.addItem(.sectionHeader(title: "Routing in \(pool.name)"))
+            submenu.addItem(.sectionHeader(title: "Routing in \(poolLabels[pool.name] ?? pool.name)"))
             let current: AccountRole = isPreferred ? .preferred : isPreserved ? .preserved : .normal
             for role in AccountRole.allCases {
                 let choice = actionItem(
@@ -207,7 +227,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             login.toolTip = "Sign in without changing this account's routing role."
             submenu.addItem(login)
         }
-        if account.isInbound {
+        if account.isInbound && !account.isClaude {
             if !submenu.items.isEmpty { submenu.addItem(.separator()) }
             let connect = actionItem(
                 title: store.connectingAccount == account.name ? "Connecting Codex login…" : "Connect existing Codex login…",
