@@ -1,5 +1,9 @@
 # Repository instructions
 
+## Developing Comradex through Comradex
+
+Before changing service lifecycle, replacing the running binary, or setting up test accounts, read [.agents/skills/comradex-self-hosted-dev/SKILL.md](.agents/skills/comradex-self-hosted-dev/SKILL.md).
+
 ## macOS releases
 
 - Build, Developer ID-sign, and notarize macOS release artifacts on the maintainer's Mac with `scripts/release_macos_local.sh`.
