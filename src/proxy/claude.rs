@@ -39,8 +39,13 @@ pub(super) struct Claude {
     usage_url: String,
     /// Per-account usage poll cooldown: (retry at, current throttle delay).
     usage_backoff: Mutex<HashMap<String, (u64, u64)>>,
+    reporting_usage: Mutex<HashMap<String, ReportingUsage>>,
     activation: Mutex<Result<crate::claude::maintenance::ActivationLedger>>,
     sessions: Mutex<HashMap<String, Weak<Session>>>,
+}
+struct ReportingUsage {
+    owner: crate::auth::QuotaOwner,
+    value: serde_json::Map<String, serde_json::Value>,
 }
 #[derive(Default)]
 struct Session {
@@ -58,6 +63,7 @@ impl Claude {
             upstream: crate::claude::UPSTREAM.into(),
             usage_url: format!("{}/api/oauth/usage", crate::claude::UPSTREAM),
             usage_backoff: Mutex::new(HashMap::new()),
+            reporting_usage: Mutex::new(HashMap::new()),
             activation: Mutex::new(crate::claude::maintenance::ActivationLedger::open(
                 config
                     .proxy
@@ -82,6 +88,42 @@ impl Claude {
 }
 
 impl App {
+    pub(super) async fn observe_claude_reporting_usage(
+        &self,
+        account: &str,
+        owner: crate::auth::QuotaOwner,
+        bytes: &[u8],
+    ) {
+        let value = crate::claude::maintenance::parse_reporting_usage(bytes);
+        let mut observations = self.claude.reporting_usage.lock().await;
+        if let Some(value) = value {
+            observations.insert(account.into(), ReportingUsage { owner, value });
+        } else {
+            observations.remove(account);
+        }
+    }
+
+    pub(super) async fn claude_reporting_usage(
+        &self,
+        account: &str,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let AccountConfig::ClaudeHome { path } = &self.config.accounts[account] else {
+            return None;
+        };
+        let path = path.clone();
+        let current = tokio::task::spawn_blocking(move || auth::read(&path))
+            .await
+            .ok()?
+            .ok()?;
+        self.claude
+            .reporting_usage
+            .lock()
+            .await
+            .get(account)
+            .filter(|observation| observation.owner == current.owner())
+            .map(|observation| observation.value.clone())
+    }
+
     pub(super) async fn handle_claude(
         &self,
         request: Request<Incoming>,
@@ -707,7 +749,17 @@ mod tests {
                                     )
                                     .unwrap()
                                     .to_rfc3339();
-                                    let data = json!({"five_hour":{"utilization":if first {100}else{25},"resets_at":reset},"seven_day":{"utilization":10,"resets_at":reset},"cedar_ember":{"eligible":true,"next_grant_id":"mock-grant","grants":[{"id":"mock-grant","resets_left":2,"usable_now":true}]}});
+                                    let mut data = json!({"five_hour":{"utilization":if first {100}else{25},"resets_at":reset},"seven_day":{"utilization":10,"resets_at":reset},"cedar_ember":{"eligible":true,"next_grant_id":"mock-grant","grants":[{"id":"mock-grant","resets_left":2,"usable_now":true}]}});
+                                    if first {
+                                        data["seven_day_fable"] =
+                                            json!({"utilization":25.5,"resets_at":reset});
+                                    } else {
+                                        data["limits"] = json!([
+                                            {"kind":"session","group":"session","percent":25,"resets_at":reset,"scope":null,"is_active":true,"severity":"normal"},
+                                            {"kind":"weekly_all","group":"weekly","percent":10,"resets_at":reset,"scope":null,"is_active":true,"severity":"normal"},
+                                            {"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":reset,"scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false,"severity":"critical"}
+                                        ]);
+                                    }
                                     Response::builder()
                                         .status(if status == StatusCode::TOO_MANY_REQUESTS {
                                             status
@@ -1427,6 +1479,76 @@ kind="claude_inbound"
         }
         harness.close().await;
     }
+    #[tokio::test]
+    async fn background_usage_poll_reports_fable_without_changing_shared_quota() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        assert!(
+            harness
+                .app
+                .refresh_claude_usage_at(auth::now(), false)
+                .await
+        );
+        let before = harness.app.router.routing_snapshot().await;
+        assert!(!before.account_states["grace"].available);
+        assert!(before.account_states["ada"].available);
+        assert_eq!(before.account_states["ada"].usage_percent, Some(25));
+        for (account, percent) in [("grace", 25.5), ("ada", 100.0)] {
+            for url in [
+                "https://api.anthropic.com/api/oauth/usage",
+                "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1",
+            ] {
+                let response = reqwest::Client::new()
+                    .post(format!(
+                        "{}/v0/management/api-call",
+                        harness.url.strip_suffix("/claude-test-secret").unwrap()
+                    ))
+                    .bearer_auth(&harness.app.config.proxy.installation_secret)
+                    .header("content-type", "application/json")
+                    .body(json!({ "auth_index": account, "method": "GET", "url": url }).to_string())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+                assert_eq!(envelope["status_code"], 200);
+                let body: serde_json::Value =
+                    serde_json::from_str(envelope["body"].as_str().unwrap()).unwrap();
+                let (utilization, reset) = if account == "grace" {
+                    (
+                        &body["seven_day_fable"]["utilization"],
+                        &body["seven_day_fable"]["resets_at"],
+                    )
+                } else {
+                    assert!(body.get("seven_day_fable").is_none());
+                    assert_eq!(body["limits"][2]["scope"]["model"]["display_name"], "Fable");
+                    (
+                        &body["limits"][2]["percent"],
+                        &body["limits"][2]["resets_at"],
+                    )
+                };
+                assert_eq!(*utilization, percent);
+                assert_eq!(
+                    chrono::DateTime::parse_from_rfc3339(reset.as_str().unwrap()).unwrap(),
+                    chrono::DateTime::parse_from_rfc3339(
+                        body["seven_day"]["resets_at"].as_str().unwrap()
+                    )
+                    .unwrap()
+                );
+            }
+        }
+        assert_eq!(before, harness.app.router.routing_snapshot().await);
+        assert_eq!(harness.seen.lock().await.len(), 2);
+        let selection = harness
+            .app
+            .router
+            .select("claude", &harness.app.config.pools["claude"], None, None)
+            .await
+            .unwrap();
+        assert_eq!(selection.account_id, "ada");
+        harness.close().await;
+    }
+
     #[tokio::test]
     async fn background_usage_poll_collects_claude_reset_data_without_claiming() {
         let harness = Harness::new(true, StatusCode::OK).await;

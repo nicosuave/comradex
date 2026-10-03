@@ -250,6 +250,9 @@ impl App {
             return usage_unavailable();
         }
         let body = if claude {
+            if let Some(reported) = self.claude_reporting_usage(&call.auth_index).await {
+                windows.extend(reported);
+            }
             if let Some(credits) = self.claude_reset_credits(&call.auth_index).await {
                 windows.insert("cedar_ember".into(), credits);
             }

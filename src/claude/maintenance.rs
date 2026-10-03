@@ -1,4 +1,4 @@
-//! Authoritative Claude quota observations and durable reset-warming reservations.
+//! Claude quota observations, reporting metadata, and durable reset-warming reservations.
 use crate::{routing::QuotaWindowStatus, usage::UsageSnapshot};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,97 @@ pub fn parse_usage(bytes: &[u8], now: u64) -> Result<UsageSnapshot> {
         observed_at_unix: now.min(i64::MAX as u64) as i64,
         windows,
     })
+}
+
+/// Fable is reporting metadata, never an account-wide routing or warming limit.
+pub fn parse_fable_usage(bytes: &[u8]) -> Option<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let window = body.get("seven_day_fable")?;
+    let utilization = window.get("utilization")?;
+    utilization
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 100.0)?;
+    let reset = match window.get("resets_at") {
+        Some(serde_json::Value::String(at)) => {
+            chrono::DateTime::parse_from_rfc3339(at).ok()?;
+            serde_json::Value::String(at.clone())
+        }
+        Some(serde_json::Value::Null) | None => serde_json::Value::Null,
+        _ => return None,
+    };
+    Some(serde_json::json!({ "utilization": utilization, "resets_at": reset }))
+}
+
+/// Retain provider reporting formats separately from the shared policy snapshot.
+pub fn parse_reporting_usage(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let body: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let mut fields = serde_json::Map::new();
+    if let Some(fable) = parse_fable_usage(bytes) {
+        fields.insert("seven_day_fable".into(), fable);
+    }
+    if let Some(limits) = body.get("limits").and_then(serde_json::Value::as_array) {
+        let limits: Vec<_> = limits
+            .iter()
+            .filter_map(|limit| {
+                let limit: ReportedLimit = serde_json::from_value(limit.clone()).ok()?;
+                if limit.kind.is_empty() || limit.group.is_empty() {
+                    return None;
+                }
+                if limit.kind == "weekly_scoped"
+                    && limit
+                        .scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.model.is_none() && scope.surface.is_none())
+                {
+                    return None;
+                }
+                limit
+                    .percent
+                    .as_f64()
+                    .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 100.0)?;
+                if let Some(at) = &limit.resets_at {
+                    chrono::DateTime::parse_from_rfc3339(at).ok()?;
+                }
+                if let Some(scope) = &limit.scope {
+                    for label in scope.model.iter().chain(scope.surface.iter()) {
+                        if label.display_name.trim().is_empty() {
+                            return None;
+                        }
+                    }
+                }
+                serde_json::to_value(limit).ok()
+            })
+            .collect();
+        if !limits.is_empty() {
+            fields.insert("limits".into(), serde_json::Value::Array(limits));
+        }
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReportedLimit {
+    kind: String,
+    group: String,
+    percent: serde_json::Number,
+    resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    severity: Option<String>,
+    scope: Option<ReportedScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_active: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReportedScope {
+    model: Option<ReportedScopeLabel>,
+    surface: Option<ReportedScopeLabel>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReportedScopeLabel {
+    id: Option<String>,
+    display_name: String,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -213,6 +304,140 @@ mod tests {
         ] {
             assert!(parse_usage(bytes, 100).is_err());
         }
+    }
+
+    #[test]
+    fn fable_reporting_preserves_utilization_and_optional_resets() {
+        for percent in [0.0, 25.5, 99.9, 100.0] {
+            for reset in [
+                serde_json::json!("2026-10-03T12:34:56.789-07:00"),
+                serde_json::Value::Null,
+            ] {
+                let payload = serde_json::json!({
+                    "seven_day_fable": { "utilization": percent, "resets_at": reset, "extra": "ignored" }
+                });
+                assert_eq!(
+                    parse_fable_usage(payload.to_string().as_bytes()),
+                    Some(serde_json::json!({ "utilization": percent, "resets_at": reset }))
+                );
+            }
+        }
+        assert_eq!(
+            parse_fable_usage(br#"{"seven_day_fable":{"utilization":0}}"#),
+            Some(serde_json::json!({ "utilization": 0, "resets_at": null }))
+        );
+    }
+
+    #[test]
+    fn invalid_or_absent_fable_metadata_does_not_discard_shared_usage() {
+        for window in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!(50),
+            serde_json::json!({}),
+            serde_json::json!({ "utilization": null }),
+            serde_json::json!({ "utilization": "50" }),
+            serde_json::json!({ "utilization": -1 }),
+            serde_json::json!({ "utilization": 100.1 }),
+            serde_json::json!({ "utilization": 50, "resets_at": false }),
+            serde_json::json!({ "utilization": 50, "resets_at": 123 }),
+            serde_json::json!({ "utilization": 50, "resets_at": "not-a-date" }),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "five_hour": { "utilization": 25 }, "seven_day": null, "seven_day_fable": window
+            }))
+            .unwrap();
+            assert!(parse_fable_usage(&bytes).is_none());
+            let snapshot = parse_usage(&bytes, 100).unwrap();
+            assert_eq!(snapshot.windows.len(), 2);
+            assert_eq!(snapshot.windows["5h"].used_percent, Some(25));
+        }
+        let bytes = br#"{"five_hour":null,"seven_day":null}"#;
+        assert!(parse_fable_usage(bytes).is_none());
+        assert!(parse_usage(bytes, 100).is_ok());
+        assert!(parse_fable_usage(b"not-json").is_none());
+    }
+
+    #[test]
+    fn scoped_fable_reporting_retains_valid_entries_and_ignores_bad_metadata() {
+        let valid = serde_json::json!({
+            "kind":"weekly_scoped","group":"weekly","percent":99.9,
+            "resets_at":"2026-10-03T12:34:56.789-07:00","severity":"normal",
+            "scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false
+        });
+        for (field, bad) in [
+            ("percent", serde_json::json!("50")),
+            ("percent", serde_json::json!(-1)),
+            ("percent", serde_json::json!(101)),
+            ("resets_at", serde_json::json!(123)),
+            ("resets_at", serde_json::json!("invalid")),
+            ("kind", serde_json::Value::Null),
+            ("group", serde_json::json!(false)),
+            ("scope", serde_json::json!({"model":{"display_name":null}})),
+            ("scope", serde_json::json!({"model":{"display_name":""}})),
+            ("scope", serde_json::Value::Null),
+            ("is_active", serde_json::json!("false")),
+            ("severity", serde_json::json!(123)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = bad;
+            let mut with_extra = valid.clone();
+            with_extra["extra"] = serde_json::json!("must-not-leak");
+            with_extra["scope"]["model"]["extra"] = serde_json::json!("must-not-leak");
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "five_hour":null,"seven_day":null,"limits":[invalid,with_extra]
+            }))
+            .unwrap();
+            assert_eq!(
+                parse_reporting_usage(&bytes).unwrap()["limits"],
+                serde_json::json!([valid])
+            );
+            let shared = parse_usage(&bytes, 100).unwrap();
+            assert_eq!(shared.windows.len(), 2);
+            assert_eq!(shared.windows["5h"].used_percent, Some(0));
+        }
+        for limits in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([null, {}]),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({"limits":limits})).unwrap();
+            assert!(parse_reporting_usage(&bytes).is_none());
+        }
+        let mut without_reset = valid.clone();
+        without_reset.as_object_mut().unwrap().remove("resets_at");
+        let bytes = serde_json::to_vec(&serde_json::json!({"limits":[without_reset]})).unwrap();
+        assert!(parse_reporting_usage(&bytes).unwrap()["limits"][0]["resets_at"].is_null());
+    }
+
+    #[test]
+    fn fable_resets_and_exhaustion_do_not_authorize_or_block_shared_warming() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = ActivationLedger::open(dir.path().join("warm.json")).unwrap();
+        let fable_reset = parse_usage(
+            br#"{
+            "five_hour":null,"seven_day":null,
+            "seven_day_fable":{"utilization":100,"resets_at":"1970-01-01T00:01:40Z"},
+            "limits":[{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"1970-01-01T00:01:40Z","scope":{"model":{"display_name":"Fable"}}}]
+        }"#,
+            101,
+        )
+        .unwrap();
+        assert_eq!(ledger.observe("grace", &fable_reset, 101).unwrap(), None);
+        let shared_reset = parse_usage(
+            br#"{
+            "five_hour":{"utilization":100,"resets_at":"1970-01-01T00:01:40Z"},"seven_day":null,
+            "seven_day_fable":{"utilization":100,"resets_at":"2100-01-01T00:00:00Z"},
+            "limits":[{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"2100-01-01T00:00:00Z","scope":{"model":{"display_name":"Fable"}}}]
+        }"#,
+            101,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.observe("ada", &shared_reset, 101).unwrap(),
+            Some(100)
+        );
     }
     #[test]
     fn claude_warming_waits_for_reset_and_deduplicates_across_restart() {

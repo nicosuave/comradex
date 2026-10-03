@@ -444,6 +444,115 @@ async fn management_reports_unavailable_until_usage_exists_and_during_login() {
 }
 
 #[tokio::test]
+async fn management_fable_reporting_replaces_optional_metadata_without_affecting_shared_usage() {
+    let fixture = Fixture::new().await;
+    fixture
+        .observe("grace", &[("5h", Some(15), Some(18000), None)])
+        .await;
+    fixture
+        .observe("anna", &[("5h", Some(25), Some(18000), None)])
+        .await;
+    let home = fixture.app.config.accounts["grace"].home().unwrap();
+    let owner = crate::claude::auth::read(home).unwrap().owner();
+    let before = fixture.app.router.routing_snapshot().await;
+    let valid = br#"{"seven_day_fable":{"utilization":99.9,"resets_at":"2100-01-01T00:00:00Z","extra":"must-not-leak"}}"#;
+    fixture
+        .app
+        .observe_claude_reporting_usage("grace", owner.clone(), valid)
+        .await;
+    assert_eq!(
+        usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await["seven_day_fable"],
+        json!({ "utilization": 99.9, "resets_at": "2100-01-01T00:00:00Z" })
+    );
+    assert!(
+        usage_body(fixture.call("anna", "GET", CLAUDE_URL).await)
+            .await
+            .get("seven_day_fable")
+            .is_none()
+    );
+    for bytes in [
+        b"{}".as_slice(),
+        br#"{"seven_day_fable":null}"#,
+        br#"{"seven_day_fable":{"utilization":1000}}"#,
+        br#"{"seven_day_fable":{"utilization":15,"resets_at":"invalid"}}"#,
+    ] {
+        fixture
+            .app
+            .observe_claude_reporting_usage("grace", owner.clone(), valid)
+            .await;
+        fixture
+            .app
+            .observe_claude_reporting_usage("grace", owner.clone(), bytes)
+            .await;
+        let body = usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await;
+        assert!(body.get("seven_day_fable").is_none());
+        assert_eq!(body["five_hour"]["utilization"], 15);
+    }
+    fixture
+        .app
+        .observe_claude_reporting_usage("grace", owner, br#"{"seven_day_fable":{"utilization":0}}"#)
+        .await;
+    assert_eq!(
+        usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await["seven_day_fable"],
+        json!({ "utilization": 0, "resets_at": null })
+    );
+    assert_eq!(before, fixture.app.router.routing_snapshot().await);
+    assert_eq!(
+        fixture
+            .app
+            .stats
+            .usage_fetch_accounts_checked
+            .load(Ordering::Relaxed),
+        0
+    );
+    fixture.app.shutdown_connections().await;
+}
+
+#[tokio::test]
+async fn management_fable_reporting_rejects_data_from_a_replaced_account_or_organization() {
+    for field in ["account_uuid", "organization_uuid"] {
+        let fixture = Fixture::new().await;
+        fixture
+            .observe("grace", &[("5h", Some(15), Some(18000), None)])
+            .await;
+        let home = fixture.app.config.accounts["grace"].home().unwrap();
+        let owner = crate::claude::auth::read(home).unwrap().owner();
+        let bytes = br#"{"seven_day_fable":{"utilization":50,"resets_at":null}}"#;
+        fixture
+            .app
+            .observe_claude_reporting_usage("grace", owner.clone(), bytes)
+            .await;
+        assert!(fixture.app.claude_reporting_usage("grace").await.is_some());
+        let path = home.join("claude-auth.json");
+        let mut credential: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        credential[field] = json!("33333333-3333-4333-8333-333333333333");
+        fs::write(path, credential.to_string()).unwrap();
+        // New shared data must not be paired with the old identity's model quota.
+        fixture
+            .observe("grace", &[("5h", Some(25), Some(18000), None)])
+            .await;
+        // A delayed old poll also cannot expose its quota for the replacement.
+        fixture
+            .app
+            .observe_claude_reporting_usage("grace", owner, bytes)
+            .await;
+        let body = usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await;
+        assert_eq!(body["five_hour"]["utilization"], 25);
+        assert!(body.get("seven_day_fable").is_none());
+        let current = crate::claude::auth::read(home).unwrap().owner();
+        fixture
+            .app
+            .observe_claude_reporting_usage("grace", current, bytes)
+            .await;
+        assert_eq!(
+            usage_body(fixture.call("grace", "GET", CLAUDE_URL).await).await["seven_day_fable"]["utilization"],
+            50
+        );
+        fixture.app.shutdown_connections().await;
+    }
+}
+
+#[tokio::test]
 async fn management_exposes_only_matching_account_metadata_for_client_deduplication() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let fixture = Fixture::new().await;
