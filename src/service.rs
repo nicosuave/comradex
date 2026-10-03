@@ -22,6 +22,8 @@ const SERVICE_NOFILE_SOFT_LIMIT: u64 = 8192;
 // otherwise healthy Apple Silicon hosts.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
 fn configured_listener_addresses(config: &crate::config::Config) -> Vec<SocketAddr> {
@@ -660,8 +662,12 @@ fn is_running(domain: &str) -> Result<bool> {
 }
 
 fn launchctl_print(domain: &str) -> Result<Option<String>> {
+    launchctl_print_target(&format!("{domain}/{LABEL}"))
+}
+
+fn launchctl_print_target(service_target: &str) -> Result<Option<String>> {
     let output = Command::new("launchctl")
-        .args(["print", &format!("{domain}/{LABEL}")])
+        .args(["print", service_target])
         .output()
         .context("launch launchctl print")?;
     classify_launchctl_print(
@@ -914,14 +920,42 @@ fn probe_address(mut address: SocketAddr) -> SocketAddr {
 }
 
 fn bootout(domain: &str) -> Result<()> {
+    bootout_target(&format!("{domain}/{LABEL}"))
+}
+
+fn bootout_target(service_target: &str) -> Result<()> {
     let status = Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{LABEL}")])
+        .args(["bootout", service_target])
         .status()
         .context("launch launchctl bootout")?;
     if !status.success() {
         bail!("launchctl bootout exited with {status}")
     }
-    Ok(())
+    // bootout acknowledges the request before a running job finishes exiting.
+    // Its label remains registered until then, so bootstrap can still fail.
+    wait_until_unloaded(service_target, UNLOAD_TIMEOUT, || {
+        launchctl_print_target(service_target)
+    })
+}
+
+fn wait_until_unloaded(
+    service_target: &str,
+    timeout: Duration,
+    mut print: impl FnMut() -> Result<Option<String>>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(output) = print()? else {
+            return Ok(());
+        };
+        if Instant::now() >= deadline {
+            bail!(
+                "LaunchAgent {service_target} did not unload within {timeout:?} ({})",
+                launchctl_state_summary(&output)
+            )
+        }
+        thread::sleep(UNLOAD_POLL_INTERVAL);
+    }
 }
 
 fn stop_if_loaded(domain: &str) -> Result<()> {
@@ -1001,6 +1035,111 @@ fn platform_check() -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn unload_waits_for_removal_including_a_stopped_job_without_a_pid() {
+        let mut states = [
+            Some("state = SIGTERMed\npid = 42\n".to_owned()),
+            Some("state = waiting\n".to_owned()),
+            None,
+        ]
+        .into_iter();
+        let polls = Cell::new(0);
+        wait_until_unloaded("gui/501/test", UNLOAD_TIMEOUT, || {
+            polls.set(polls.get() + 1);
+            Ok(states
+                .next()
+                .expect("must stop polling when the job is absent"))
+        })
+        .unwrap();
+        assert_eq!(polls.get(), 3);
+    }
+
+    #[test]
+    fn unload_accepts_an_absent_job_even_at_the_deadline() {
+        wait_until_unloaded("gui/501/test", Duration::ZERO, || Ok(None)).unwrap();
+    }
+
+    #[test]
+    fn unload_deadline_reports_the_job_and_last_state() {
+        let error = wait_until_unloaded("gui/501/test", Duration::ZERO, || {
+            Ok(Some("state = SIGTERMed\npid = 42\n".into()))
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("gui/501/test"));
+        assert!(message.contains("did not unload within 0ns"));
+        assert!(message.contains("state = SIGTERMed, pid = 42"));
+        assert!(!error.is::<ReadinessTimeout>());
+    }
+
+    #[test]
+    fn unload_propagates_inspection_errors() {
+        let error = wait_until_unloaded("gui/501/test", UNLOAD_TIMEOUT, || {
+            classify_launchctl_print(false, "", "Operation not permitted")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Operation not permitted"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "starts an isolated LaunchAgent in the current GUI session"]
+    fn bootout_waits_for_launchd_removal_before_rebootstrap() {
+        struct Job(String);
+        impl Drop for Job {
+            fn drop(&mut self) {
+                let _ = Command::new("launchctl")
+                    .args(["bootout", &self.0])
+                    .output();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while launchctl_print_target(&self.0).ok().flatten().is_some()
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(READY_POLL_INTERVAL);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("daemon.sh");
+        let ready = dir.path().join("ready");
+        fs::write(
+            &script,
+            "trap 'sleep 1; exit 0' TERM\n: > \"$1\"\nwhile :; do sleep 0.05; done\n",
+        )
+        .unwrap();
+        let label = format!("{LABEL}.unload-test.{:032x}", rand::random::<u128>());
+        let domain = launchctl_domain();
+        let job = Job(format!("{domain}/{label}"));
+        let plist_path = dir.path().join("service.plist");
+        fs::write(
+            &plist_path,
+            format!(
+                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                 <key>Label</key><string>{label}</string>\
+                 <key>ProgramArguments</key><array><string>/bin/sh</string>\
+                 <string>{}</string><string>{}</string></array>\
+                 <key>RunAtLoad</key><true/>\
+                 <key>ExitTimeOut</key><integer>5</integer>\
+                 </dict></plist>",
+                xml(&script),
+                xml(&ready),
+            ),
+        )
+        .unwrap();
+        bootstrap(&domain, &plist_path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "test daemon did not initialize");
+            thread::sleep(READY_POLL_INTERVAL);
+        }
+
+        bootout_target(&job.0).unwrap();
+        assert!(launchctl_print_target(&job.0).unwrap().is_none());
+        bootstrap(&domain, &plist_path).unwrap();
+        bootout_target(&job.0).unwrap();
+    }
 
     #[test]
     fn xml_escapes_paths() {
@@ -1084,6 +1223,7 @@ mod tests {
         let stops = Cell::new(0);
         let new_starts = Cell::new(0);
         let previous_starts = Cell::new(0);
+        let unload_polls = Cell::new(0);
 
         let result = replace_plist_transaction(
             &plist_path,
@@ -1092,10 +1232,15 @@ mod tests {
             true,
             || {
                 stops.set(stops.get() + 1);
-                Ok(())
+                let mut states = [Some("state = SIGTERMed\n".into()), None].into_iter();
+                wait_until_unloaded("gui/501/test", UNLOAD_TIMEOUT, || {
+                    unload_polls.set(unload_polls.get() + 1);
+                    Ok(states.next().unwrap())
+                })
             },
             |path| {
                 new_starts.set(new_starts.get() + 1);
+                assert_eq!(unload_polls.get(), 2);
                 if fs::read(path)? == b"new" {
                     bail!("simulated bootstrap failure")
                 }
@@ -1103,6 +1248,7 @@ mod tests {
             },
             |path| {
                 previous_starts.set(previous_starts.get() + 1);
+                assert_eq!(unload_polls.get(), 4);
                 assert_eq!(fs::read(path)?, b"old");
                 Ok(())
             },
@@ -1113,6 +1259,31 @@ mod tests {
         assert_eq!(stops.get(), 2);
         assert_eq!(new_starts.get(), 1);
         assert_eq!(previous_starts.get(), 1);
+    }
+
+    #[test]
+    fn unload_timeout_preserves_the_previous_plist_and_does_not_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist_path = dir.path().join("service.plist");
+        fs::write(&plist_path, b"old").unwrap();
+        let mut candidate = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        candidate.write_all(b"new").unwrap();
+        let error = replace_plist_transaction(
+            &plist_path,
+            candidate,
+            Some(b"old"),
+            true,
+            || {
+                wait_until_unloaded("gui/501/test", Duration::ZERO, || {
+                    Ok(Some("state = SIGTERMed\n".into()))
+                })
+            },
+            |_| panic!("must not replace a job that is still unloading"),
+            |_| panic!("must not bootstrap over a job that is still unloading"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not unload"));
+        assert_eq!(fs::read(&plist_path).unwrap(), b"old");
     }
 
     #[test]
