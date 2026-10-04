@@ -86,7 +86,10 @@ final class ResetCreditTests: XCTestCase {
         XCTAssertEqual(calls[0].account, "personal")
         XCTAssertEqual(calls[0].creditID, "one")
         XCTAssertNil(store.actionErrorMessage)
-        XCTAssertEqual(store.resetMessage, "personal: Reset used successfully.")
+        XCTAssertNil(store.resetMessage)
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+        XCTAssertFalse(controller.renderedMenu.items.contains { $0.title.contains("Reset used successfully") })
     }
 
     func testAllBackendOutcomesHaveDistinctFeedback() {
@@ -94,6 +97,33 @@ final class ResetCreditTests: XCTestCase {
                              ("nothing_to_reset", "No credit used"), ("no_credit", "No reset credit"),
                              ("future", "Unknown reset result")] {
             XCTAssertTrue(ResetResultSnapshot(code: code, refreshError: nil).message.contains(text))
+        }
+    }
+
+    @MainActor
+    func testConfirmedResetsLeaveNoMessageButWarningsRemainDisabled() async throws {
+        let snapshot = try resetFixture()
+        for code in ["reset", "already_redeemed", "nothing_to_reset", "no_credit", "future"] {
+            for refreshError in [nil, "Usage unavailable"] as [String?] {
+                let result = ResetResultSnapshot(code: code, refreshError: refreshError)
+                let client = ResetRecordingClient(snapshot: snapshot, result: result)
+                let store = ComradexStore(client: client)
+                await store.refresh()
+                await store.useResetCredit(account: "personal", creditID: "one")
+                await store.useResetCredit(account: "personal", creditID: "one")
+                let controller = MenuBarController(store: store)
+                controller.rebuildMenu()
+                let message = controller.renderedMenu.items.first { $0.title == "personal: \(result.message)" }
+                if (code == "reset" || code == "already_redeemed") && refreshError == nil {
+                    XCTAssertNil(store.resetMessage)
+                    XCTAssertNil(message)
+                } else {
+                    let warning = try XCTUnwrap(message)
+                    XCTAssertFalse(warning.isEnabled)
+                    XCTAssertNil(warning.action)
+                    XCTAssertEqual(warning.toolTip, refreshError.map { "Usage refresh failed: \($0)" })
+                }
+            }
         }
     }
 
@@ -150,10 +180,13 @@ private actor ResetRecordingClient: ControlServing {
     struct Call: Sendable { let account: String; let creditID: String; let requestID: String }
     let snapshot: UIStatusSnapshot
     let afterFailureSnapshot: UIStatusSnapshot?
+    let result: ResetResultSnapshot
     var calls: [Call] = []
-    init(snapshot: UIStatusSnapshot, afterFailureSnapshot: UIStatusSnapshot? = nil) {
+    init(snapshot: UIStatusSnapshot, afterFailureSnapshot: UIStatusSnapshot? = nil,
+         result: ResetResultSnapshot = ResetResultSnapshot(code: "reset", refreshError: nil)) {
         self.snapshot = snapshot
         self.afterFailureSnapshot = afterFailureSnapshot
+        self.result = result
     }
     func status() async throws -> UIStatusSnapshot {
         calls.isEmpty ? snapshot : (afterFailureSnapshot ?? snapshot)
@@ -161,7 +194,7 @@ private actor ResetRecordingClient: ControlServing {
     func useResetCredit(account: String, creditID: String, requestID: String) async throws -> ResetResultSnapshot {
         calls.append(Call(account: account, creditID: creditID, requestID: requestID))
         if calls.count == 1 { throw ControlSocketError.emptyResponse }
-        return ResetResultSnapshot(code: "reset", refreshError: nil)
+        return result
     }
     func setPreferred(pool: String, account: String?) async throws -> UIStatusSnapshot? { nil }
     func startLogin(account: String) async throws -> LoginSnapshot { throw ControlSocketError.emptyResponse }

@@ -115,7 +115,10 @@ final class ComradexStore: ObservableObject {
             let result = try await client.useResetCredit(account: account, creditID: creditID, requestID: requestID)
             resetRequestIDs[key] = nil
             pendingResetCredits[account]?[creditID] = nil
-            resetMessage = "\(account): \(result.message)"
+            let succeeded = result.code == "reset" || result.code == "already_redeemed"
+            if !succeeded || result.refreshError != nil {
+                resetMessage = "\(account): \(result.message)"
+            }
             if let error = result.refreshError {
                 resetDetail = "Usage refresh failed: \(error)"
             }
