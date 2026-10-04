@@ -128,6 +128,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if let message = store.resetMessage {
             addInformationalItem(message, icon: "arrow.counterclockwise")
             menu.items.last?.toolTip = store.resetDetail
+            menu.items.last?.isEnabled = false
         }
         if let error = store.actionErrorMessage {
             addInformationalItem("Account change failed", icon: "exclamationmark.triangle.fill")
