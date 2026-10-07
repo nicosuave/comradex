@@ -5,6 +5,7 @@ struct UsageActivationFixture {
     maximum_active: Arc<AtomicUsize>,
     release: Arc<Notify>,
     used_percent: Arc<AtomicUsize>,
+    reset_at: Arc<std::sync::atomic::AtomicI64>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -26,11 +27,13 @@ impl UsageActivationFixture {
         let maximum_active = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(Notify::new());
         let used_percent = Arc::new(AtomicUsize::new(0));
+        let reset_at = Arc::new(std::sync::atomic::AtomicI64::new(chrono::Utc::now().timestamp() + 604800));
         let server_posts = posts.clone();
         let server_active = active.clone();
         let server_maximum = maximum_active.clone();
         let server_release = release.clone();
         let server_used = used_percent.clone();
+        let server_reset = reset_at.clone();
         let server = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -40,6 +43,7 @@ impl UsageActivationFixture {
                 let maximum = server_maximum.clone();
                 let release = server_release.clone();
                 let used_percent = server_used.clone();
+                let reset_at = server_reset.clone();
                 connections.spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service_fn(move |req: Request<Incoming>| {
@@ -48,16 +52,16 @@ impl UsageActivationFixture {
                             let maximum = maximum.clone();
                             let release = release.clone();
                             let used_percent = used_percent.clone();
+                            let reset_at = reset_at.clone();
                             async move {
                                 let account = req.headers()["chatgpt-account-id"].to_str().unwrap().to_owned();
                                 assert!(req.headers()[AUTHORIZATION].to_str().unwrap().starts_with("Bearer e30."));
                                 if req.method() == Method::GET {
                                     assert_eq!(req.uri().path(), "/usage");
-                                    // Reset keeps moving and the percentage stays rounded to zero,
-                                    // exercising durable deduplication rather than an artificial usage jump.
+                                    // Usage can stay rounded to zero after a successful activation.
                                     let body = serde_json::json!({"rate_limit": {"primary_window": {
                                         "used_percent": used_percent.load(Ordering::SeqCst), "limit_window_seconds": 604800,
-                                        "reset_at": chrono::Utc::now().timestamp() + 604800
+                                        "reset_at": reset_at.load(Ordering::SeqCst)
                                     }}});
                                     return Ok::<_, Infallible>(Response::builder()
                                         .header(CONTENT_TYPE, "application/json")
@@ -125,6 +129,7 @@ impl UsageActivationFixture {
             maximum_active,
             release,
             used_percent,
+            reset_at,
             server,
             _dir: dir,
         }
@@ -155,6 +160,108 @@ impl UsageActivationFixture {
 
 const ACTIVATION_COMPLETED_SSE: &str =
     "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+
+#[derive(Clone)]
+struct ActivationLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for ActivationLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn weekly_activation_decision_logs_are_opt_in_and_explain_skips_without_secrets() {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer = ActivationLogWriter(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let mut fixture = UsageActivationFixture::new(true, StatusCode::OK, ACTIVATION_COMPLETED_SSE, false).await;
+    fixture.used_percent.store(1, Ordering::SeqCst);
+    fixture.poll().await;
+    assert!(!String::from_utf8(bytes.lock().unwrap().clone()).unwrap().contains("weekly usage activation decision"));
+
+    let mut config = (*fixture.app.config).clone();
+    config.proxy.log_weekly_usage_activation = true;
+    Arc::get_mut(&mut fixture.app).unwrap().config = Arc::new(config);
+    fixture.poll().await;
+    fixture.used_percent.store(0, Ordering::SeqCst);
+    let slots = fixture.app.http_slots.clone();
+    let capacity = slots.acquire_many(slots.available_permits() as u32).await.unwrap();
+    fixture.poll().await;
+    drop(capacity);
+    fixture.poll().await;
+    fixture.poll().await;
+
+    // Advance only the saved attempt time to exercise completed-cycle suppression.
+    let path = fixture.app.config.proxy.state_dir.as_ref().unwrap().join("usage-activation.json");
+    let mut records: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for record in records.as_object_mut().unwrap().values_mut() {
+        record["attempted_at"] = (chrono::Utc::now().timestamp() - 3601).into();
+    }
+    fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+    fixture.restart();
+    fixture.poll().await;
+    let mut config = (*fixture.app.config).clone();
+    config.proxy.auto_activate_weekly_usage = false;
+    Arc::get_mut(&mut fixture.app).unwrap().config = Arc::new(config);
+    fixture.poll().await;
+
+    let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    for reason in ["usage_nonzero", "capacity_unavailable", "eligible", "response_completed", "retry_cooldown", "cycle_already_activated", "activation_disabled"] {
+        assert!(logs.contains(&format!("reason=\"{reason}\"")), "missing {reason}: {logs}");
+    }
+    assert!(logs.contains("stored_reset_at_unix=Some("));
+    assert!(logs.contains("used_percent: Some(1)"));
+    for secret in ["Bearer", "synthetic-refresh-token", "workspace-a", "Reply OK"] {
+        assert!(!logs.contains(secret), "unexpected secret or payload: {secret}");
+    }
+    assert_eq!(fixture.posts.lock().unwrap().len(), 2);
+
+    let mut failed = UsageActivationFixture::new(true, StatusCode::TOO_MANY_REQUESTS, "private response body", false).await;
+    let mut config = (*failed.app.config).clone();
+    config.proxy.log_weekly_usage_activation = true;
+    Arc::get_mut(&mut failed.app).unwrap().config = Arc::new(config);
+    failed.poll().await;
+    let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("outcome=\"failed\" reason=\"activation_request\""));
+    assert!(!logs.contains("private response body"));
+}
+
+#[tokio::test]
+async fn weekly_activation_handles_early_reset_showing_six_days_twenty_three_hours() {
+    let mut fixture = UsageActivationFixture::new(true, StatusCode::OK, ACTIVATION_COMPLETED_SSE, false).await;
+    let now = chrono::Utc::now().timestamp();
+    fixture.reset_at.store(now + 3 * 86400, Ordering::SeqCst);
+    fixture.poll().await;
+    assert_eq!(fixture.posts.lock().unwrap().len(), 2);
+    // Seed the previous successful attempt as yesterday, retaining the real
+    // fixture's owner keys and completion data in the existing ledger format.
+    let path = fixture.app.config.proxy.state_dir.as_ref().unwrap().join("usage-activation.json");
+    let mut records: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for record in records.as_object_mut().unwrap().values_mut() {
+        record["attempted_at"] = (now - 86400).into();
+        record["completed_at"] = (now - 86400 + 2).into();
+    }
+    fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+    fixture.restart();
+    // No intervening nonzero usage observation: the new reported deadline alone
+    // must be enough, even though the previous deadline has not elapsed.
+    fixture.reset_at.store(now + 604800 - 3600, Ordering::SeqCst);
+    fixture.poll().await;
+    assert_eq!(fixture.posts.lock().unwrap().len(), 4);
+    fixture.restart();
+    fixture.poll().await;
+    assert_eq!(fixture.posts.lock().unwrap().len(), 4);
+}
 
 #[tokio::test]
 async fn weekly_activation_rechecks_usage_and_identity_before_dispatch() {

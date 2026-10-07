@@ -100,6 +100,9 @@ pub struct ProxyConfig {
     /// Start freshly reset weekly windows with a minimal account-specific request.
     #[serde(default)]
     pub auto_activate_weekly_usage: bool,
+    /// Log weekly activation decisions and sanitized quota metadata.
+    #[serde(default)]
+    pub log_weekly_usage_activation: bool,
     /// Warm elapsed Claude 5-hour/7-day windows through genuine Claude Code.
     #[serde(default)]
     pub auto_activate_claude_usage: bool,
@@ -129,6 +132,7 @@ impl Default for ProxyConfig {
             affinity_idle_days: default_affinity_days(),
             snapshot_interval_seconds: default_flush_seconds(),
             auto_activate_weekly_usage: false,
+            log_weekly_usage_activation: false,
             auto_activate_claude_usage: false,
             state_dir: None,
             installation_secret: String::new(),
@@ -569,6 +573,20 @@ kind = "inbound"
         ] {
             let config: ProxyConfig = toml::from_str(text).unwrap();
             assert_eq!(config.auto_activate_weekly_usage, enabled);
+        }
+    }
+
+    #[test]
+    fn weekly_usage_activation_logging_requires_separate_opt_in() {
+        assert!(!ProxyConfig::default().log_weekly_usage_activation);
+        for (text, enabled) in [
+            ("", false),
+            ("auto_activate_weekly_usage = true", false),
+            ("log_weekly_usage_activation = false", false),
+            ("log_weekly_usage_activation = true", true),
+        ] {
+            let config: ProxyConfig = toml::from_str(text).unwrap();
+            assert_eq!(config.log_weekly_usage_activation, enabled);
         }
     }
 

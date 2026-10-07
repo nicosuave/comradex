@@ -17,21 +17,35 @@ const RESET_TOLERANCE_SECONDS: i64 = 300;
 const RETRY_SECONDS: i64 = 3_600;
 
 /// Return the reset of the window displayed by the menu, only when it shows
-/// 100% remaining and a full weekly allowance. Usage percentages are already
+/// 100% remaining and a current weekly allowance. Usage percentages are already
 /// rounded by the usage parser; a rounded zero is deliberately eligible.
 pub fn activation_reset(windows: &BTreeMap<String, QuotaWindowStatus>, now: i64) -> Option<i64> {
+    activation_eligibility(windows, now).ok()
+}
+
+pub(crate) fn activation_eligibility(
+    windows: &BTreeMap<String, QuotaWindowStatus>,
+    now: i64,
+) -> std::result::Result<i64, &'static str> {
     let window = windows
         .iter()
         .filter(|(_, window)| {
             window.used_percent.is_some() && window.limit_window_seconds != Some(0)
         })
-        .min_by_key(|(name, _)| (window_order(name), *name))?
+        .min_by_key(|(name, _)| (window_order(name), *name))
+        .ok_or("no_usable_window")?
         .1;
-    if window.used_percent != Some(0) || window.limit_window_seconds != Some(WEEK_SECONDS as u64) {
-        return None;
+    if window.used_percent != Some(0) {
+        return Err("usage_nonzero");
     }
-    let reset = window.reset_at_unix?;
-    is_fresh_week(now, reset).then_some(reset)
+    if window.limit_window_seconds != Some(WEEK_SECONDS as u64) {
+        return Err("not_weekly");
+    }
+    let reset = window.reset_at_unix.ok_or("missing_reset")?;
+    if !is_current_week(now, reset) {
+        return Err("reset_outside_current_week");
+    }
+    Ok(reset)
 }
 
 fn window_order(name: &str) -> u8 {
@@ -43,15 +57,15 @@ fn window_order(name: &str) -> u8 {
     }
 }
 
-fn is_fresh_week(now: i64, reset: i64) -> bool {
-    now > 0 && reset.abs_diff(now.saturating_add(WEEK_SECONDS)) <= RESET_TOLERANCE_SECONDS as u64
+fn is_current_week(now: i64, reset: i64) -> bool {
+    now > 0 && reset > now && reset <= now.saturating_add(WEEK_SECONDS + RESET_TOLERANCE_SECONDS)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ActivationRecord {
-    attempted_at: i64,
-    reset_at: i64,
-    completed_at: Option<i64>,
+pub(crate) struct ActivationRecord {
+    pub(crate) attempted_at: i64,
+    pub(crate) reset_at: i64,
+    pub(crate) completed_at: Option<i64>,
 }
 
 /// Owned by the daemon's single activation worker. Keys must identify quota
@@ -63,6 +77,10 @@ pub struct UsageActivationLedger {
 }
 
 impl UsageActivationLedger {
+    pub(crate) fn record(&self, key: &str) -> Option<&ActivationRecord> {
+        self.records.get(key)
+    }
+
     /// A malformed or unreadable existing ledger is an error, never permission
     /// to issue duplicate activations.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
@@ -78,22 +96,8 @@ impl UsageActivationLedger {
     /// Durably reserve one eligible attempt. Call only after `activation_reset`
     /// selects a window; false means a previous attempt or success suppresses it.
     pub fn reserve(&mut self, key: &str, now: i64, reset: i64) -> Result<bool> {
-        if !is_fresh_week(now, reset) {
+        if self.reservation_skip_reason(key, now, reset).is_some() {
             return Ok(false);
-        }
-        if let Some(record) = self.records.get(key) {
-            if record.completed_at.is_some() {
-                // A tiny activation can still round to 100% remaining and the
-                // reported reset can move when first use starts the clock.
-                // Match the cycle by elapsed time, not exact reset equality.
-                if now < record.reset_at.saturating_sub(RESET_TOLERANCE_SECONDS)
-                    || reset <= record.reset_at.saturating_add(RESET_TOLERANCE_SECONDS)
-                {
-                    return Ok(false);
-                }
-            } else if now < record.attempted_at.saturating_add(RETRY_SECONDS) {
-                return Ok(false);
-            }
         }
         let mut records = self.records.clone();
         records.insert(
@@ -106,6 +110,34 @@ impl UsageActivationLedger {
         );
         self.save(records)?;
         Ok(true)
+    }
+
+    pub(crate) fn reservation_skip_reason(
+        &self,
+        key: &str,
+        now: i64,
+        reset: i64,
+    ) -> Option<&'static str> {
+        if !is_current_week(now, reset) {
+            return Some("reset_outside_current_week");
+        }
+        if let Some(record) = self.records.get(key) {
+            // A provider can keep moving an unused window's deadline even after
+            // a completed response. Bound retries without requiring the old
+            // weekly deadline to elapse.
+            if now < record.attempted_at.saturating_add(RETRY_SECONDS) {
+                return Some("retry_cooldown");
+            }
+            if record.completed_at.is_some() {
+                // The provider's reset identifies the cycle, even when it changes
+                // before the previous deadline. Allow small first-use timestamp drift,
+                // but never make the old deadline veto a newly reported cycle.
+                if reset <= record.reset_at.saturating_add(RESET_TOLERANCE_SECONDS) {
+                    return Some("cycle_already_activated");
+                }
+            }
+        }
+        None
     }
 
     /// Record a confirmed successful request. `reset` is the qualifying usage
@@ -201,14 +233,23 @@ mod tests {
             let snapshot = crate::usage::parse_usage_response(&body, NOW).unwrap();
             assert_eq!(activation_reset(&snapshot.windows, NOW).is_some(), expected);
         }
-        for offset in [-301, -300, 0, 300, 301] {
+        for offset in [
+            -WEEK_SECONDS,
+            -WEEK_SECONDS + 1,
+            -3600,
+            -301,
+            -300,
+            0,
+            300,
+            301,
+        ] {
             let window = QuotaWindowStatus {
                 reset_at_unix: Some(NOW + WEEK_SECONDS + offset),
                 ..weekly()
             };
             assert_eq!(
                 activation_reset(&BTreeMap::from([("primary".into(), window)]), NOW).is_some(),
-                offset.abs() <= 300
+                offset > -WEEK_SECONDS && offset <= 300
             );
         }
         for window in [
@@ -229,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn success_survives_restart_and_reset_drift_until_next_week() {
+    fn success_survives_restart_and_small_reset_drift() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("activation.json");
         let mut ledger = UsageActivationLedger::open(&path).unwrap();
@@ -242,7 +283,7 @@ mod tests {
         for elapsed in [3, 300, 3_600, 6 * 86_400] {
             assert!(
                 !ledger
-                    .reserve("owner", NOW + elapsed, NOW + elapsed + WEEK_SECONDS)
+                    .reserve("owner", NOW + elapsed, NOW + WEEK_SECONDS + 300)
                     .unwrap()
             );
         }
@@ -265,6 +306,101 @@ mod tests {
                     "owner",
                     NOW + WEEK_SECONDS + 300,
                     NOW + 2 * WEEK_SECONDS + 300
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn captured_sq_snapshot_overrides_legacy_activation_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("activation.json");
+        // Safe timing/usage fields captured on October 7, 2026. The owner key
+        // is synthetic. Preserve the installed daemon's legacy ledger format.
+        fs::write(&path, br#"{"owner":{"attempted_at":1790975739,"reset_at":1791580539,"completed_at":1790975741}}"#).unwrap();
+        let mut ledger = UsageActivationLedger::open(&path).unwrap();
+        let observed_at = 1791379753;
+        let reset_at = 1791983531;
+        let windows = BTreeMap::from([(
+            "primary".into(),
+            QuotaWindowStatus {
+                used_percent: Some(0),
+                reset_at_unix: Some(reset_at),
+                limit_window_seconds: Some(604800),
+            },
+        )]);
+        assert_eq!(activation_reset(&windows, observed_at), Some(reset_at));
+        assert!(ledger.reserve("owner", observed_at, reset_at).unwrap());
+        ledger.complete("owner", observed_at + 2, reset_at).unwrap();
+        drop(ledger);
+        let mut ledger = UsageActivationLedger::open(&path).unwrap();
+        assert!(
+            !ledger
+                .reserve("owner", observed_at + 3600, reset_at)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn early_reset_uses_current_snapshot_without_prior_usage_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("activation.json");
+        let mut ledger = UsageActivationLedger::open(&path).unwrap();
+        assert!(ledger.reserve("owner", NOW, NOW + WEEK_SECONDS).unwrap());
+        ledger
+            .complete("owner", NOW + 2, NOW + WEEK_SECONDS)
+            .unwrap();
+        drop(ledger);
+
+        let mut ledger = UsageActivationLedger::open(&path).unwrap();
+        let now = NOW + 4 * 86_400;
+        // The menu shows 100% remaining and 6d 23h. The previous recorded
+        // deadline is still three days away, and no intervening polls exist.
+        let reset = now + WEEK_SECONDS - 3_600;
+        let window = QuotaWindowStatus {
+            reset_at_unix: Some(reset),
+            ..weekly()
+        };
+        assert_eq!(
+            activation_reset(&BTreeMap::from([("primary".into(), window)]), now),
+            Some(reset)
+        );
+        assert!(ledger.reserve("owner", now, reset).unwrap());
+        ledger.complete("owner", now + 2, reset).unwrap();
+        drop(ledger);
+        let mut ledger = UsageActivationLedger::open(&path).unwrap();
+        assert!(!ledger.reserve("owner", now + 300, reset).unwrap());
+        assert!(
+            !ledger
+                .reserve("owner", now + 301, NOW + WEEK_SECONDS)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn moving_deadline_after_success_is_rate_limited_without_blocking_new_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("activation.json");
+        let mut ledger = UsageActivationLedger::open(&path).unwrap();
+        assert!(ledger.reserve("owner", NOW, NOW + WEEK_SECONDS).unwrap());
+        ledger
+            .complete("owner", NOW + 1, NOW + WEEK_SECONDS)
+            .unwrap();
+        drop(ledger);
+        let mut ledger = UsageActivationLedger::open(&path).unwrap();
+        for elapsed in [301, RETRY_SECONDS - 1] {
+            assert!(
+                !ledger
+                    .reserve("owner", NOW + elapsed, NOW + WEEK_SECONDS + elapsed)
+                    .unwrap()
+            );
+        }
+        assert!(
+            ledger
+                .reserve(
+                    "owner",
+                    NOW + RETRY_SECONDS,
+                    NOW + WEEK_SECONDS + RETRY_SECONDS
                 )
                 .unwrap()
         );
@@ -326,11 +462,7 @@ mod tests {
         );
         assert!(
             !ledger
-                .reserve(
-                    "owner",
-                    NOW + RETRY_SECONDS,
-                    NOW + RETRY_SECONDS + WEEK_SECONDS
-                )
+                .reserve("owner", NOW + RETRY_SECONDS, NOW + WEEK_SECONDS)
                 .unwrap()
         );
     }
