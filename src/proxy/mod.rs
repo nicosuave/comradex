@@ -1079,9 +1079,19 @@ impl App {
                     {
                         warn!(account = account_id, %error, "weekly usage activation failed");
                     }
+                    if !self.config.proxy.auto_activate_weekly_usage {
+                        self.log_weekly_activation(
+                            &account_id,
+                            Some(&snapshot),
+                            "skipped",
+                            "activation_disabled",
+                            None,
+                        );
+                    }
                 }
                 Err(error) => {
                     succeeded = false;
+                    self.log_weekly_activation(&account_id, None, "failed", "usage_fetch", None);
                     self.stats
                         .usage_fetch_failures
                         .fetch_add(1, Ordering::Relaxed);
