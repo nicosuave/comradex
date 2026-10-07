@@ -20,10 +20,10 @@ pub struct NativeRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Portability {
     Portable,
-    /// Signed thinking from another organization is dropped rather than rejected, so the
-    /// request still succeeds elsewhere at the cost of that reasoning and its prompt cache.
-    Thinking,
-    /// Files, containers, compaction, server tools, and previous-request references only
+    /// Thinking and compaction keep their prompt cache while healthy, but can be replayed
+    /// elsewhere when quota runs out. Foreign thinking may be dropped; summaries survive.
+    Sticky,
+    /// Files, containers, server tools, and previous-request references only
     /// resolve on the account that created them.
     Account,
 }
@@ -219,7 +219,7 @@ fn portability(value: &Value) -> Portability {
                 }
                 let own = match (key.as_str(), value) {
                     (_, Value::Null) => Portability::Portable,
-                    ("signature", _) => Portability::Thinking,
+                    ("signature", _) => Portability::Sticky,
                     (
                         "file_id"
                         | "container"
@@ -229,8 +229,8 @@ fn portability(value: &Value) -> Portability {
                         _,
                     ) => Portability::Account,
                     ("type", Value::String(kind)) => match kind.as_str() {
-                        "redacted_thinking" => Portability::Thinking,
-                        "compaction" | "server_tool_use" => Portability::Account,
+                        "redacted_thinking" | "compaction" => Portability::Sticky,
+                        "server_tool_use" => Portability::Account,
                         _ => Portability::Portable,
                     },
                     _ => Portability::Portable,
@@ -623,7 +623,7 @@ mod tests {
         }
     }
     #[test]
-    fn signed_thinking_can_move_but_server_owned_context_cannot() {
+    fn thinking_and_compaction_can_move_but_server_owned_context_cannot() {
         let classify = |content: Value| {
             let mut value: Value = serde_json::from_slice(&body()).unwrap();
             value["messages"][0]["content"] = content;
@@ -645,13 +645,14 @@ mod tests {
         for field in [
             serde_json::json!({"type":"thinking","thinking":"x","signature":"opaque"}),
             serde_json::json!({"type":"redacted_thinking","data":"opaque"}),
+            serde_json::json!({"type":"compaction","content":"summary","signature":"opaque"}),
+            serde_json::json!({"type":"compaction","content":"summary"}),
         ] {
-            assert_eq!(classify(serde_json::json!([field])), Portability::Thinking);
+            assert_eq!(classify(serde_json::json!([field])), Portability::Sticky);
         }
         for field in [
             serde_json::json!({"type":"server_tool_use","id":"owned"}),
             serde_json::json!({"file_id":"file_1"}),
-            serde_json::json!({"type":"compaction","content":"opaque"}),
             serde_json::json!({"container":"owned"}),
             serde_json::json!({"encrypted_content":"opaque"}),
         ] {

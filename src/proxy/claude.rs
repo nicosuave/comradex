@@ -361,9 +361,9 @@ impl App {
                 "model pin conflicts with conversation ownership",
             ));
         }
-        // Signed thinking and overlapping generations stay with their owner until it exhausts
-        // its included quota, then move instead of stopping. The new account becomes the
-        // owner, so the conversation does not return when the old window resets.
+        // Thinking, compaction, and overlapping generations stay with their owner until it
+        // exhausts its included quota, then move instead of stopping. The new account becomes
+        // the owner, so the conversation does not return when the old window resets.
         let movable = !account_bound && pinned.is_none();
         let mut exact = owner.or(pinned);
         let mut moved_from = None;
@@ -388,9 +388,17 @@ impl App {
                     .filter(|_| std::mem::take(&mut try_binding))
                 {
                     Some(binding) => {
-                        self.router
+                        let selected = self
+                            .router
                             .select_exact(&remaining, &binding.account_id)
-                            .await
+                            .await;
+                        if selected.is_none()
+                            && movable
+                            && self.router.quota_exhausted(&binding.account_id).await
+                        {
+                            moved_from = Some(binding.account_id.clone());
+                        }
+                        selected
                     }
                     None => None,
                 };
@@ -538,7 +546,9 @@ impl App {
                     .claude_quota_until(&account, reset, &owner)
                     .await;
                 if movable {
-                    if exact.take().is_some() {
+                    if exact.take().is_some()
+                        || binding.as_ref().is_some_and(|b| b.account_id == account)
+                    {
                         moved_from = Some(account.clone());
                     }
                     self.claude.forget_activity(&routing_id, &account).await;
@@ -547,10 +557,12 @@ impl App {
                     continue;
                 }
             }
-            // Only the conversation that placed the session can move it. Token counts,
-            // helpers, and subagents on another account leave its owner for compaction.
+            // Helpers on another account leave the session home alone. Quota migration from
+            // that home updates it even when compaction replaced the first message, otherwise
+            // the next compaction would inherit the old account again after its quota resets.
             let leads = binding.as_ref().is_none_or(|b| {
                 b.account_id == account
+                    || moved_from.as_ref() == Some(&b.account_id)
                     || conversation
                         .as_ref()
                         .is_some_and(|c| c.account_id == b.account_id)
@@ -1398,9 +1410,9 @@ kind="claude_inbound"
                 .refresh_claude_usage_at(auth::now(), false)
                 .await
         );
-        // Compaction starts a new first message; its state still belongs to the session owner.
+        // Files still require their account even when the rest of the history can move.
         let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
-        body["messages"] = json!([{"role":"user","content":[{"type":"compaction","content":"opaque"}]},{"role":"user","content":"continue"}]);
+        body["messages"] = json!([{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_1"}}]},{"role":"user","content":"continue"}]);
         let response = harness
             .send(serde_json::to_vec(&body).unwrap(), native_headers())
             .await;
@@ -1441,6 +1453,71 @@ kind="claude_inbound"
             "ada"
         );
         harness.close().await;
+    }
+    #[tokio::test]
+    async fn compaction_migrates_and_keeps_its_new_home_across_later_compactions() {
+        for kind in ["text", "compaction", "signed_compaction"] {
+            let messages = |summary: &str| {
+                let first = match kind {
+                    "text" => json!({"role":"user","content":summary}),
+                    "compaction" => {
+                        json!({"role":"assistant","content":[{"type":"compaction","content":summary}]})
+                    }
+                    _ => {
+                        json!({"role":"assistant","content":[{"type":"compaction","content":summary,"signature":format!("{summary}-signature") }]})
+                    }
+                };
+                json!([first, {"role":"user","content":"continue"}])
+            };
+            for upstream_rejection in [false, true] {
+                let harness = Harness::new(true, StatusCode::OK).await;
+                let response = harness.send(request_body(), native_headers()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+                body["messages"] = messages("First summary");
+                let response = harness
+                    .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                assert_eq!(inference_accounts(&harness).await, ["grace", "grace"]);
+
+                // A new summary has no conversation binding yet; it inherits the session home.
+                body["messages"] = messages("Second summary");
+                let mut headers = native_headers();
+                if upstream_rejection {
+                    headers.insert("x-test-quota", "true".parse().unwrap());
+                } else {
+                    report_usage(&harness, "grace", "1.0").await;
+                }
+                let response = harness
+                    .send(serde_json::to_vec(&body).unwrap(), headers)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                assert_eq!(
+                    harness.seen.lock().await.last().unwrap().1,
+                    wire::rewrite(&serde_json::to_vec(&body).unwrap(), OTHER, &"b".repeat(64))
+                        .unwrap()
+                );
+
+                report_usage(&harness, "grace", "0.1").await;
+                body["messages"] = messages("Third summary");
+                let response = harness
+                    .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                let expected = if upstream_rejection {
+                    vec!["grace", "grace", "grace", "ada", "ada"]
+                } else {
+                    vec!["grace", "grace", "ada", "ada"]
+                };
+                assert_eq!(inference_accounts(&harness).await, expected);
+                harness.close().await;
+            }
+        }
     }
     #[tokio::test]
     async fn new_sessions_balance_remaining_quota_across_active_sessions() {
@@ -1532,6 +1609,16 @@ kind="claude_inbound"
                 json!([{"type":"thinking","thinking":"synthetic","signature":"opaque"}]),
                 StatusCode::OK,
                 &["grace", "ada"][..],
+            ),
+            (
+                json!([{"type":"compaction","content":"summary","signature":"opaque"}]),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
+            (
+                json!([{"type":"compaction","content":"summary","signature":"opaque"},{"type":"document","source":{"type":"file","file_id":"file_1"}}]),
+                StatusCode::TOO_MANY_REQUESTS,
+                &["grace"][..],
             ),
             (
                 json!([{"type":"thinking","thinking":"synthetic","signature":"opaque"},{"type":"server_tool_use","id":"owned"}]),
