@@ -19,10 +19,6 @@ const RETRY_SECONDS: i64 = 3_600;
 /// Return the reset of the window displayed by the menu, only when it shows
 /// 100% remaining and a current weekly allowance. Usage percentages are already
 /// rounded by the usage parser; a rounded zero is deliberately eligible.
-pub fn activation_reset(windows: &BTreeMap<String, QuotaWindowStatus>, now: i64) -> Option<i64> {
-    activation_eligibility(windows, now).ok()
-}
-
 pub(crate) fn activation_eligibility(
     windows: &BTreeMap<String, QuotaWindowStatus>,
     now: i64,
@@ -178,6 +174,10 @@ impl UsageActivationLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn activation_reset(windows: &BTreeMap<String, QuotaWindowStatus>, now: i64) -> Option<i64> {
+        activation_eligibility(windows, now).ok()
+    }
 
     const NOW: i64 = 1_800_000_000;
 

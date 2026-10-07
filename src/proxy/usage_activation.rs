@@ -17,7 +17,7 @@ impl App {
         }
         // A rotating bearer and multiple configured aliases can represent the same quota owner.
         // Unknown identities are never activated automatically.
-        let identity = credentials.context_identity().map_err(|error| {
+        let identity = credentials.context_identity().inspect_err(|_| {
             self.log_weekly_activation(
                 account,
                 Some(snapshot),
@@ -25,7 +25,6 @@ impl App {
                 "unknown_identity",
                 None,
             );
-            error
         })?;
         let key = blake3::hash(identity.as_bytes()).to_hex().to_string();
         let mut ledger = self.usage_activation.lock().await;
