@@ -418,7 +418,20 @@ impl Router {
         thread: Option<ThreadKey>,
         exclude: Option<&str>,
     ) -> Option<Selection> {
-        self.select_with_preference(pool_name, pool, thread, exclude, None)
+        self.select_with_preference(pool_name, pool, thread, exclude, None, None)
+            .await
+    }
+
+    /// Places fresh work on the account with the most included quota left per session
+    /// recently active there. Sessions stay on their account for hours, so reusing the last
+    /// pick until `switch_at` lets one account exhaust while another idles.
+    pub async fn select_balanced(
+        &self,
+        pool_name: &str,
+        pool: &PoolConfig,
+        sessions: &HashMap<String, usize>,
+    ) -> Option<Selection> {
+        self.select_with_preference(pool_name, pool, None, None, None, Some(sessions))
             .await
     }
 
@@ -430,7 +443,7 @@ impl Router {
         pool: &PoolConfig,
         preferred: &str,
     ) -> Option<Selection> {
-        self.select_with_preference(pool_name, pool, None, None, Some(preferred))
+        self.select_with_preference(pool_name, pool, None, None, Some(preferred), None)
             .await
     }
 
@@ -441,6 +454,7 @@ impl Router {
         thread: Option<ThreadKey>,
         exclude: Option<&str>,
         preferred: Option<&str>,
+        sessions: Option<&HashMap<String, usize>>,
     ) -> Option<Selection> {
         let now = Instant::now();
         let wall_now = Utc::now();
@@ -531,11 +545,41 @@ impl Router {
                     .map(str::to_owned)
             })
             .or_else(|| {
-                active_id
-                    .filter(|id| pool.members.contains(id) && eligible(id) && below_switch_at(id))
+                active_id.filter(|id| {
+                    sessions.is_none()
+                        && pool.members.contains(id)
+                        && eligible(id)
+                        && below_switch_at(id)
+                })
             })
-            .or_else(|| {
-                pool.members
+            .or_else(|| match sessions {
+                Some(sessions) => pool
+                    .members
+                    .iter()
+                    .filter(|id| eligible(id))
+                    .min_by(|a, b| {
+                        // Unknown usage counts as full headroom; the first response reports it.
+                        let key = |id: &str| {
+                            let account = &accounts[id];
+                            let usage = account.usage_at(wall_now).unwrap_or(0);
+                            let share = f64::from(100u8.saturating_sub(usage))
+                                / (sessions.get(id).copied().unwrap_or(0) + 1) as f64;
+                            (
+                                !below_switch_at(id),
+                                share,
+                                account.inflight,
+                                account.last_assigned,
+                            )
+                        };
+                        let (a, b) = (key(a), key(b));
+                        a.0.cmp(&b.0)
+                            .then(b.1.total_cmp(&a.1))
+                            .then(a.2.cmp(&b.2))
+                            .then(a.3.cmp(&b.3))
+                    })
+                    .cloned(),
+                None => pool
+                    .members
                     .iter()
                     .filter(|id| eligible(id))
                     .min_by_key(|id| {
@@ -547,7 +591,7 @@ impl Router {
                         };
                         (tier, usage, a.inflight, a.last_assigned)
                     })
-                    .cloned()
+                    .cloned(),
             })?;
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         {
@@ -944,6 +988,18 @@ impl Router {
         }
         let generation = self.affinity.account_epoch(account).await;
         self.affinity.put(key, account.to_owned(), generation).await
+    }
+
+    /// Whether the account's included 5-hour or 7-day quota is spent, as opposed to an
+    /// authentication or transient failure.
+    pub async fn quota_exhausted(&self, account: &str) -> bool {
+        let now = Instant::now();
+        let wall_now = Utc::now();
+        let mut accounts = self.account_runtimes().await;
+        accounts.get_mut(account).is_some_and(|runtime| {
+            reconcile_expired_quota(runtime, now, wall_now);
+            runtime.quota_blocked(now, wall_now)
+        })
     }
 
     pub async fn select_exact(&self, pool: &PoolConfig, account: &str) -> Option<Selection> {
@@ -3169,5 +3225,59 @@ mod tests {
             snapshot.active_accounts["default"],
             snapshot.wired_accounts["default"]
         );
+    }
+
+    #[tokio::test]
+    async fn balanced_selection_divides_headroom_among_active_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.pools.get_mut("default").unwrap().members = vec!["a".into(), "b".into(), "c".into()];
+        cfg.accounts.insert("c".into(), AccountConfig::Inbound);
+        let affinity = Arc::new(
+            AffinityStore::load(
+                dir.path().join("a.json"),
+                &cfg.proxy.affinity_key,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        );
+        let router = Router::new(&cfg, affinity);
+        let pool = &cfg.pools["default"];
+        for (account, used) in [("a", "20"), ("b", "60"), ("c", "85")] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-primary-used-percent",
+                HeaderValue::from_static(used),
+            );
+            headers.insert(
+                "x-codex-primary-reset-at",
+                HeaderValue::from_static("2099-01-01T00:00:00Z"),
+            );
+            router.observe_headers(account, &headers).await;
+        }
+        let pick = async |sessions: &[(&str, usize)]| {
+            let sessions = sessions
+                .iter()
+                .map(|(account, count)| (account.to_string(), *count))
+                .collect();
+            router
+                .select_balanced("default", pool, &sessions)
+                .await
+                .unwrap()
+                .account_id
+        };
+        assert_eq!(pick(&[]).await, "a");
+        // 80% headroom across three sessions leaves less per session than b's 40% alone.
+        assert_eq!(pick(&[("a", 2)]).await, "b");
+        // Accounts past switch_at take new sessions only when nothing below it remains.
+        assert_eq!(pick(&[("a", 9), ("b", 9)]).await, "a");
+        // The last fresh pick is no longer sticky.
+        assert_eq!(pick(&[("a", 2)]).await, "b");
+        assert_eq!(pick(&[("b", 1)]).await, "a");
+        router.set_preferred("default", Some("b".into())).await;
+        assert_eq!(pick(&[("b", 9)]).await, "b");
+        router.set_preferred("default", None).await;
+        router.set_preserved("default", Some("a".into())).await;
+        assert_eq!(pick(&[]).await, "b");
     }
 }

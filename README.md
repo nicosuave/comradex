@@ -58,7 +58,7 @@ Each managed Claude account signs in through an isolated native login profile. C
 
 On several computers, sign each account in separately on each machine. Do not copy `claude-auth.json` between running daemons: independent refreshes of the same rotating grant invalidate each other.
 
-New sessions follow the same prefer/preserve roles as Codex pools:
+New sessions follow the same prefer/preserve roles as Codex pools. Without a preferred account, they spread by remaining quota; see [Claude Code requests](#claude-code-requests).
 
 ```sh
 comradex account prefer grace --pool claude
@@ -393,7 +393,7 @@ HTTP requests and the frame-aware WebSocket modes enforce file ownership found i
 
 ### Quotas, retries, and streaming
 
-Existing healthy bindings stay put after usage crosses `switch_at`. A reported 100% included-quota window makes an account unavailable for both fresh work and continuations, even when paid credits would let upstream keep accepting requests. Selection and dispatch validation enforce the same cutoff. Portable work switches to an eligible account; hard account-owned continuations and configured pins stop if their owner is exhausted. An exhausted pool returns an error instead of falling back to credits. Keep `switch_at` below 100 (the default is 80) to move new work earlier; it remains a soft preference and does not interrupt an active answer.
+Existing healthy bindings stay put after usage crosses `switch_at`. A reported 100% included-quota window makes an account unavailable for both fresh work and continuations, even when paid credits would let upstream keep accepting requests. Selection and dispatch validation enforce the same cutoff. Portable work switches to an eligible account; hard account-owned continuations and configured pins stop if their owner is exhausted. Claude signed thinking is the exception and moves; see [Claude Code requests](#claude-code-requests). An exhausted pool returns an error instead of falling back to credits. Keep `switch_at` below 100 (the default is 80) to move new work earlier; it remains a soft preference and does not interrupt an active answer.
 
 The default HTTP WebSocket bridge reconstructs a continued conversation from its cached input and completed output. When that history is portable, an exhausted previous account can be replaced automatically on the same client connection, including after a pre-output HTTP quota rejection or a bare quota error before `response.created`. The previous account remains preferred while healthy. Files, turn-state ownership, configured account pins, and nonportable context still prevent cross-account replay; missing cached history requires a full resend from the client. Account switching does not resume a partially delivered answer.
 
@@ -444,7 +444,9 @@ The Claude listener accepts native Claude Code subscription requests for Message
 
 Prompts, tools, thinking, cache controls, beta headers, and response bytes pass through unchanged. Routing changes only the OAuth bearer, the account and device identity in `metadata.user_id`, and an already-present request checksum. Claude Code sends an empty account ID when it has no cached account profile; routing fills it with the selected account's ID.
 
-Sessions stay on their account. An explicit shared 5-hour or 7-day quota rejection can move a request to another account before its response is forwarded. Signed thinking, compaction, predecessor references, files, and containers stay with their original account, as does a session with another stream in flight; those requests wait for their account or return an error. Permission errors, ambiguous limits, and interrupted streams never move to another account.
+New sessions go to the account with the most included quota left per session active on it in the last 30 minutes. Accounts past `switch_at` take new sessions only when every other eligible account is past it too. A preferred account still takes new sessions first while below `switch_at`, and a preserved account takes them only when nothing else is eligible. Once placed, a session stays on its account so its prompt cache stays warm. An explicit shared 5-hour or 7-day quota rejection can move a request to another account before its response is forwarded.
+
+Signed thinking, and a session with another stream in flight, stay with their account until its included 5-hour or 7-day quota is exhausted, then move to another account. Anthropic drops thinking signed by another organization rather than rejecting the request, so the moved request succeeds without that earlier reasoning and misses the prompt cache once. The new account becomes the conversation's owner; the conversation does not move back when the old window resets. Compaction, predecessor references, files, containers, server tools, and configured model pins never move; those requests wait for their account or return an error. Permission errors, ambiguous limits, login problems, and interrupted streams never move a conversation.
 
 Background usage polling feeds the menubar's 5-hour and 7-day allowance and skips accounts with a confirmed active limit before sending inference. Throttling of the usage endpoint itself does not mark an account as limited; while it lasts, that account's checks back off from five minutes up to an hour.
 

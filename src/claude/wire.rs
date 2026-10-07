@@ -12,8 +12,20 @@ pub struct NativeRequest {
     pub session: String,
     pub account: String,
     pub model: String,
-    pub nonportable: bool,
+    pub portability: Portability,
     pub conversation: String,
+}
+
+/// How far a request's history can travel between accounts. Ordered by restriction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Portability {
+    Portable,
+    /// Signed thinking from another organization is dropped rather than rejected, so the
+    /// request still succeeds elsewhere at the cost of that reasoning and its prompt cache.
+    Thinking,
+    /// Files, containers, compaction, server tools, and previous-request references only
+    /// resolve on the account that created them.
+    Account,
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
@@ -138,19 +150,25 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
         account,
         model,
         conversation: conversation(&value),
-        nonportable: value.get("messages").is_some_and(nonportable)
-            || [
-                "container",
-                "container_id",
-                "fallback_credit_token",
-                "cc_prev_req",
-            ]
-            .iter()
-            .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
+        portability: if [
+            "container",
+            "container_id",
+            "fallback_credit_token",
+            "cc_prev_req",
+        ]
+        .iter()
+        .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
             || value
                 .get("diagnostics")
                 .and_then(|v| v.get("previous_message_id"))
-                .is_some_and(|v| !v.is_null()),
+                .is_some_and(|v| !v.is_null())
+        {
+            Portability::Account
+        } else {
+            value
+                .get("messages")
+                .map_or(Portability::Portable, portability)
+        },
     })
 }
 
@@ -191,30 +209,42 @@ fn conversation(value: &Value) -> String {
         .to_string()
 }
 
-fn nonportable(value: &Value) -> bool {
+fn portability(value: &Value) -> Portability {
     match value {
-        Value::Object(map) => map.iter().any(|(key, value)| {
-            if key == "input" {
-                return false;
-            }
-            ([
-                "file_id",
-                "container",
-                "container_id",
-                "fallback_credit_token",
-                "signature",
-                "encrypted_content",
-            ]
-            .contains(&key.as_str())
-                && !value.is_null())
-                || (key == "type"
-                    && value.as_str().is_some_and(|kind| {
-                        matches!(kind, "compaction" | "redacted_thinking" | "server_tool_use")
-                    }))
-                || nonportable(value)
-        }),
-        Value::Array(values) => values.iter().any(nonportable),
-        _ => false,
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                if key == "input" {
+                    return Portability::Portable;
+                }
+                let own = match (key.as_str(), value) {
+                    (_, Value::Null) => Portability::Portable,
+                    ("signature", _) => Portability::Thinking,
+                    (
+                        "file_id"
+                        | "container"
+                        | "container_id"
+                        | "fallback_credit_token"
+                        | "encrypted_content",
+                        _,
+                    ) => Portability::Account,
+                    ("type", Value::String(kind)) => match kind.as_str() {
+                        "redacted_thinking" => Portability::Thinking,
+                        "compaction" | "server_tool_use" => Portability::Account,
+                        _ => Portability::Portable,
+                    },
+                    _ => Portability::Portable,
+                };
+                own.max(portability(value))
+            })
+            .max()
+            .unwrap_or(Portability::Portable),
+        Value::Array(values) => values
+            .iter()
+            .map(portability)
+            .max()
+            .unwrap_or(Portability::Portable),
+        _ => Portability::Portable,
     }
 }
 
@@ -593,23 +623,56 @@ mod tests {
         }
     }
     #[test]
-    fn signed_and_server_owned_context_is_not_replayed_cross_account() {
+    fn signed_thinking_can_move_but_server_owned_context_cannot() {
+        let classify = |content: Value| {
+            let mut value: Value = serde_json::from_slice(&body()).unwrap();
+            value["messages"][0]["content"] = content;
+            inspect(&headers(), &serde_json::to_vec(&value).unwrap(), false)
+                .unwrap()
+                .portability
+        };
+        assert_eq!(
+            classify(serde_json::json!("Grace Hopper")),
+            Portability::Portable
+        );
+        // Tool inputs are caller data, whatever their field names.
+        assert_eq!(
+            classify(
+                serde_json::json!([{"type":"tool_use","id":"t","name":"x","input":{"signature":"x","file_id":"y"}}])
+            ),
+            Portability::Portable
+        );
         for field in [
-            serde_json::json!({"signature":"opaque"}),
+            serde_json::json!({"type":"thinking","thinking":"x","signature":"opaque"}),
             serde_json::json!({"type":"redacted_thinking","data":"opaque"}),
+        ] {
+            assert_eq!(classify(serde_json::json!([field])), Portability::Thinking);
+        }
+        for field in [
             serde_json::json!({"type":"server_tool_use","id":"owned"}),
             serde_json::json!({"file_id":"file_1"}),
             serde_json::json!({"type":"compaction","content":"opaque"}),
             serde_json::json!({"container":"owned"}),
+            serde_json::json!({"encrypted_content":"opaque"}),
         ] {
-            let mut value: Value = serde_json::from_slice(&body()).unwrap();
-            value["messages"][0]["content"] = serde_json::json!([field]);
-            assert!(
-                inspect(&headers(), &serde_json::to_vec(&value).unwrap(), false)
-                    .unwrap()
-                    .nonportable
+            assert_eq!(
+                classify(serde_json::json!([
+                    {"type":"thinking","thinking":"x","signature":"opaque"},
+                    field
+                ])),
+                Portability::Account
             );
         }
+        let mut value: Value = serde_json::from_slice(&body()).unwrap();
+        value["messages"][0]["content"] =
+            serde_json::json!([{"type":"thinking","thinking":"x","signature":"opaque"}]);
+        value["cc_prev_req"] = "owned".into();
+        assert_eq!(
+            inspect(&headers(), &serde_json::to_vec(&value).unwrap(), false)
+                .unwrap()
+                .portability,
+            Portability::Account
+        );
     }
     #[test]
     fn conversation_follows_the_first_message_across_cache_breakpoints() {
