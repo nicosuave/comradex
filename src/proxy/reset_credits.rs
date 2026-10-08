@@ -370,8 +370,9 @@ impl App {
             rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
         };
+        let mut credit_id = credit.id.clone();
         let mut outcome = self
-            .use_reset_credit(account, &credit.id, &request_id)
+            .use_reset_credit(account, &credit_id, &request_id)
             .await;
         if outcome.is_err() {
             // An earlier uncertain attempt blocks new ones until it is retried as sent.
@@ -382,15 +383,29 @@ impl App {
                     .map(|attempt| (attempt.credit_id.clone(), attempt.request_id.clone())),
                 _ => None,
             };
-            if let Some((credit_id, request_id)) = pending {
+            if let Some((pending_id, request_id)) = pending {
                 outcome = self
-                    .use_reset_credit(account, &credit_id, &request_id)
+                    .use_reset_credit(account, &pending_id, &request_id)
                     .await;
+                credit_id = pending_id;
             }
         }
+        // A retried earlier attempt may target a credit missing from this snapshot.
+        let expires_at = if credit_id == credit.id {
+            credit.expires_at.as_deref().unwrap_or("never")
+        } else {
+            "unknown"
+        };
         match outcome {
             Ok(result) => {
-                info!(account, code = ?result.code, used, "automatic reset redemption finished");
+                info!(
+                    account,
+                    credit = credit_id.as_str(),
+                    expires_at,
+                    code = ?result.code,
+                    used,
+                    "automatic reset redemption finished"
+                );
                 let mut declined = self.reset_credits.declined.lock().await;
                 if result.code == ResetOutcome::NothingToReset {
                     declined.insert(account.into(), (used, now_unix));
@@ -399,7 +414,13 @@ impl App {
                 }
             }
             Err(error) => {
-                warn!(account, error = %format!("{error:#}"), "automatic reset redemption failed")
+                warn!(
+                    account,
+                    credit = credit_id.as_str(),
+                    expires_at,
+                    error = %format!("{error:#}"),
+                    "automatic reset redemption failed"
+                )
             }
         }
     }
