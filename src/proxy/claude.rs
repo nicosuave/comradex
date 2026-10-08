@@ -1603,6 +1603,40 @@ kind="claude_inbound"
         harness.close().await;
     }
     #[tokio::test]
+    async fn cache_diagnostics_can_migrate_but_server_threads_cannot() {
+        for (field, status, accounts) in [
+            (
+                json!({"diagnostics":{"previous_message_id":"msg_prior"}}),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
+            (
+                json!({"thread":{"type":"continue","previous_message_id":"msg_prior"}}),
+                StatusCode::TOO_MANY_REQUESTS,
+                &["grace"][..],
+            ),
+        ] {
+            let harness = Harness::new(true, StatusCode::TOO_MANY_REQUESTS).await;
+            let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+            body.as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            let response = harness
+                .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                .await;
+            assert_eq!(response.status(), status);
+            let _ = response.bytes().await.unwrap();
+            assert_eq!(inference_accounts(&harness).await, accounts);
+            for (_, bytes, _) in harness.seen.lock().await.iter() {
+                let sent: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                for (key, value) in field.as_object().unwrap() {
+                    assert_eq!(&sent[key], value);
+                }
+            }
+            harness.close().await;
+        }
+    }
+    #[tokio::test]
     async fn signed_continuation_moves_when_its_owner_rejects_quota() {
         for (content, status, accounts) in [
             (
@@ -1612,6 +1646,14 @@ kind="claude_inbound"
             ),
             (
                 json!([{"type":"compaction","content":"summary","signature":"opaque"}]),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
+            (
+                json!([
+                    {"type":"server_tool_use","id":"srvtoolu_fetch","name":"web_fetch","input":{"url":"https://example.com"}},
+                    {"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_fetch","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Fetched text"}}}}
+                ]),
                 StatusCode::OK,
                 &["grace", "ada"][..],
             ),

@@ -23,7 +23,7 @@ pub enum Portability {
     /// Thinking and compaction keep their prompt cache while healthy, but can be replayed
     /// elsewhere when quota runs out. Foreign thinking may be dropped; summaries survive.
     Sticky,
-    /// Files, containers, server tools, and previous-request references only
+    /// Files, containers, opaque server tools, and server-side thread continuations only
     /// resolve on the account that created them.
     Account,
 }
@@ -150,18 +150,14 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
         account,
         model,
         conversation: conversation(&value),
-        portability: if [
-            "container",
-            "container_id",
-            "fallback_credit_token",
-            "cc_prev_req",
-        ]
-        .iter()
-        .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
+        portability: if ["container", "container_id", "fallback_credit_token"]
+            .iter()
+            .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
             || value
-                .get("diagnostics")
-                .and_then(|v| v.get("previous_message_id"))
-                .is_some_and(|v| !v.is_null())
+                .get("thread")
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str)
+                == Some("continue")
         {
             Portability::Account
         } else {
@@ -210,6 +206,10 @@ fn conversation(value: &Value) -> String {
 }
 
 fn portability(value: &Value) -> Portability {
+    block_portability(value, false)
+}
+
+fn block_portability(value: &Value, completed_text_fetch: bool) -> Portability {
     match value {
         Value::Object(map) => map
             .iter()
@@ -230,7 +230,7 @@ fn portability(value: &Value) -> Portability {
                     ) => Portability::Account,
                     ("type", Value::String(kind)) => match kind.as_str() {
                         "redacted_thinking" | "compaction" => Portability::Sticky,
-                        "server_tool_use" => Portability::Account,
+                        "server_tool_use" if !completed_text_fetch => Portability::Account,
                         _ => Portability::Portable,
                     },
                     _ => Portability::Portable,
@@ -239,11 +239,33 @@ fn portability(value: &Value) -> Portability {
             })
             .max()
             .unwrap_or(Portability::Portable),
-        Value::Array(values) => values
-            .iter()
-            .map(portability)
-            .max()
-            .unwrap_or(Portability::Portable),
+        Value::Array(values) => {
+            // Only the complete, inline text web-fetch history has been verified across
+            // accounts. Unknown tools and unmatched calls retain their owner. Recursion
+            // still catches encrypted content, files, and containers in matched results.
+            let text_fetches: BTreeSet<_> = values
+                .iter()
+                .filter(|v| {
+                    v["type"] == "web_fetch_tool_result"
+                        && v["content"]["type"] == "web_fetch_result"
+                        && v["content"]["content"]["type"] == "document"
+                        && v["content"]["content"]["source"]["type"] == "text"
+                        && v["content"]["content"]["source"]["media_type"] == "text/plain"
+                        && v["content"]["content"]["source"]["data"].is_string()
+                })
+                .filter_map(|v| v["tool_use_id"].as_str().filter(|id| !id.is_empty()))
+                .collect();
+            values
+                .iter()
+                .map(|v| {
+                    let text_fetch = v["type"] == "server_tool_use"
+                        && v["name"] == "web_fetch"
+                        && v["id"].as_str().is_some_and(|id| text_fetches.contains(id));
+                    block_portability(v, text_fetch)
+                })
+                .max()
+                .unwrap_or(Portability::Portable)
+        }
         _ => Portability::Portable,
     }
 }
@@ -667,11 +689,100 @@ mod tests {
         let mut value: Value = serde_json::from_slice(&body()).unwrap();
         value["messages"][0]["content"] =
             serde_json::json!([{"type":"thinking","thinking":"x","signature":"opaque"}]);
-        value["cc_prev_req"] = "owned".into();
-        assert_eq!(
-            inspect(&headers(), &serde_json::to_vec(&value).unwrap(), false)
+        for (field, expected) in [
+            (
+                serde_json::json!({"diagnostics":{"previous_message_id":"msg_prior"}}),
+                Portability::Sticky,
+            ),
+            // Native cc_prev_req is a billing-header hint; the top-level form is invalid
+            // upstream, but must not be mistaken for an ownership anchor here.
+            (
+                serde_json::json!({"cc_prev_req":"hint"}),
+                Portability::Sticky,
+            ),
+            (
+                serde_json::json!({"thread":{"type":"create"}}),
+                Portability::Sticky,
+            ),
+            (
+                serde_json::json!({"thread":{"type":"continue","previous_message_id":"msg_prior"}}),
+                Portability::Account,
+            ),
+            (
+                serde_json::json!({"container":"owned"}),
+                Portability::Account,
+            ),
+            (
+                serde_json::json!({"fallback_credit_token":"owned"}),
+                Portability::Account,
+            ),
+        ] {
+            let mut request = value.clone();
+            request
+                .as_object_mut()
                 .unwrap()
-                .portability,
+                .extend(field.as_object().unwrap().clone());
+            assert_eq!(
+                inspect(&headers(), &serde_json::to_vec(&request).unwrap(), false)
+                    .unwrap()
+                    .portability,
+                expected,
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn only_complete_inline_text_fetch_history_is_portable() {
+        let call = serde_json::json!({"type":"server_tool_use","name":"web_fetch","id":"srvtoolu_fetch","input":{"url":"https://example.com"}});
+        let result = serde_json::json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_fetch","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Fetched text"}}}});
+        assert_eq!(
+            portability(&serde_json::json!([call, result])),
+            Portability::Portable
+        );
+        assert_eq!(
+            portability(&serde_json::json!([call])),
+            Portability::Account
+        );
+        for (pointer, replacement) in [
+            ("/tool_use_id", serde_json::json!("srvtoolu_other")),
+            ("/content/content/source/type", serde_json::json!("base64")),
+            (
+                "/content/content/source/media_type",
+                serde_json::json!("application/pdf"),
+            ),
+            ("/content/content/source/data", serde_json::Value::Null),
+        ] {
+            let mut changed = result.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            assert_eq!(
+                portability(&serde_json::json!([call, changed])),
+                Portability::Account,
+                "{pointer}"
+            );
+        }
+        for field in [
+            "encrypted_content",
+            "file_id",
+            "container",
+            "fallback_credit_token",
+        ] {
+            let mut changed = result.clone();
+            changed["content"][field] = "opaque".into();
+            assert_eq!(
+                portability(&serde_json::json!([call, changed])),
+                Portability::Account,
+                "{field}"
+            );
+        }
+        let mut unknown = call.clone();
+        unknown["name"] = "unknown_tool".into();
+        assert_eq!(
+            portability(&serde_json::json!([unknown, result])),
+            Portability::Account
+        );
+        // A matching result in a different message does not qualify an unmatched call.
+        assert_eq!(
+            portability(&serde_json::json!([{"content":[call]}, {"content":[result]}])),
             Portability::Account
         );
     }
