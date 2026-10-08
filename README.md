@@ -205,6 +205,71 @@ comradex account add personal_2
 
 This appends a `codex_home` account (home directory `accounts/personal_2` next to the config), adds it to the pool (`--pool` chooses another), validates the edited configuration through the full loader before persisting it, restarts the daemon if the service is installed, and runs interactive device login. Pass `--no-login` to defer authentication.
 
+### Account browser profiles
+
+Give each account its own browser cookies so signing into one does not sign another out:
+
+```sh
+comradex account add grace --browser
+comradex account add ada --claude --browser
+# Opt an existing managed account into browser profiles:
+comradex account login grace --browser
+# Reopen its provider website, for example to manage the subscription:
+comradex account browser grace
+```
+
+Once an account has a profile, later `account login <name>` commands reuse it automatically.
+Use `account login <name> --no-browser` for the ordinary login flow, including on a headless
+host. The menubar's sign-in flow is unchanged. Codex still uses the official device flow:
+enter the code printed in the terminal into the page Comradex opens. Claude's official CLI
+opens its authorization URL in the account's browser through a temporary `BROWSER` launcher.
+Browser cookies and CLI OAuth grants remain separate; Comradex does not read cookies or
+automate passwords, security keys, email verification, or purchases. Providers can still
+require those checks when a browser session expires.
+
+To create a new provider account and then connect it to Comradex:
+
+```sh
+comradex account new
+# Or supply the name and provider up front:
+comradex account new anna --claude
+comradex account new grace_2 --codex --pool default
+```
+
+The wizard asks for a name and provider, opens that account's browser, and waits while you
+create the provider account and choose any subscription you need. Press Enter when ready;
+Comradex adds it to the pool and starts the official CLI login using the same browser cookies.
+The config is validated before opening the browser and re-read after signup to preserve edits
+made while you were there. If you stop before pressing Enter, run `account new` with the same
+name to resume with those cookies. If login fails after the account was added, resume with
+`account login <name>`. Account creation requires a terminal and an existing Comradex config.
+
+Comradex uses an installed Chrome/Chromium version 115 or newer. On macOS it checks system
+and user Applications directories for Google Chrome; on Linux it checks `PATH`. Set
+`COMRADEX_BROWSER` to an absolute Chrome/Chromium executable path for a custom installation.
+It launches ordinary browser windows with a separate
+[`--user-data-dir`](https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md)
+for each account, without changing your default browser, sharing its profile, opening a
+debugging port, or disabling Chrome's sandbox.
+
+If no supported browser is installed, Comradex downloads Google's stable
+[Chrome for Testing](https://github.com/GoogleChromeLabs/chrome-for-testing) using `curl`
+and `unzip`. Automatic downloads support Apple Silicon and Intel macOS, and x86-64 Linux;
+Linux also needs Chrome's system libraries and a graphical session. On other architectures,
+including Linux ARM64, install Chromium and set `COMRADEX_BROWSER`. Downloaded builds are
+cached by version under `browsers/chrome/` next to the config; the stable release is checked
+on each use of the downloaded browser, and older cached versions are retained. An unavailable
+release service or failed download reports an error; it does not use your default browser.
+
+Cookies are stored in private `browsers/profiles/<account-name-hash>/` directories next to
+the config. Commands print the selected profile path. The hash keeps names distinct even on
+case-insensitive filesystems. `account remove` retains browser cookies as well as credentials;
+`account remove --purge` deletes both. Close the account's browser before purging it. A profile
+with a Chrome singleton lock/socket, or a linked profile directory, is refused before changing
+the config. Reusing a removed account's name reuses its retained cookies.
+
+### Inspecting and removing accounts
+
 Use these commands to inspect or remove accounts:
 
 ```sh

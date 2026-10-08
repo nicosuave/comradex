@@ -256,10 +256,18 @@ impl Resolver {
 /// Login uses a dedicated native profile only for the official login ceremony. The relay
 /// owns the imported grant afterwards; running Claude in this profile would race refresh.
 pub fn login(home: &Path) -> Result<()> {
+    login_with_browser(home, None)
+}
+
+pub fn login_with_browser(home: &Path, browser: Option<&Path>) -> Result<()> {
     fs::create_dir_all(home)?;
     let _guard = HomeAuthLock::acquire(home)?;
+    let mut command = login_command(home)?;
+    if let Some(browser) = browser {
+        command.env("BROWSER", browser);
+    }
     ensure!(
-        login_command(home)?
+        command
             .status()
             .context("launch official Claude login")?
             .success(),
