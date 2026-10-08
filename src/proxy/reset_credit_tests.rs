@@ -607,3 +607,58 @@ async fn reset_credit_retry_cannot_change_request_credit_or_identity() {
         1
     );
 }
+
+fn enable_auto_redeem(fixture: &mut ResetCreditFixture) {
+    let app = Arc::get_mut(&mut fixture.app).unwrap();
+    let mut config = (*app.config).clone();
+    config.proxy.auto_redeem_resets = true;
+    app.config = Arc::new(config);
+}
+
+fn consume_requests(fixture: &ResetCreditFixture) -> Vec<serde_json::Value> {
+    fixture
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, _, _)| *method == Method::POST)
+        .map(|(_, _, body)| body.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn auto_redeem_spends_a_banked_reset_once_the_window_is_nearly_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = reset_credit_fixture(dir.path(), "reset", "2100-01-01T00:00:00Z").await;
+    enable_auto_redeem(&mut fixture);
+    let now = chrono::Utc::now().timestamp() as u64;
+    assert!(fixture.app.refresh_managed_usage_at(now).await);
+    let consumed = consume_requests(&fixture);
+    assert_eq!(consumed.len(), 1);
+    assert_eq!(consumed[0]["credit_id"], "credit-one");
+    assert_eq!(
+        fixture.router.routing_snapshot().await.account_states["a"].usage_percent,
+        Some(0)
+    );
+    // The refilled window has nothing left to redeem against.
+    assert!(fixture.app.refresh_managed_usage_at(now).await);
+    assert_eq!(consume_requests(&fixture).len(), 1);
+}
+
+#[tokio::test]
+async fn auto_redeem_waits_for_more_usage_after_the_provider_declines() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture =
+        reset_credit_fixture(dir.path(), "nothing_to_reset", "2100-01-01T00:00:00Z").await;
+    enable_auto_redeem(&mut fixture);
+    let now = chrono::Utc::now().timestamp() as u64;
+    assert!(fixture.app.refresh_managed_usage_at(now).await);
+    assert!(fixture.app.refresh_managed_usage_at(now).await);
+    assert_eq!(consume_requests(&fixture).len(), 1);
+    assert!(
+        fixture.router.routing_snapshot().await.account_states["a"]
+            .reset_credits
+            .as_ref()
+            .is_some_and(|credits| credits.available_count == 1)
+    );
+}

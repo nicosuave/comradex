@@ -149,6 +149,14 @@ struct AccountRuntime {
     capacity: CapacityBackoff,
 }
 
+/// New sessions stay on their account for hours, so quota expiring sooner than this cannot
+/// absorb more of them than quota expiring this far out.
+const PLACEMENT_HORIZON_SECONDS: i64 = 24 * 3600;
+/// Windows this long hold quota that is lost if unused. Shorter windows refill within a
+/// session's lifetime, so they only cap headroom.
+pub(crate) const LONG_WINDOW_SECONDS: u64 = 24 * 3600;
+const DEFAULT_WINDOW_SECONDS: i64 = 7 * 24 * 3600;
+
 const CAPACITY_REJECTION_WINDOW: Duration = Duration::from_secs(120);
 const CAPACITY_BACKOFF_DECAY: Duration = Duration::from_secs(30 * 60);
 const CAPACITY_REJECTION_THRESHOLD: usize = 3;
@@ -225,6 +233,8 @@ pub struct Router {
     wired: Mutex<HashMap<String, String>>,
     sequence: AtomicU64,
     switch_at: u8,
+    /// Banked resets count toward placement only when Comradex redeems them itself.
+    auto_redeem_resets: bool,
 }
 
 impl AccountRuntime {
@@ -243,6 +253,85 @@ impl AccountRuntime {
             .filter_map(|window| window.used_percent)
             .chain(self.legacy_usage)
             .max()
+    }
+
+    /// Percent of a window per hour this account must use so none of its included quota,
+    /// or its banked resets when `count_credits`, expires unused. A reserved account offers
+    /// only its surplus over an even pace and keeps its banked resets.
+    fn placement_rate(&self, now: DateTime<Utc>, reserved: bool, count_credits: bool) -> f64 {
+        let now_unix = now.timestamp();
+        let headroom = if reserved {
+            self.reserve_surplus(now_unix)
+        } else {
+            f64::from(100u8.saturating_sub(self.usage_at(now).unwrap_or(0)))
+        };
+        // An unstarted window begins with the next request.
+        let window_deadline = self
+            .usage_windows
+            .values()
+            .filter(|window| window.used_percent.is_some())
+            .filter_map(|window| {
+                let length = window
+                    .limit_window_seconds
+                    .filter(|length| *length >= LONG_WINDOW_SECONDS)?;
+                match window.reset_at_unix {
+                    Some(reset) if reset <= now_unix => None,
+                    Some(reset) => Some(reset - now_unix),
+                    None => Some(i64::try_from(length).unwrap_or(i64::MAX)),
+                }
+            })
+            .min()
+            .unwrap_or(DEFAULT_WINDOW_SECONDS);
+        let credits = if count_credits && !reserved {
+            self.redeemable_credit_expiries(now)
+        } else {
+            Vec::new()
+        };
+        // A banked reset can be used only after the current headroom is spent.
+        let deadline = credits.iter().copied().fold(window_deadline, i64::min);
+        let hours = |seconds: i64| seconds.max(PLACEMENT_HORIZON_SECONDS) as f64 / 3600.0;
+        headroom / hours(deadline)
+            + credits
+                .iter()
+                .map(|expiry| 100.0 / hours(*expiry))
+                .sum::<f64>()
+    }
+
+    /// Quota above an even pace through each window. The owner of a reserved account keeps
+    /// the rest; anything above that line would expire unused. Unknown timing reserves the
+    /// whole window.
+    fn reserve_surplus(&self, now: i64) -> f64 {
+        self.usage_windows
+            .values()
+            .filter(|window| window.reset_at_unix.is_none_or(|reset| reset > now))
+            .filter_map(|window| {
+                let used = window.used_percent?;
+                let left = match (window.reset_at_unix, window.limit_window_seconds) {
+                    (Some(reset), Some(length)) if length > 0 => {
+                        ((reset - now) as f64 / length as f64).clamp(0.0, 1.0)
+                    }
+                    _ => 1.0,
+                };
+                Some(f64::from(100u8.saturating_sub(used)) - 100.0 * left)
+            })
+            .chain(self.legacy_usage.map(|used| -f64::from(used)))
+            .reduce(f64::min)
+            .unwrap_or(0.0)
+            .max(0.0)
+    }
+
+    /// Seconds until each redeemable banked reset expires. A reset without an expiry is never
+    /// wasted, so it adds no urgency.
+    fn redeemable_credit_expiries(&self, now: DateTime<Utc>) -> Vec<i64> {
+        self.reset_credits
+            .as_ref()
+            .and_then(|snapshot| snapshot.credits.as_ref())
+            .into_iter()
+            .flatten()
+            .filter(|credit| credit.can_redeem_at(now))
+            .filter_map(|credit| DateTime::parse_from_rfc3339(credit.expires_at.as_ref()?).ok())
+            .map(|expiry| expiry.timestamp() - now.timestamp())
+            .collect()
     }
 
     /// Credits can keep upstream requests succeeding after included quota is spent.
@@ -408,6 +497,7 @@ impl Router {
             wired: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
             switch_at: config.proxy.switch_at,
+            auto_redeem_resets: config.proxy.auto_redeem_resets,
         }
     }
 
@@ -422,9 +512,8 @@ impl Router {
             .await
     }
 
-    /// Places fresh work on the account with the most included quota left per session
-    /// recently active there. Sessions stay on their account for hours, so reusing the last
-    /// pick until `switch_at` lets one account exhaust while another idles.
+    /// Places fresh work by soonest-expiring quota per session recently active on each
+    /// account, rather than counting in-flight requests.
     pub async fn select_balanced(
         &self,
         pool_name: &str,
@@ -503,6 +592,7 @@ impl Router {
         }
         let (configured_preferred, preserved) = self.account_order(pool_name).await;
         let active_id = self.active.lock().await.get(pool_name).cloned();
+        let is_preserved = |id: &str| preserved.as_deref() == Some(id);
         let eligible = |id: &str| {
             exclude != Some(id)
                 && accounts.get(id).is_some_and(|a| {
@@ -512,12 +602,16 @@ impl Router {
                         && a.avoid_until.is_none_or(|v| v <= now)
                 })
         };
-        let has_unpreserved = pool
-            .members
-            .iter()
-            .any(|id| preserved.as_ref() != Some(id) && eligible(id));
-        let eligible =
-            |id: &str| eligible(id) && (!has_unpreserved || preserved.as_deref() != Some(id));
+        // A preserved account with no surplus over an even pace waits until nothing else is
+        // eligible; its surplus would otherwise expire unused.
+        let held = |id: &str| {
+            is_preserved(id)
+                && accounts
+                    .get(id)
+                    .is_none_or(|a| a.reserve_surplus(wall_now.timestamp()) <= 0.0)
+        };
+        let has_unheld = pool.members.iter().any(|id| !held(id) && eligible(id));
+        let eligible = |id: &str| eligible(id) && (!has_unheld || !held(id));
         // Apply the soft capacity preference only after normal eligibility. An
         // unavailable sibling must never turn this preference into an empty pool.
         let has_capacity_alternative = pool
@@ -527,11 +621,16 @@ impl Router {
         let preferred_for_capacity =
             |id: &str| !has_capacity_alternative || !accounts[id].capacity.active(now);
         let eligible = |id: &str| eligible(id) && preferred_for_capacity(id);
+        // Running out is harmless when Comradex can refill the account with a banked reset.
         let below_switch_at = |id: &str| {
-            accounts
-                .get(id)
-                .and_then(|account| account.usage_at(wall_now))
-                .is_none_or(|usage| usage < self.switch_at)
+            accounts.get(id).is_some_and(|account| {
+                account
+                    .usage_at(wall_now)
+                    .is_none_or(|usage| usage < self.switch_at)
+                    || (self.auto_redeem_resets
+                        && !is_preserved(id)
+                        && !account.redeemable_credit_expiries(wall_now).is_empty())
+            })
         };
         let selected = configured_preferred
             .filter(|id| pool.members.contains(id) && eligible(id) && below_switch_at(id))
@@ -545,53 +644,39 @@ impl Router {
                     .map(str::to_owned)
             })
             .or_else(|| {
-                active_id.filter(|id| {
-                    sessions.is_none()
-                        && pool.members.contains(id)
-                        && eligible(id)
-                        && below_switch_at(id)
-                })
-            })
-            .or_else(|| match sessions {
-                Some(sessions) => pool
-                    .members
+                // Quota that expires sooner goes first, shared among the sessions already
+                // using it. Codex sessions hold their account for the life of a connection,
+                // so in-flight work stands in for them, and ties keep the last pick so
+                // requests without a session key share a warm cache. Unknown usage counts as
+                // full headroom; the first response reports it.
+                let key = |id: &str| {
+                    let account = &accounts[id];
+                    let load = match sessions {
+                        Some(sessions) => sessions.get(id).copied().unwrap_or(0) as u64,
+                        None => account.inflight,
+                    };
+                    let rate =
+                        account.placement_rate(wall_now, is_preserved(id), self.auto_redeem_resets);
+                    (
+                        !below_switch_at(id),
+                        rate / (load + 1) as f64,
+                        sessions.is_none() && active_id.as_deref() != Some(id),
+                        account.inflight,
+                        account.last_assigned,
+                    )
+                };
+                pool.members
                     .iter()
                     .filter(|id| eligible(id))
                     .min_by(|a, b| {
-                        // Unknown usage counts as full headroom; the first response reports it.
-                        let key = |id: &str| {
-                            let account = &accounts[id];
-                            let usage = account.usage_at(wall_now).unwrap_or(0);
-                            let share = f64::from(100u8.saturating_sub(usage))
-                                / (sessions.get(id).copied().unwrap_or(0) + 1) as f64;
-                            (
-                                !below_switch_at(id),
-                                share,
-                                account.inflight,
-                                account.last_assigned,
-                            )
-                        };
                         let (a, b) = (key(a), key(b));
                         a.0.cmp(&b.0)
                             .then(b.1.total_cmp(&a.1))
                             .then(a.2.cmp(&b.2))
                             .then(a.3.cmp(&b.3))
+                            .then(a.4.cmp(&b.4))
                     })
-                    .cloned(),
-                None => pool
-                    .members
-                    .iter()
-                    .filter(|id| eligible(id))
-                    .min_by_key(|id| {
-                        let a = &accounts[*id];
-                        let (tier, usage) = match a.usage_at(wall_now) {
-                            Some(usage) if usage < self.switch_at => (0u8, usage),
-                            None => (1u8, 0),
-                            Some(usage) => (2u8, usage),
-                        };
-                        (tier, usage, a.inflight, a.last_assigned)
-                    })
-                    .cloned(),
+                    .cloned()
             })?;
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         {
@@ -846,16 +931,20 @@ impl Router {
             let (configured, preserved) = self.account_order(pool_name).await;
             if preserved.as_deref() == Some(selection.account_id.as_str()) {
                 let accounts = self.account_runtimes().await;
-                let has_alternative = pool.members.iter().any(|id| {
-                    id != &selection.account_id
-                        && selection.excluded_account.as_ref() != Some(id)
-                        && accounts.get(id).is_some_and(|runtime| {
-                            !runtime.auth_unavailable()
-                                && !runtime.login_in_progress
-                                && !runtime.quota_blocked(now, wall_now)
-                                && runtime.avoid_until.is_none_or(|until| until <= now)
-                        })
-                });
+                let held = accounts
+                    .get(&selection.account_id)
+                    .is_none_or(|runtime| runtime.reserve_surplus(wall_now.timestamp()) <= 0.0);
+                let has_alternative = held
+                    && pool.members.iter().any(|id| {
+                        id != &selection.account_id
+                            && selection.excluded_account.as_ref() != Some(id)
+                            && accounts.get(id).is_some_and(|runtime| {
+                                !runtime.auth_unavailable()
+                                    && !runtime.login_in_progress
+                                    && !runtime.quota_blocked(now, wall_now)
+                                    && runtime.avoid_until.is_none_or(|until| until <= now)
+                            })
+                    });
                 if has_alternative {
                     return Err(SelectionStaleReason::PreservedSuperseded);
                 }
@@ -3279,5 +3368,241 @@ mod tests {
         router.set_preferred("default", None).await;
         router.set_preserved("default", Some("a".into())).await;
         assert_eq!(pick(&[]).await, "b");
+    }
+
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
+
+    fn weekly(used: u8, reset_in: i64) -> QuotaWindowStatus {
+        QuotaWindowStatus {
+            used_percent: Some(used),
+            reset_at_unix: Some(Utc::now().timestamp() + reset_in),
+            limit_window_seconds: Some(7 * DAY as u64),
+        }
+    }
+
+    fn usage(windows: &[(&str, QuotaWindowStatus)]) -> AccountRuntime {
+        AccountRuntime {
+            usage_windows: windows
+                .iter()
+                .map(|(name, window)| (name.to_string(), window.clone()))
+                .collect(),
+            ..AccountRuntime::default()
+        }
+    }
+
+    fn banked_reset(expires_in: i64) -> crate::reset_credits::ResetCreditsSnapshot {
+        crate::reset_credits::ResetCreditsSnapshot {
+            available_count: 1,
+            observed_at_unix: Utc::now().timestamp(),
+            credits: Some(vec![crate::reset_credits::ResetCredit {
+                id: "credit".into(),
+                reset_type: "codex_rate_limits".into(),
+                status: "available".into(),
+                granted_at: "2026-10-01T00:00:00Z".into(),
+                expires_at: Some((Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339()),
+                title: None,
+                description: None,
+            }]),
+            error: None,
+        }
+    }
+
+    fn close(actual: f64, expected: f64) -> bool {
+        (actual - expected).abs() <= 1e-3 * expected.abs()
+    }
+
+    #[test]
+    fn placement_rate_favors_quota_and_banked_resets_that_expire_first() {
+        let now = Utc::now();
+        // 10% left with a reset expiring tomorrow beats 90% left that resets in four days,
+        // but only when Comradex redeems resets itself.
+        let mut expiring = usage(&[("primary", weekly(90, 5 * DAY))]);
+        expiring.reset_credits = Some(banked_reset(DAY));
+        let roomy = usage(&[("primary", weekly(10, 4 * DAY))]);
+        assert!(
+            expiring.placement_rate(now, false, true)
+                > 4.0 * roomy.placement_rate(now, false, true)
+        );
+        assert!(
+            expiring.placement_rate(now, false, false) < roomy.placement_rate(now, false, false)
+        );
+        // With equal deadlines, the rate follows headroom as before.
+        let half = usage(&[("primary", weekly(50, 4 * DAY))]);
+        assert!(close(
+            roomy.placement_rate(now, false, false) / half.placement_rate(now, false, false),
+            1.8
+        ));
+        // Urgency stops growing inside the final day.
+        assert!(close(
+            usage(&[("primary", weekly(50, HOUR))]).placement_rate(now, false, false),
+            usage(&[("primary", weekly(50, DAY))]).placement_rate(now, false, false)
+        ));
+        // Short windows cap headroom without adding urgency, and an unstarted week starts now.
+        let unstarted = usage(&[
+            (
+                "5h",
+                QuotaWindowStatus {
+                    used_percent: Some(40),
+                    reset_at_unix: Some(now.timestamp() + HOUR),
+                    limit_window_seconds: Some(5 * HOUR as u64),
+                },
+            ),
+            (
+                "7d",
+                QuotaWindowStatus {
+                    used_percent: Some(0),
+                    reset_at_unix: None,
+                    limit_window_seconds: Some(7 * DAY as u64),
+                },
+            ),
+        ]);
+        assert!(close(
+            unstarted.placement_rate(now, false, false),
+            60.0 / 168.0
+        ));
+        // Unknown usage counts as a full window due in a week.
+        assert!(close(
+            AccountRuntime::default().placement_rate(now, false, false),
+            100.0 / 168.0
+        ));
+    }
+
+    #[test]
+    fn reserved_accounts_offer_only_quota_above_an_even_pace() {
+        let now = Utc::now().timestamp();
+        // A week just begun leaves a seventh; with a day left, six sevenths.
+        assert!(close(
+            usage(&[("primary", weekly(0, 6 * DAY))]).reserve_surplus(now),
+            100.0 / 7.0
+        ));
+        assert!(close(
+            usage(&[("primary", weekly(0, DAY))]).reserve_surplus(now),
+            600.0 / 7.0
+        ));
+        // Usage ahead of pace, an unstarted window, and unknown usage hold everything back.
+        assert_eq!(
+            usage(&[("primary", weekly(50, 6 * DAY))]).reserve_surplus(now),
+            0.0
+        );
+        let mut unstarted = weekly(0, 0);
+        unstarted.reset_at_unix = None;
+        assert_eq!(usage(&[("primary", unstarted)]).reserve_surplus(now), 0.0);
+        assert_eq!(AccountRuntime::default().reserve_surplus(now), 0.0);
+        let legacy = AccountRuntime {
+            legacy_usage: Some(10),
+            ..usage(&[("primary", weekly(0, DAY))])
+        };
+        assert_eq!(legacy.reserve_surplus(now), 0.0);
+        // Banked resets stay with the reserved account.
+        let mut reserved = usage(&[("primary", weekly(0, DAY))]);
+        reserved.reset_credits = Some(banked_reset(DAY));
+        assert!(close(
+            reserved.placement_rate(Utc::now(), true, true),
+            600.0 / 7.0 / 24.0
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_work_goes_to_the_quota_that_expires_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, router, pool) = stale_test_router(dir.path());
+        {
+            let mut accounts = router.accounts.lock().await;
+            accounts.get_mut("a").unwrap().usage_windows =
+                BTreeMap::from([("primary".into(), weekly(40, 6 * DAY))]);
+            accounts.get_mut("b").unwrap().usage_windows =
+                BTreeMap::from([("primary".into(), weekly(40, 2 * DAY))]);
+        }
+        let pick = async || {
+            router
+                .select("default", &pool, None, None)
+                .await
+                .unwrap()
+                .account_id
+        };
+        assert_eq!(pick().await, "b");
+        // Open connections share b's quota; three of them leave a's slower deadline ahead.
+        for _ in 0..3 {
+            router.begin("b").await;
+        }
+        assert_eq!(pick().await, "a");
+    }
+
+    #[tokio::test]
+    async fn preserved_account_takes_fresh_work_from_its_surplus() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, router, pool) = stale_test_router(dir.path());
+        router.set_preserved("default", Some("a".into())).await;
+        {
+            let mut accounts = router.accounts.lock().await;
+            accounts.get_mut("a").unwrap().usage_windows =
+                BTreeMap::from([("primary".into(), weekly(0, DAY))]);
+            accounts.get_mut("b").unwrap().usage_windows =
+                BTreeMap::from([("primary".into(), weekly(50, 6 * DAY))]);
+        }
+        let selected = router.select("default", &pool, None, None).await.unwrap();
+        assert_eq!(selected.account_id, "a");
+        assert!(
+            router
+                .validate_selection(&selected, "default", &pool)
+                .await
+                .is_ok()
+        );
+        // Once its owner is ahead of pace, the preserved account waits behind the others.
+        router
+            .accounts
+            .lock()
+            .await
+            .get_mut("a")
+            .unwrap()
+            .usage_windows = BTreeMap::from([("primary".into(), weekly(30, 6 * DAY))]);
+        assert_eq!(
+            router.validate_selection(&selected, "default", &pool).await,
+            Err(SelectionStaleReason::PreservedSuperseded)
+        );
+        assert_eq!(
+            router
+                .select("default", &pool, None, None)
+                .await
+                .unwrap()
+                .account_id,
+            "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn banked_resets_count_only_when_comradex_redeems_them() {
+        for (auto_redeem, expected) in [(false, "b"), (true, "a")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = config(dir.path());
+            cfg.proxy.auto_redeem_resets = auto_redeem;
+            let affinity = Arc::new(
+                AffinityStore::load(
+                    dir.path().join("a.json"),
+                    &cfg.proxy.affinity_key,
+                    Duration::from_secs(60),
+                )
+                .unwrap(),
+            );
+            let router = Router::new(&cfg, affinity);
+            {
+                let mut accounts = router.accounts.lock().await;
+                let a = accounts.get_mut("a").unwrap();
+                // Past switch_at, but its reset expiring tomorrow needs this window spent first.
+                a.usage_windows = BTreeMap::from([("primary".into(), weekly(90, 5 * DAY))]);
+                a.reset_credits = Some(banked_reset(DAY));
+                accounts.get_mut("b").unwrap().usage_windows =
+                    BTreeMap::from([("primary".into(), weekly(10, 4 * DAY))]);
+            }
+            assert_eq!(
+                router
+                    .select("default", &cfg.pools["default"], None, None)
+                    .await
+                    .unwrap()
+                    .account_id,
+                expected
+            );
+        }
     }
 }

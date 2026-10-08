@@ -106,6 +106,9 @@ pub struct ProxyConfig {
     /// Warm elapsed Claude 5-hour/7-day windows through genuine Claude Code.
     #[serde(default)]
     pub auto_activate_claude_usage: bool,
+    /// Redeem banked Codex resets when they add quota, and count them in placement.
+    #[serde(default)]
+    pub auto_redeem_resets: bool,
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
     #[serde(default)]
@@ -134,6 +137,7 @@ impl Default for ProxyConfig {
             auto_activate_weekly_usage: false,
             log_weekly_usage_activation: false,
             auto_activate_claude_usage: false,
+            auto_redeem_resets: false,
             state_dir: None,
             installation_secret: String::new(),
             affinity_key: String::new(),

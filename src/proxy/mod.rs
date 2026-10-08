@@ -1088,6 +1088,9 @@ impl App {
                             None,
                         );
                     }
+                    if self.config.proxy.auto_redeem_resets {
+                        self.auto_redeem_reset(&account_id, &snapshot).await;
+                    }
                 }
                 Err(error) => {
                     succeeded = false;
