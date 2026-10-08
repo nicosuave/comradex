@@ -22,10 +22,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 mod maintenance;
+
+/// How long a session counts toward its account's load after its last request.
+const ACTIVE_SESSION: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(not(test))]
 const RESPONSE_BODY_IDLE_TIMEOUT: Duration = super::HTTP_RESPONSE_BODY_IDLE_TIMEOUT;
@@ -42,6 +45,8 @@ pub(super) struct Claude {
     reporting_usage: Mutex<HashMap<String, ReportingUsage>>,
     activation: Mutex<Result<crate::claude::maintenance::ActivationLedger>>,
     sessions: Mutex<HashMap<String, Weak<Session>>>,
+    /// Last inference dispatch per (session, account), for balancing new sessions.
+    activity: Mutex<HashMap<(String, String), Instant>>,
 }
 struct ReportingUsage {
     owner: crate::auth::QuotaOwner,
@@ -73,7 +78,30 @@ impl Claude {
                     .join("claude-activation.json"),
             )),
             sessions: Mutex::new(HashMap::new()),
+            activity: Mutex::new(HashMap::new()),
         })
+    }
+    async fn note_activity(&self, session: &str, account: &str) {
+        let now = Instant::now();
+        let mut activity = self.activity.lock().await;
+        activity.retain(|_, at| now.duration_since(*at) < ACTIVE_SESSION);
+        activity.insert((session.into(), account.into()), now);
+    }
+    async fn forget_activity(&self, session: &str, account: &str) {
+        self.activity
+            .lock()
+            .await
+            .remove(&(session.to_owned(), account.to_owned()));
+    }
+    async fn active_sessions(&self) -> HashMap<String, usize> {
+        let now = Instant::now();
+        let mut counts = HashMap::new();
+        for ((_, account), at) in self.activity.lock().await.iter() {
+            if now.duration_since(*at) < ACTIVE_SESSION {
+                *counts.entry(account.clone()).or_default() += 1;
+            }
+        }
+        counts
     }
     async fn session(&self, key: &str) -> Arc<Session> {
         let mut sessions = self.sessions.lock().await;
@@ -291,7 +319,9 @@ impl App {
             native.conversation
         ));
         let conversation = self.router.affinity.get(&conversation_key).await;
-        let hard = native.nonportable || session.active.load(Ordering::Acquire) > 0;
+        let account_bound = native.portability == wire::Portability::Account;
+        let hard = native.portability != wire::Portability::Portable
+            || session.active.load(Ordering::Acquire) > 0;
         let pinned = pool.model_accounts.get(&native.model).cloned();
         let owner = if hard {
             conversation
@@ -313,7 +343,7 @@ impl App {
         } else {
             None
         };
-        if hard && owner.is_none() {
+        if account_bound && owner.is_none() {
             return Ok(error_response(
                 StatusCode::CONFLICT,
                 "claude_owner_required",
@@ -331,31 +361,53 @@ impl App {
                 "model pin conflicts with conversation ownership",
             ));
         }
-        let exact = owner.or(pinned);
+        // Thinking, compaction, and overlapping generations stay with their owner until it
+        // exhausts its included quota, then move instead of stopping. The new account becomes
+        // the owner, so the conversation does not return when the old window resets.
+        let movable = !account_bound && pinned.is_none();
+        let mut exact = owner.or(pinned);
+        let mut moved_from = None;
         let mut remaining = pool.clone();
         let mut last_rejection = None;
         let mut attempted_identities = HashSet::new();
-        for attempt in 0..pool.members.len() {
+        let mut try_binding = true;
+        for _ in 0..pool.members.len() {
+            if movable
+                && let Some(account) = exact.clone()
+                && self.router.quota_exhausted(&account).await
+            {
+                remaining.members.retain(|name| name != &account);
+                exact = None;
+                moved_from = Some(account);
+            }
             let selection = if let Some(account) = &exact {
                 self.router.select_exact(&remaining, account).await
             } else {
-                let bound = if attempt == 0 {
-                    match &binding {
-                        Some(binding) => {
-                            self.router
-                                .select_exact(&remaining, &binding.account_id)
-                                .await
+                let bound = match binding
+                    .as_ref()
+                    .filter(|_| std::mem::take(&mut try_binding))
+                {
+                    Some(binding) => {
+                        let selected = self
+                            .router
+                            .select_exact(&remaining, &binding.account_id)
+                            .await;
+                        if selected.is_none()
+                            && movable
+                            && self.router.quota_exhausted(&binding.account_id).await
+                        {
+                            moved_from = Some(binding.account_id.clone());
                         }
-                        None => None,
+                        selected
                     }
-                } else {
-                    None
+                    None => None,
                 };
                 match bound {
                     Some(selection) => Some(selection),
                     None => {
+                        let sessions = self.claude.active_sessions().await;
                         self.router
-                            .select(&listener.pool, &remaining, None, None)
+                            .select_balanced(&listener.pool, &remaining, &sessions)
                             .await
                     }
                 }
@@ -398,7 +450,7 @@ impl App {
             let identity_key = self.router.affinity.key(&format!(
                 "claude-credential:{routing_id}:{account}:{identity}"
             ));
-            if native.nonportable
+            if account_bound
                 && credentials
                     .as_ref()
                     .is_some_and(|c| binding.is_some() || c.account_uuid != native.account)
@@ -429,6 +481,9 @@ impl App {
                 }
                 None => body.clone(),
             };
+            if message {
+                self.claude.note_activity(&routing_id, &account).await;
+            }
             self.router.note_wired(&listener.pool, &account).await;
             self.router.begin(&account).await;
             let lease = DirectAccountLease::new_for_selection(self.router.clone(), &selected);
@@ -490,16 +545,24 @@ impl App {
                 self.router
                     .claude_quota_until(&account, reset, &owner)
                     .await;
-                if exact.is_none() && !native.nonportable {
+                if movable {
+                    if exact.take().is_some()
+                        || binding.as_ref().is_some_and(|b| b.account_id == account)
+                    {
+                        moved_from = Some(account.clone());
+                    }
+                    self.claude.forget_activity(&routing_id, &account).await;
                     last_rejection = Some(response);
                     drop(lease);
                     continue;
                 }
             }
-            // Only the conversation that placed the session can move it. Token counts,
-            // helpers, and subagents on another account leave its owner for compaction.
+            // Helpers on another account leave the session home alone. Quota migration from
+            // that home updates it even when compaction replaced the first message, otherwise
+            // the next compaction would inherit the old account again after its quota resets.
             let leads = binding.as_ref().is_none_or(|b| {
                 b.account_id == account
+                    || moved_from.as_ref() == Some(&b.account_id)
                     || conversation
                         .as_ref()
                         .is_some_and(|c| c.account_id == b.account_id)
@@ -515,6 +578,15 @@ impl App {
                     "affinity_unavailable",
                     "could not persist Claude account binding",
                 ));
+            }
+            if response.status().is_success()
+                && let Some(from) = &moved_from
+            {
+                tracing::info!(
+                    from = from.as_str(),
+                    to = account.as_str(),
+                    "moved Claude conversation off an account with exhausted quota"
+                );
             }
             let (mut parts, incoming) = response.into_parts();
             headers::strip_hop_by_hop(&mut parts.headers);
@@ -1248,8 +1320,86 @@ kind="claude_inbound"
             harness.close().await;
         }
     }
+    /// Reports fresh shared 5-hour and 7-day usage for a managed account.
+    async fn report_usage(harness: &Harness, account: &str, utilization: &str) {
+        let mut headers = HeaderMap::new();
+        for window in ["5h", "7d"] {
+            headers.insert(
+                hyper::header::HeaderName::try_from(format!(
+                    "anthropic-ratelimit-unified-{window}-utilization"
+                ))
+                .unwrap(),
+                utilization.parse().unwrap(),
+            );
+        }
+        let home = harness.app.config.accounts[account].home().unwrap();
+        let owner = auth::read(home).unwrap().owner();
+        harness
+            .app
+            .router
+            .observe_claude_usage_for_owner(
+                account,
+                quota::snapshot(&headers, auth::now() + 1).unwrap(),
+                &owner,
+            )
+            .await;
+    }
+    async fn inference_accounts(harness: &Harness) -> Vec<String> {
+        harness
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r.2.starts_with("/v1/messages"))
+            .map(|r| {
+                r.0["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .replace("Bearer sk-ant-oat01-", "")
+            })
+            .collect()
+    }
+    fn session_request(session: &str) -> (Vec<u8>, HeaderMap) {
+        let body = String::from_utf8(request_body())
+            .unwrap()
+            .replace(SESSION, session)
+            .into_bytes();
+        let mut headers = native_headers();
+        headers.insert("x-claude-code-session-id", session.parse().unwrap());
+        (body, headers)
+    }
     #[tokio::test]
     async fn helper_on_another_account_does_not_take_over_signed_conversation() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let response = harness.send(request_body(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        // Maintenance sends the helper elsewhere without touching grace's quota.
+        assert!(harness.app.router.begin_login("grace").await);
+        let mut helper: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        helper["model"] = "claude-haiku-4-5".into();
+        helper["messages"] = json!([{"role":"user","content":"Write a short title."}]);
+        let response = harness
+            .send(serde_json::to_vec(&helper).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        harness.app.router.finish_login("grace", false).await;
+        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["messages"] = json!([{"role":"user","content":"Ada Lovelace says hello."},{"role":"assistant","content":[{"type":"thinking","thinking":"synthetic","signature":"opaque"}]},{"role":"user","content":"continue"}]);
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        assert_eq!(
+            inference_accounts(&harness).await,
+            ["grace", "ada", "grace"]
+        );
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn signed_conversation_moves_once_when_its_owner_exhausts_quota() {
         let harness = Harness::new(true, StatusCode::OK).await;
         let response = harness.send(request_body(), native_headers()).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1260,47 +1410,148 @@ kind="claude_inbound"
                 .refresh_claude_usage_at(auth::now(), false)
                 .await
         );
-        let mut helper: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
-        helper["model"] = "claude-haiku-4-5".into();
-        helper["messages"] = json!([{"role":"user","content":"Write a short title."}]);
-        let response = harness
-            .send(serde_json::to_vec(&helper).unwrap(), native_headers())
-            .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let _ = response.bytes().await.unwrap();
+        // Files still require their account even when the rest of the history can move.
         let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["messages"] = json!([{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_1"}}]},{"role":"user","content":"continue"}]);
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(inference_accounts(&harness).await, ["grace"]);
         body["messages"] = json!([{"role":"user","content":"Ada Lovelace says hello."},{"role":"assistant","content":[{"type":"thinking","thinking":"synthetic","signature":"opaque"}]},{"role":"user","content":"continue"}]);
         let response = harness
             .send(serde_json::to_vec(&body).unwrap(), native_headers())
             .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        {
-            let seen = harness.seen.lock().await;
-            let inference: Vec<_> = seen
-                .iter()
-                .filter(|r| r.2.starts_with("/v1/messages"))
-                .map(|r| r.0["authorization"].clone())
-                .collect();
-            assert_eq!(
-                inference,
-                ["Bearer sk-ant-oat01-grace", "Bearer sk-ant-oat01-ada"]
-            );
-        }
-        // Compaction starts a new first message; its state still belongs to the session owner.
-        body["messages"] = json!([{"role":"user","content":[{"type":"compaction","content":"opaque"}]},{"role":"user","content":"continue"}]);
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        // The new owner keeps the conversation after the old account recovers.
+        report_usage(&harness, "grace", "0.1").await;
         let response = harness
             .send(serde_json::to_vec(&body).unwrap(), native_headers())
             .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        assert_eq!(inference_accounts(&harness).await, ["grace", "ada", "ada"]);
+        assert_eq!(
+            harness.seen.lock().await.last().unwrap().1,
+            wire::rewrite(&serde_json::to_vec(&body).unwrap(), OTHER, &"b".repeat(64)).unwrap()
+        );
+        let session = harness
+            .app
+            .router
+            .affinity
+            .key(&format!("claude:claude:{SESSION}"));
         assert_eq!(
             harness
-                .seen
-                .lock()
+                .app
+                .router
+                .affinity
+                .get(&session)
                 .await
-                .iter()
-                .filter(|r| r.2.starts_with("/v1/messages"))
-                .count(),
-            2
+                .unwrap()
+                .account_id,
+            "ada"
+        );
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn compaction_migrates_and_keeps_its_new_home_across_later_compactions() {
+        for kind in ["text", "compaction", "signed_compaction"] {
+            let messages = |summary: &str| {
+                let first = match kind {
+                    "text" => json!({"role":"user","content":summary}),
+                    "compaction" => {
+                        json!({"role":"assistant","content":[{"type":"compaction","content":summary}]})
+                    }
+                    _ => {
+                        json!({"role":"assistant","content":[{"type":"compaction","content":summary,"signature":format!("{summary}-signature") }]})
+                    }
+                };
+                json!([first, {"role":"user","content":"continue"}])
+            };
+            for upstream_rejection in [false, true] {
+                let harness = Harness::new(true, StatusCode::OK).await;
+                let response = harness.send(request_body(), native_headers()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+                body["messages"] = messages("First summary");
+                let response = harness
+                    .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                assert_eq!(inference_accounts(&harness).await, ["grace", "grace"]);
+
+                // A new summary has no conversation binding yet; it inherits the session home.
+                body["messages"] = messages("Second summary");
+                let mut headers = native_headers();
+                if upstream_rejection {
+                    headers.insert("x-test-quota", "true".parse().unwrap());
+                } else {
+                    report_usage(&harness, "grace", "1.0").await;
+                }
+                let response = harness
+                    .send(serde_json::to_vec(&body).unwrap(), headers)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                assert_eq!(
+                    harness.seen.lock().await.last().unwrap().1,
+                    wire::rewrite(&serde_json::to_vec(&body).unwrap(), OTHER, &"b".repeat(64))
+                        .unwrap()
+                );
+
+                report_usage(&harness, "grace", "0.1").await;
+                body["messages"] = messages("Third summary");
+                let response = harness
+                    .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                let expected = if upstream_rejection {
+                    vec!["grace", "grace", "grace", "ada", "ada"]
+                } else {
+                    vec!["grace", "grace", "ada", "ada"]
+                };
+                assert_eq!(inference_accounts(&harness).await, expected);
+                harness.close().await;
+            }
+        }
+    }
+    #[tokio::test]
+    async fn new_sessions_balance_remaining_quota_across_active_sessions() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        harness.app.router.set_preferred("claude", None).await;
+        let sessions = [
+            SESSION,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            "99999999-9999-4999-8999-999999999999",
+        ];
+        for session in &sessions[..3] {
+            let (body, headers) = session_request(session);
+            let response = harness.send(body, headers).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = response.bytes().await.unwrap();
+        }
+        assert_eq!(
+            inference_accounts(&harness).await,
+            ["grace", "ada", "grace"]
+        );
+        // grace keeps 40% for two sessions; ada keeps 90% for one, then for two.
+        report_usage(&harness, "grace", "0.6").await;
+        report_usage(&harness, "ada", "0.1").await;
+        for session in [sessions[3], sessions[4], sessions[0]] {
+            let (body, headers) = session_request(session);
+            let response = harness.send(body, headers).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = response.bytes().await.unwrap();
+        }
+        assert_eq!(
+            inference_accounts(&harness).await,
+            ["grace", "ada", "grace", "ada", "ada", "grace"]
         );
         harness.close().await;
     }
@@ -1352,38 +1603,103 @@ kind="claude_inbound"
         harness.close().await;
     }
     #[tokio::test]
-    async fn signed_continuation_stays_with_owner_on_quota_failure() {
-        let harness = Harness::new(true, StatusCode::TOO_MANY_REQUESTS).await;
-        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
-        body["messages"] = json!([{"role":"assistant","content":[{"type":"thinking","thinking":"synthetic","signature":"opaque"}]},{"role":"user","content":"continue"}]);
-        let response = harness
-            .send(serde_json::to_vec(&body).unwrap(), native_headers())
-            .await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(harness.seen.lock().await.len(), 1);
-        harness.close().await;
+    async fn cache_diagnostics_can_migrate_but_server_threads_cannot() {
+        for (field, status, accounts) in [
+            (
+                json!({"diagnostics":{"previous_message_id":"msg_prior"}}),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
+            (
+                json!({"thread":{"type":"continue","previous_message_id":"msg_prior"}}),
+                StatusCode::TOO_MANY_REQUESTS,
+                &["grace"][..],
+            ),
+        ] {
+            let harness = Harness::new(true, StatusCode::TOO_MANY_REQUESTS).await;
+            let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+            body.as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            let response = harness
+                .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                .await;
+            assert_eq!(response.status(), status);
+            let _ = response.bytes().await.unwrap();
+            assert_eq!(inference_accounts(&harness).await, accounts);
+            for (_, bytes, _) in harness.seen.lock().await.iter() {
+                let sent: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                for (key, value) in field.as_object().unwrap() {
+                    assert_eq!(&sent[key], value);
+                }
+            }
+            harness.close().await;
+        }
     }
     #[tokio::test]
-    async fn overlapping_generation_cannot_migrate_the_session() {
+    async fn signed_continuation_moves_when_its_owner_rejects_quota() {
+        for (content, status, accounts) in [
+            (
+                json!([{"type":"thinking","thinking":"synthetic","signature":"opaque"}]),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
+            (
+                json!([{"type":"compaction","content":"summary","signature":"opaque"}]),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
+            (
+                json!([
+                    {"type":"server_tool_use","id":"srvtoolu_fetch","name":"web_fetch","input":{"url":"https://example.com"}},
+                    {"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_fetch","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Fetched text"}}}}
+                ]),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
+            (
+                json!([{"type":"compaction","content":"summary","signature":"opaque"},{"type":"document","source":{"type":"file","file_id":"file_1"}}]),
+                StatusCode::TOO_MANY_REQUESTS,
+                &["grace"][..],
+            ),
+            (
+                json!([{"type":"thinking","thinking":"synthetic","signature":"opaque"},{"type":"server_tool_use","id":"owned"}]),
+                StatusCode::TOO_MANY_REQUESTS,
+                &["grace"][..],
+            ),
+        ] {
+            let harness = Harness::new(true, StatusCode::TOO_MANY_REQUESTS).await;
+            let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+            body["messages"] = json!([{"role":"assistant","content":content},{"role":"user","content":"continue"}]);
+            let response = harness
+                .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                .await;
+            assert_eq!(response.status(), status);
+            let _ = response.bytes().await.unwrap();
+            assert_eq!(inference_accounts(&harness).await, accounts);
+            harness.close().await;
+        }
+    }
+    #[tokio::test]
+    async fn overlapping_generation_moves_only_when_its_owner_rejects_quota() {
         let harness = Harness::new(true, StatusCode::OK).await;
         let mut headers = native_headers();
         headers.insert("x-test-hold", "true".parse().unwrap());
         let first = harness.send(request_body(), headers).await;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(harness.app.stats.inflight_http.load(Ordering::Relaxed), 1);
+        let second = harness.send(request_body(), native_headers()).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = second.bytes().await.unwrap();
         let mut headers = native_headers();
         headers.insert("x-test-quota", "true".parse().unwrap());
-        let second = harness.send(request_body(), headers).await;
-        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-        let _ = second.bytes().await.unwrap();
-        {
-            let seen = harness.seen.lock().await;
-            assert_eq!(seen.len(), 2);
-            assert!(
-                seen.iter()
-                    .all(|r| r.0["authorization"] == "Bearer sk-ant-oat01-grace")
-            );
-        }
+        let third = harness.send(request_body(), headers).await;
+        assert_eq!(third.status(), StatusCode::OK);
+        let _ = third.bytes().await.unwrap();
+        assert_eq!(
+            inference_accounts(&harness).await,
+            ["grace", "grace", "grace", "ada"]
+        );
         harness.release_stream.notify_one();
         assert_eq!(first.bytes().await.unwrap(), STREAM);
         harness.close().await;
@@ -1441,14 +1757,23 @@ kind="claude_inbound"
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         changed["organization_uuid"] = ACCOUNT.into();
         std::fs::write(path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let mut owned = body.clone();
+        owned["messages"][1]["content"] = json!([{"type":"text","text":"continue"},{"type":"document","source":{"type":"file","file_id":"file_1"}}]);
         assert_eq!(
             harness
-                .send(serde_json::to_vec(&body).unwrap(), native_headers())
+                .send(serde_json::to_vec(&owned).unwrap(), native_headers())
                 .await
                 .status(),
             StatusCode::CONFLICT
         );
         assert_eq!(harness.seen.lock().await.len(), 3);
+        // Another organization's signatures are dropped upstream rather than rejected.
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        assert_eq!(harness.seen.lock().await.len(), 4);
         harness.close().await;
     }
     #[tokio::test]

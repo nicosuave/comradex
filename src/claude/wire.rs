@@ -12,8 +12,20 @@ pub struct NativeRequest {
     pub session: String,
     pub account: String,
     pub model: String,
-    pub nonportable: bool,
+    pub portability: Portability,
     pub conversation: String,
+}
+
+/// How far a request's history can travel between accounts. Ordered by restriction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Portability {
+    Portable,
+    /// Thinking and compaction keep their prompt cache while healthy, but can be replayed
+    /// elsewhere when quota runs out. Foreign thinking may be dropped; summaries survive.
+    Sticky,
+    /// Files, containers, opaque server tools, and server-side thread continuations only
+    /// resolve on the account that created them.
+    Account,
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
@@ -138,19 +150,21 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
         account,
         model,
         conversation: conversation(&value),
-        nonportable: value.get("messages").is_some_and(nonportable)
-            || [
-                "container",
-                "container_id",
-                "fallback_credit_token",
-                "cc_prev_req",
-            ]
+        portability: if ["container", "container_id", "fallback_credit_token"]
             .iter()
             .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
             || value
-                .get("diagnostics")
-                .and_then(|v| v.get("previous_message_id"))
-                .is_some_and(|v| !v.is_null()),
+                .get("thread")
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str)
+                == Some("continue")
+        {
+            Portability::Account
+        } else {
+            value
+                .get("messages")
+                .map_or(Portability::Portable, portability)
+        },
     })
 }
 
@@ -191,30 +205,68 @@ fn conversation(value: &Value) -> String {
         .to_string()
 }
 
-fn nonportable(value: &Value) -> bool {
+fn portability(value: &Value) -> Portability {
+    block_portability(value, false)
+}
+
+fn block_portability(value: &Value, completed_text_fetch: bool) -> Portability {
     match value {
-        Value::Object(map) => map.iter().any(|(key, value)| {
-            if key == "input" {
-                return false;
-            }
-            ([
-                "file_id",
-                "container",
-                "container_id",
-                "fallback_credit_token",
-                "signature",
-                "encrypted_content",
-            ]
-            .contains(&key.as_str())
-                && !value.is_null())
-                || (key == "type"
-                    && value.as_str().is_some_and(|kind| {
-                        matches!(kind, "compaction" | "redacted_thinking" | "server_tool_use")
-                    }))
-                || nonportable(value)
-        }),
-        Value::Array(values) => values.iter().any(nonportable),
-        _ => false,
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                if key == "input" {
+                    return Portability::Portable;
+                }
+                let own = match (key.as_str(), value) {
+                    (_, Value::Null) => Portability::Portable,
+                    ("signature", _) => Portability::Sticky,
+                    (
+                        "file_id"
+                        | "container"
+                        | "container_id"
+                        | "fallback_credit_token"
+                        | "encrypted_content",
+                        _,
+                    ) => Portability::Account,
+                    ("type", Value::String(kind)) => match kind.as_str() {
+                        "redacted_thinking" | "compaction" => Portability::Sticky,
+                        "server_tool_use" if !completed_text_fetch => Portability::Account,
+                        _ => Portability::Portable,
+                    },
+                    _ => Portability::Portable,
+                };
+                own.max(portability(value))
+            })
+            .max()
+            .unwrap_or(Portability::Portable),
+        Value::Array(values) => {
+            // Only the complete, inline text web-fetch history has been verified across
+            // accounts. Unknown tools and unmatched calls retain their owner. Recursion
+            // still catches encrypted content, files, and containers in matched results.
+            let text_fetches: BTreeSet<_> = values
+                .iter()
+                .filter(|v| {
+                    v["type"] == "web_fetch_tool_result"
+                        && v["content"]["type"] == "web_fetch_result"
+                        && v["content"]["content"]["type"] == "document"
+                        && v["content"]["content"]["source"]["type"] == "text"
+                        && v["content"]["content"]["source"]["media_type"] == "text/plain"
+                        && v["content"]["content"]["source"]["data"].is_string()
+                })
+                .filter_map(|v| v["tool_use_id"].as_str().filter(|id| !id.is_empty()))
+                .collect();
+            values
+                .iter()
+                .map(|v| {
+                    let text_fetch = v["type"] == "server_tool_use"
+                        && v["name"] == "web_fetch"
+                        && v["id"].as_str().is_some_and(|id| text_fetches.contains(id));
+                    block_portability(v, text_fetch)
+                })
+                .max()
+                .unwrap_or(Portability::Portable)
+        }
+        _ => Portability::Portable,
     }
 }
 
@@ -593,23 +645,146 @@ mod tests {
         }
     }
     #[test]
-    fn signed_and_server_owned_context_is_not_replayed_cross_account() {
+    fn thinking_and_compaction_can_move_but_server_owned_context_cannot() {
+        let classify = |content: Value| {
+            let mut value: Value = serde_json::from_slice(&body()).unwrap();
+            value["messages"][0]["content"] = content;
+            inspect(&headers(), &serde_json::to_vec(&value).unwrap(), false)
+                .unwrap()
+                .portability
+        };
+        assert_eq!(
+            classify(serde_json::json!("Grace Hopper")),
+            Portability::Portable
+        );
+        // Tool inputs are caller data, whatever their field names.
+        assert_eq!(
+            classify(
+                serde_json::json!([{"type":"tool_use","id":"t","name":"x","input":{"signature":"x","file_id":"y"}}])
+            ),
+            Portability::Portable
+        );
         for field in [
-            serde_json::json!({"signature":"opaque"}),
+            serde_json::json!({"type":"thinking","thinking":"x","signature":"opaque"}),
             serde_json::json!({"type":"redacted_thinking","data":"opaque"}),
+            serde_json::json!({"type":"compaction","content":"summary","signature":"opaque"}),
+            serde_json::json!({"type":"compaction","content":"summary"}),
+        ] {
+            assert_eq!(classify(serde_json::json!([field])), Portability::Sticky);
+        }
+        for field in [
             serde_json::json!({"type":"server_tool_use","id":"owned"}),
             serde_json::json!({"file_id":"file_1"}),
-            serde_json::json!({"type":"compaction","content":"opaque"}),
             serde_json::json!({"container":"owned"}),
+            serde_json::json!({"encrypted_content":"opaque"}),
         ] {
-            let mut value: Value = serde_json::from_slice(&body()).unwrap();
-            value["messages"][0]["content"] = serde_json::json!([field]);
-            assert!(
-                inspect(&headers(), &serde_json::to_vec(&value).unwrap(), false)
-                    .unwrap()
-                    .nonportable
+            assert_eq!(
+                classify(serde_json::json!([
+                    {"type":"thinking","thinking":"x","signature":"opaque"},
+                    field
+                ])),
+                Portability::Account
             );
         }
+        let mut value: Value = serde_json::from_slice(&body()).unwrap();
+        value["messages"][0]["content"] =
+            serde_json::json!([{"type":"thinking","thinking":"x","signature":"opaque"}]);
+        for (field, expected) in [
+            (
+                serde_json::json!({"diagnostics":{"previous_message_id":"msg_prior"}}),
+                Portability::Sticky,
+            ),
+            // Native cc_prev_req is a billing-header hint; the top-level form is invalid
+            // upstream, but must not be mistaken for an ownership anchor here.
+            (
+                serde_json::json!({"cc_prev_req":"hint"}),
+                Portability::Sticky,
+            ),
+            (
+                serde_json::json!({"thread":{"type":"create"}}),
+                Portability::Sticky,
+            ),
+            (
+                serde_json::json!({"thread":{"type":"continue","previous_message_id":"msg_prior"}}),
+                Portability::Account,
+            ),
+            (
+                serde_json::json!({"container":"owned"}),
+                Portability::Account,
+            ),
+            (
+                serde_json::json!({"fallback_credit_token":"owned"}),
+                Portability::Account,
+            ),
+        ] {
+            let mut request = value.clone();
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(field.as_object().unwrap().clone());
+            assert_eq!(
+                inspect(&headers(), &serde_json::to_vec(&request).unwrap(), false)
+                    .unwrap()
+                    .portability,
+                expected,
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn only_complete_inline_text_fetch_history_is_portable() {
+        let call = serde_json::json!({"type":"server_tool_use","name":"web_fetch","id":"srvtoolu_fetch","input":{"url":"https://example.com"}});
+        let result = serde_json::json!({"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_fetch","content":{"type":"web_fetch_result","content":{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Fetched text"}}}});
+        assert_eq!(
+            portability(&serde_json::json!([call, result])),
+            Portability::Portable
+        );
+        assert_eq!(
+            portability(&serde_json::json!([call])),
+            Portability::Account
+        );
+        for (pointer, replacement) in [
+            ("/tool_use_id", serde_json::json!("srvtoolu_other")),
+            ("/content/content/source/type", serde_json::json!("base64")),
+            (
+                "/content/content/source/media_type",
+                serde_json::json!("application/pdf"),
+            ),
+            ("/content/content/source/data", serde_json::Value::Null),
+        ] {
+            let mut changed = result.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            assert_eq!(
+                portability(&serde_json::json!([call, changed])),
+                Portability::Account,
+                "{pointer}"
+            );
+        }
+        for field in [
+            "encrypted_content",
+            "file_id",
+            "container",
+            "fallback_credit_token",
+        ] {
+            let mut changed = result.clone();
+            changed["content"][field] = "opaque".into();
+            assert_eq!(
+                portability(&serde_json::json!([call, changed])),
+                Portability::Account,
+                "{field}"
+            );
+        }
+        let mut unknown = call.clone();
+        unknown["name"] = "unknown_tool".into();
+        assert_eq!(
+            portability(&serde_json::json!([unknown, result])),
+            Portability::Account
+        );
+        // A matching result in a different message does not qualify an unmatched call.
+        assert_eq!(
+            portability(&serde_json::json!([{"content":[call]}, {"content":[result]}])),
+            Portability::Account
+        );
     }
     #[test]
     fn conversation_follows_the_first_message_across_cache_breakpoints() {
