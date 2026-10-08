@@ -149,6 +149,8 @@ struct AccountRuntime {
     capacity: CapacityBackoff,
 }
 
+/// How long a session counts toward its account's load after its last request.
+const ACTIVE_SESSION: Duration = Duration::from_secs(30 * 60);
 /// New sessions stay on their account for hours, so quota expiring sooner than this cannot
 /// absorb more of them than quota expiring this far out.
 const PLACEMENT_HORIZON_SECONDS: i64 = 24 * 3600;
@@ -231,6 +233,8 @@ pub struct Router {
     preserved: Mutex<HashMap<String, String>>,
     active: Mutex<HashMap<String, String>>,
     wired: Mutex<HashMap<String, String>>,
+    /// Last request of each session on each account, keyed by the session's soft routing key.
+    sessions: Mutex<HashMap<(ThreadKey, String), Instant>>,
     sequence: AtomicU64,
     switch_at: u8,
     /// Banked resets count toward placement only when Comradex redeems them itself.
@@ -495,6 +499,7 @@ impl Router {
             ),
             active: Mutex::new(HashMap::new()),
             wired: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
             switch_at: config.proxy.switch_at,
             auto_redeem_resets: config.proxy.auto_redeem_resets,
@@ -508,19 +513,7 @@ impl Router {
         thread: Option<ThreadKey>,
         exclude: Option<&str>,
     ) -> Option<Selection> {
-        self.select_with_preference(pool_name, pool, thread, exclude, None, None)
-            .await
-    }
-
-    /// Places fresh work by soonest-expiring quota per session recently active on each
-    /// account, rather than counting in-flight requests.
-    pub async fn select_balanced(
-        &self,
-        pool_name: &str,
-        pool: &PoolConfig,
-        sessions: &HashMap<String, usize>,
-    ) -> Option<Selection> {
-        self.select_with_preference(pool_name, pool, None, None, None, Some(sessions))
+        self.select_with_preference(pool_name, pool, thread, exclude, None)
             .await
     }
 
@@ -532,8 +525,37 @@ impl Router {
         pool: &PoolConfig,
         preferred: &str,
     ) -> Option<Selection> {
-        self.select_with_preference(pool_name, pool, None, None, Some(preferred), None)
+        self.select_with_preference(pool_name, pool, None, None, Some(preferred))
             .await
+    }
+
+    /// Counts a session toward its account's load until it has been idle for 30 minutes.
+    /// Sessions stay on their account for hours, so load measured by in-flight requests
+    /// alone would let one account fill while another idles.
+    pub async fn note_session(&self, key: &ThreadKey, account: &str) {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|_, at| now.duration_since(*at) < ACTIVE_SESSION);
+        sessions.insert((key.clone(), account.to_owned()), now);
+    }
+
+    /// Stops counting a session that left `account` before being served there.
+    pub async fn forget_session(&self, key: &ThreadKey, account: &str) {
+        self.sessions
+            .lock()
+            .await
+            .remove(&(key.clone(), account.to_owned()));
+    }
+
+    async fn session_counts(&self) -> HashMap<String, usize> {
+        let now = Instant::now();
+        let mut counts = HashMap::new();
+        for ((_, account), at) in self.sessions.lock().await.iter() {
+            if now.duration_since(*at) < ACTIVE_SESSION {
+                *counts.entry(account.clone()).or_default() += 1;
+            }
+        }
+        counts
     }
 
     async fn select_with_preference(
@@ -543,10 +565,10 @@ impl Router {
         thread: Option<ThreadKey>,
         exclude: Option<&str>,
         preferred: Option<&str>,
-        sessions: Option<&HashMap<String, usize>>,
     ) -> Option<Selection> {
         let now = Instant::now();
         let wall_now = Utc::now();
+        let sessions = self.session_counts().await;
         let binding = match &thread {
             Some(key) => self.affinity.get(key).await,
             None => None,
@@ -591,7 +613,6 @@ impl Router {
             }
         }
         let (configured_preferred, preserved) = self.account_order(pool_name).await;
-        let active_id = self.active.lock().await.get(pool_name).cloned();
         let is_preserved = |id: &str| preserved.as_deref() == Some(id);
         let eligible = |id: &str| {
             exclude != Some(id)
@@ -645,22 +666,16 @@ impl Router {
             })
             .or_else(|| {
                 // Quota that expires sooner goes first, shared among the sessions already
-                // using it. Codex sessions hold their account for the life of a connection,
-                // so in-flight work stands in for them, and ties keep the last pick so
-                // requests without a session key share a warm cache. Unknown usage counts as
-                // full headroom; the first response reports it.
+                // using it. Unknown usage counts as full headroom; the first response reports
+                // it.
                 let key = |id: &str| {
                     let account = &accounts[id];
-                    let load = match sessions {
-                        Some(sessions) => sessions.get(id).copied().unwrap_or(0) as u64,
-                        None => account.inflight,
-                    };
+                    let load = sessions.get(id).copied().unwrap_or(0);
                     let rate =
                         account.placement_rate(wall_now, is_preserved(id), self.auto_redeem_resets);
                     (
                         !below_switch_at(id),
                         rate / (load + 1) as f64,
-                        sessions.is_none() && active_id.as_deref() != Some(id),
                         account.inflight,
                         account.last_assigned,
                     )
@@ -674,7 +689,6 @@ impl Router {
                             .then(b.1.total_cmp(&a.1))
                             .then(a.2.cmp(&b.2))
                             .then(a.3.cmp(&b.3))
-                            .then(a.4.cmp(&b.4))
                     })
                     .cloned()
             })?;
@@ -1846,7 +1860,11 @@ mod tests {
             .select("default", &pool, Some(key.clone()), None)
             .await
             .unwrap();
-        let selected = router.select("default", &pool, None, None).await.unwrap();
+        let selected = router
+            .select_preferred("default", &pool, "a")
+            .await
+            .unwrap();
+        assert!(!selected.bound);
         router.set_preserved("default", Some("a".into())).await;
         assert_eq!(
             router.validate_selection(&selected, "default", &pool).await,
@@ -3345,12 +3363,15 @@ mod tests {
             router.observe_headers(account, &headers).await;
         }
         let pick = async |sessions: &[(&str, usize)]| {
-            let sessions = sessions
-                .iter()
-                .map(|(account, count)| (account.to_string(), *count))
-                .collect();
+            router.sessions.lock().await.clear();
+            for (account, count) in sessions {
+                for session in 0..*count {
+                    let key = router.affinity.key(&format!("{account}-{session}"));
+                    router.note_session(&key, account).await;
+                }
+            }
             router
-                .select_balanced("default", pool, &sessions)
+                .select("default", pool, None, None)
                 .await
                 .unwrap()
                 .account_id
@@ -3522,11 +3543,26 @@ mod tests {
                 .account_id
         };
         assert_eq!(pick().await, "b");
-        // Open connections share b's quota; three of them leave a's slower deadline ahead.
+        // In-flight requests are not sessions.
         for _ in 0..3 {
             router.begin("b").await;
         }
+        assert_eq!(pick().await, "b");
+        // Three active sessions share b's quota, leaving a's slower deadline ahead.
+        for session in ["one", "two", "three"] {
+            router
+                .note_session(&router.affinity.key(session), "b")
+                .await;
+        }
         assert_eq!(pick().await, "a");
+        // A session that moved away stops counting there.
+        router
+            .forget_session(&router.affinity.key("one"), "b")
+            .await;
+        router
+            .forget_session(&router.affinity.key("two"), "b")
+            .await;
+        assert_eq!(pick().await, "b");
     }
 
     #[tokio::test]

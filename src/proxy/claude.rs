@@ -22,13 +22,10 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 mod maintenance;
-
-/// How long a session counts toward its account's load after its last request.
-const ACTIVE_SESSION: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(not(test))]
 const RESPONSE_BODY_IDLE_TIMEOUT: Duration = super::HTTP_RESPONSE_BODY_IDLE_TIMEOUT;
@@ -45,8 +42,6 @@ pub(super) struct Claude {
     reporting_usage: Mutex<HashMap<String, ReportingUsage>>,
     activation: Mutex<Result<crate::claude::maintenance::ActivationLedger>>,
     sessions: Mutex<HashMap<String, Weak<Session>>>,
-    /// Last inference dispatch per (session, account), for balancing new sessions.
-    activity: Mutex<HashMap<(String, String), Instant>>,
 }
 struct ReportingUsage {
     owner: crate::auth::QuotaOwner,
@@ -78,30 +73,7 @@ impl Claude {
                     .join("claude-activation.json"),
             )),
             sessions: Mutex::new(HashMap::new()),
-            activity: Mutex::new(HashMap::new()),
         })
-    }
-    async fn note_activity(&self, session: &str, account: &str) {
-        let now = Instant::now();
-        let mut activity = self.activity.lock().await;
-        activity.retain(|_, at| now.duration_since(*at) < ACTIVE_SESSION);
-        activity.insert((session.into(), account.into()), now);
-    }
-    async fn forget_activity(&self, session: &str, account: &str) {
-        self.activity
-            .lock()
-            .await
-            .remove(&(session.to_owned(), account.to_owned()));
-    }
-    async fn active_sessions(&self) -> HashMap<String, usize> {
-        let now = Instant::now();
-        let mut counts = HashMap::new();
-        for ((_, account), at) in self.activity.lock().await.iter() {
-            if now.duration_since(*at) < ACTIVE_SESSION {
-                *counts.entry(account.clone()).or_default() += 1;
-            }
-        }
-        counts
     }
     async fn session(&self, key: &str) -> Arc<Session> {
         let mut sessions = self.sessions.lock().await;
@@ -405,9 +377,8 @@ impl App {
                 match bound {
                     Some(selection) => Some(selection),
                     None => {
-                        let sessions = self.claude.active_sessions().await;
                         self.router
-                            .select_balanced(&listener.pool, &remaining, &sessions)
+                            .select(&listener.pool, &remaining, None, None)
                             .await
                     }
                 }
@@ -482,7 +453,7 @@ impl App {
                 None => body.clone(),
             };
             if message {
-                self.claude.note_activity(&routing_id, &account).await;
+                self.router.note_session(&key, &account).await;
             }
             self.router.note_wired(&listener.pool, &account).await;
             self.router.begin(&account).await;
@@ -551,7 +522,7 @@ impl App {
                     {
                         moved_from = Some(account.clone());
                     }
-                    self.claude.forget_activity(&routing_id, &account).await;
+                    self.router.forget_session(&key, &account).await;
                     last_rejection = Some(response);
                     drop(lease);
                     continue;
