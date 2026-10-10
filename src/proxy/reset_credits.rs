@@ -6,9 +6,21 @@ use serde_json::{Value, json};
 pub(super) const CODEX_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 
+use crate::reset_credits::AUTO_REDEEM_AT_PERCENT;
+/// A banked reset this close to expiring is redeemed whenever that adds quota.
+const AUTO_REDEEM_BEFORE_EXPIRY_SECONDS: i64 = 24 * 3600;
+/// Spacing between declined attempts below exhaustion.
+const AUTO_REDEEM_RETRY_SECONDS: i64 = 3600;
+/// Spacing between automatic attempts that failed without an answer from the provider.
+const AUTO_REDEEM_FAILURE_RETRY_SECONDS: i64 = 15 * 60;
+
 #[derive(Default)]
 pub(super) struct ResetCredits {
     pub claude: AsyncMutex<HashMap<String, ClaudeCredits>>,
+    /// Usage and time of each account's last automatic attempt the provider declined.
+    declined: AsyncMutex<HashMap<String, (u8, i64)>>,
+    /// Time of each account's last automatic attempt that failed.
+    failed: AsyncMutex<HashMap<String, i64>>,
 }
 
 pub(super) struct ClaudeCredits {
@@ -303,7 +315,150 @@ impl App {
         Ok(account)
     }
 
-    /// Only explicit control requests reach this method. Never called by a scheduler.
+    /// Redeems the soonest-expiring banked reset when that adds quota: near the limit, or
+    /// before the reset would expire unused.
+    pub(super) async fn auto_redeem_reset(&self, account: &str, snapshot: &usage::UsageSnapshot) {
+        let now = chrono::Utc::now();
+        let now_unix = now.timestamp();
+        let Some((used, gain, reset_in)) =
+            crate::reset_credits::redemption_gain(&snapshot.windows, now_unix)
+        else {
+            return;
+        };
+        if gain <= 0.0 {
+            return;
+        }
+        let expiry = |credit: &crate::reset_credits::ResetCredit| {
+            credit
+                .expires_at
+                .as_deref()
+                .and_then(|expiry| chrono::DateTime::parse_from_rfc3339(expiry).ok())
+                .map_or(i64::MAX, |expiry| expiry.timestamp())
+        };
+        let Some(credit) = self
+            .router
+            .routing_snapshot()
+            .await
+            .account_states
+            .get(account)
+            .and_then(|state| state.reset_credits.clone()?.credits)
+            .into_iter()
+            .flatten()
+            .filter(|credit| credit.can_redeem_at(now))
+            .min_by_key(|credit| expiry(credit))
+        else {
+            return;
+        };
+        let expiring = expiry(&credit) - now_unix <= AUTO_REDEEM_BEFORE_EXPIRY_SECONDS;
+        if used < AUTO_REDEEM_AT_PERCENT && !expiring {
+            return;
+        }
+        // A reset that survives a window about to restart on its own is worth more later.
+        let buffer = i64::try_from(self.config.proxy.auto_redeem_reset_buffer_hours)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(3600);
+        if reset_in < buffer && expiry(&credit) > now_unix + reset_in {
+            return;
+        }
+        if self
+            .reset_credits
+            .failed
+            .lock()
+            .await
+            .get(account)
+            .is_some_and(|at| now_unix - at < AUTO_REDEEM_FAILURE_RETRY_SECONDS)
+        {
+            return;
+        }
+        {
+            let mut declined = self.reset_credits.declined.lock().await;
+            match declined.get(account).copied() {
+                // Usage fell, so the window restarted after the provider declined.
+                Some((declined_at, _)) if used < declined_at => {
+                    declined.remove(account);
+                }
+                Some((declined_at, at))
+                    if used == declined_at
+                        || (used < 100 && now_unix - at < AUTO_REDEEM_RETRY_SECONDS) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let request_id = {
+            let mut bytes = [0u8; 16];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+        };
+        let mut credit_id = credit.id.clone();
+        let mut request_id = request_id;
+        let mut outcome = self
+            .use_reset_credit(account, &credit_id, &request_id)
+            .await;
+        if outcome.is_err() {
+            // An earlier uncertain attempt blocks new ones until it is retried as sent.
+            let pending = match self.usage_locks.get(account).map(|lock| lock.try_lock()) {
+                Some(Ok(attempt)) => attempt
+                    .as_ref()
+                    .filter(|attempt| attempt.result.is_none() && attempt.request_id != request_id)
+                    .map(|attempt| (attempt.credit_id.clone(), attempt.request_id.clone())),
+                _ => None,
+            };
+            if let Some((pending_id, pending_request)) = pending {
+                outcome = self
+                    .use_reset_credit(account, &pending_id, &pending_request)
+                    .await;
+                credit_id = pending_id;
+                request_id = pending_request;
+            }
+        }
+        // A retried earlier attempt may target a credit missing from this snapshot.
+        let expires_at = if credit_id == credit.id {
+            credit.expires_at.as_deref().unwrap_or("never")
+        } else {
+            "unknown"
+        };
+        match outcome {
+            Ok(result) => {
+                info!(
+                    account,
+                    credit = credit_id.as_str(),
+                    request_id = request_id.as_str(),
+                    expires_at,
+                    code = ?result.code,
+                    used,
+                    "automatic reset redemption finished"
+                );
+                self.reset_credits.failed.lock().await.remove(account);
+                let mut declined = self.reset_credits.declined.lock().await;
+                if result.code == ResetOutcome::NothingToReset {
+                    declined.insert(account.into(), (used, now_unix));
+                } else {
+                    declined.remove(account);
+                }
+            }
+            Err(error) => {
+                // An uncertain attempt stays pending; its request ID lets a manual retry
+                // settle it.
+                warn!(
+                    account,
+                    credit = credit_id.as_str(),
+                    request_id = request_id.as_str(),
+                    expires_at,
+                    error = %format!("{error:#}"),
+                    "automatic reset redemption failed"
+                );
+                self.reset_credits
+                    .failed
+                    .lock()
+                    .await
+                    .insert(account.into(), now_unix);
+            }
+        }
+    }
+
+    /// Explicit control requests and opt-in automatic redemption reach this method.
     pub async fn use_reset_credit(
         &self,
         account_name: &str,
@@ -377,7 +532,6 @@ impl App {
                 result: None,
             });
         }
-        let attempt = action.as_mut().expect("reset attempt was reserved");
         self.router
             .observe_reset_credits_for_owner(account_name, None, &credentials.quota_owner())
             .await;
@@ -400,8 +554,16 @@ impl App {
             "reset outcome unknown; refresh credits before retrying with the same request ID",
         )??;
         if !status.is_success() {
+            // A client error other than a timeout or conflict refused the request without
+            // applying it, so it no longer blocks new attempts.
+            if status.is_client_error()
+                && !matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::CONFLICT)
+            {
+                *action = None;
+            }
             return Err(ResetProviderError(status).into());
         }
+        let attempt = action.as_mut().expect("reset attempt was reserved");
         let mut result: ResetResult = serde_json::from_slice(&bytes).context(
             "reset outcome unknown; refresh credits before retrying with the same request ID",
         )?;

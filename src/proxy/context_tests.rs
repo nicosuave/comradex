@@ -554,7 +554,7 @@ async fn signed_context_wrapper_can_rotate_inference_without_moving_notes_owner(
     }))
     .await;
     let dir = tempfile::tempdir().unwrap();
-    let test = context_test_app(dir.path(), upstream.address);
+    let test = context_test_app_with_preference(dir.path(), upstream.address, Some("a"));
     let wrapper = establish_owner_and_fetch_note_wrapper(&test).await;
 
     let (status, _) = post(
@@ -650,7 +650,7 @@ async fn signed_context_does_not_make_unrelated_native_reasoning_portable() {
     }))
     .await;
     let dir = tempfile::tempdir().unwrap();
-    let test = context_test_app(dir.path(), upstream.address);
+    let test = context_test_app_with_preference(dir.path(), upstream.address, Some("a"));
     let wrapper = establish_owner_and_fetch_note_wrapper(&test).await;
 
     let (status, _) = post(

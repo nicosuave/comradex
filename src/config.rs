@@ -48,6 +48,10 @@ fn default_flush_seconds() -> u64 {
     5
 }
 
+fn default_auto_redeem_reset_buffer_hours() -> u64 {
+    24
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesWebsocketMode {
@@ -106,6 +110,13 @@ pub struct ProxyConfig {
     /// Warm elapsed Claude 5-hour/7-day windows through genuine Claude Code.
     #[serde(default)]
     pub auto_activate_claude_usage: bool,
+    /// Redeem banked Codex resets when they add quota, and count them in placement.
+    #[serde(default)]
+    pub auto_redeem_resets: bool,
+    /// Keep a banked reset that outlives the current window when that window resets on its
+    /// own within this many hours.
+    #[serde(default = "default_auto_redeem_reset_buffer_hours")]
+    pub auto_redeem_reset_buffer_hours: u64,
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
     #[serde(default)]
@@ -134,6 +145,8 @@ impl Default for ProxyConfig {
             auto_activate_weekly_usage: false,
             log_weekly_usage_activation: false,
             auto_activate_claude_usage: false,
+            auto_redeem_resets: false,
+            auto_redeem_reset_buffer_hours: default_auto_redeem_reset_buffer_hours(),
             state_dir: None,
             installation_secret: String::new(),
             affinity_key: String::new(),

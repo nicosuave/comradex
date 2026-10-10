@@ -534,6 +534,12 @@ async fn exercise_untrusted_ciphertext_is_not_replayed(mode: ResponsesWebsocketM
     let upstream = start_context_upstream().await;
     let dir = tempfile::tempdir().unwrap();
     let proxy = start_context_proxy(dir.path(), upstream.address, mode).await;
+    // These turns carry no session key, so fresh placement alone would alternate accounts.
+    proxy
+        .app
+        .router
+        .set_preferred("default", Some("a".into()))
+        .await;
     let mut websocket = connect_proxy(proxy.address).await;
     assert_eq!(
         send_turn(&mut websocket, initial_create())

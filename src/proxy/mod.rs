@@ -1088,6 +1088,9 @@ impl App {
                             None,
                         );
                     }
+                    if self.config.proxy.auto_redeem_resets {
+                        self.auto_redeem_reset(&account_id, &snapshot).await;
+                    }
                 }
                 Err(error) => {
                     succeeded = false;
@@ -1691,6 +1694,7 @@ impl App {
         let mut known_file_owners = 0usize;
         let mut missing_hard_owner = false;
         let soft_routing_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let session_key = soft_routing_key.clone();
         for (kind, key) in &affinity_keys {
             let binding = if *kind == metadata::AffinityKind::File {
                 self.file_owners.get(key).await
@@ -1908,6 +1912,9 @@ impl App {
             // after this revalidation. No token is ever substituted into an already-built
             // Request, and the 401-continue path re-enters this fence before rebuilding.
             self.router.note_wired(&listener.pool, &account).await;
+            if let Some(key) = &session_key {
+                self.router.note_session(key, &account).await;
+            }
             let (slots, counter, capacity_message) = match lane {
                 ServingLane::Http => (
                     self.http_slots.clone(),
@@ -2950,6 +2957,7 @@ impl App {
             .collect();
         let mut hard_bound_account: Option<String> = None;
         let soft_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let session_key = soft_key.clone();
         let mut hard_owner = false;
         let mut non_previous_hard_owner = false;
         let mut known_file_owners = 0usize;
@@ -3025,6 +3033,9 @@ impl App {
                 .await
                 .context("no eligible account")?
         };
+        if let Some(key) = &session_key {
+            self.router.note_session(key, &selection.account_id).await;
+        }
         let mut soft_keys = Vec::new();
         for (kind, key) in &affinity_keys {
             if let Some(key) = affinity_bind_key(*kind, key, hard_owner) {
@@ -4499,6 +4510,9 @@ impl App {
             self.router
                 .note_wired(&listener.pool, &selection.account_id)
                 .await;
+            if let Some(key) = &key {
+                self.router.note_session(key, &selection.account_id).await;
+            }
             let uri = self.upstream_uri(&path, live::uses_v1_origin(&path))?;
             let mut upstream_req = Request::builder()
                 .method(req.method())
@@ -8522,6 +8536,37 @@ mod tests {
                 .unwrap();
             assert_eq!(route.account_id, "a");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_fresh_sessions_spread_across_accounts_by_active_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, listener, _, stats) = direct_test_app(dir.path());
+        let route = async |session: Option<&str>| {
+            let mut headers = hyper::HeaderMap::new();
+            if let Some(session) = session {
+                headers.insert("session-id", session.parse().unwrap());
+            }
+            let replay = ReplayBody::from_bytes(
+                Bytes::from_static(br#"{"input":[]}"#),
+                app.config.proxy.max_request_bytes,
+                app.config.proxy.max_spool_bytes,
+                stats.clone(),
+            )
+            .unwrap();
+            app.route_websocket_frame(&listener, &headers, &replay, None)
+                .await
+                .unwrap()
+                .account_id
+        };
+        let first = route(Some("ada")).await;
+        // Work without a session key leaves no session behind, so the next new session
+        // follows active sessions rather than alternating with the last pick.
+        let other = route(None).await;
+        assert_ne!(other, first);
+        assert_eq!(route(Some("grace")).await, other);
+        // A returning session keeps its account.
+        assert_eq!(route(Some("ada")).await, first);
     }
 
     #[tokio::test]
