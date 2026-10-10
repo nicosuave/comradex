@@ -108,8 +108,11 @@ enum AccountCommand {
         #[arg(long)]
         no_login: bool,
         /// Sign in using this account's persistent browser profile
-        #[arg(long, conflicts_with = "no_login")]
+        #[arg(long, conflicts_with_all = ["no_login", "no_browser"])]
         browser: bool,
+        /// Use the ordinary login flow even if this name has a retained browser profile
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Create a provider account in its own browser, then connect it to Comradex
     New {
@@ -187,7 +190,8 @@ enum AccountCommand {
     /// Remove an account from the configuration and all pools
     Remove {
         name: String,
-        /// Also delete an isolated account home (external logins cannot be purged)
+        /// Also delete the browser profile and isolated account home (external
+        /// logins cannot be purged); also cleans up after an earlier plain remove
         #[arg(long)]
         purge: bool,
     },
@@ -1049,6 +1053,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             no_login,
             claude,
             browser,
+            no_browser,
         } => {
             load_config(config_path)?;
             let pool = pool.unwrap_or_else(|| if claude { "claude" } else { "default" }.into());
@@ -1059,15 +1064,17 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             } else {
                 comradex::accounts::add_account(&text, &name, &pool)?
             };
-            let browser =
-                if !no_login && (browser || comradex::browser::has_profile(config_path, &name)?) {
-                    Some(comradex::browser::AccountBrowser::prepare(
-                        config_path,
-                        &name,
-                    )?)
-                } else {
-                    None
-                };
+            let browser = if !no_login
+                && !no_browser
+                && (browser || comradex::browser::has_profile(config_path, &name)?)
+            {
+                Some(comradex::browser::AccountBrowser::prepare(
+                    config_path,
+                    &name,
+                )?)
+            } else {
+                None
+            };
             write_config_validated(config_path, &updated)?;
             println!("added account {name} to pool {pool}");
             reload_daemon()?;
@@ -1293,6 +1300,9 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
         }
         AccountCommand::Remove { name, purge } => {
             let config = load_config(config_path)?;
+            if purge && !config.accounts.contains_key(&name) {
+                return purge_removed_account(config_path, &config, &name);
+            }
             let browser_profile = if purge {
                 comradex::browser::purgeable_profile(config_path, &name)?
             } else {
@@ -1312,45 +1322,84 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             write_config_validated(config_path, &updated)?;
             println!("removed account {name}");
             reload_daemon()?;
-            if let Some(profile) = browser_profile {
-                fs::remove_dir_all(&profile)?;
-                println!("deleted browser profile {}", profile.display());
-            } else if comradex::browser::has_profile(config_path, &name)? {
+            // Resolve the home from the already-loaded config so relative
+            // paths are anchored to the config directory, not the CWD.
+            let home = config
+                .accounts
+                .get(&name)
+                .and_then(|account| account.home());
+            if purge {
+                return purge_account_storage(&name, browser_profile.as_deref(), home);
+            }
+            let retry = format!("run `comradex account remove {name} --purge` to delete them");
+            if comradex::browser::has_profile(config_path, &name)? {
                 println!(
-                    "browser cookies kept at {} (pass --purge to delete them)",
+                    "browser cookies kept at {} ({retry})",
                     comradex::browser::profile_path(config_path, &name)?.display()
                 );
             }
-            // Resolve the home from the already-loaded config so relative
-            // paths are anchored to the config directory, not the CWD.
-            if let Some(path) = config
-                .accounts
-                .get(&name)
-                .and_then(|account| account.home())
-            {
-                if purge {
-                    match fs::remove_dir_all(path) {
-                        Ok(()) => println!("deleted {}", path.display()),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(error)
-                                .with_context(|| format!("delete {}", path.display()));
-                        }
-                    }
-                } else if path.exists() {
-                    if comradex::accounts::validate_purge_home(config_path, &name, path).is_ok() {
-                        println!(
-                            "credentials kept at {} (pass --purge to delete them)",
-                            path.display()
-                        );
-                    } else {
-                        println!("existing Codex login kept at {}", path.display());
-                    }
+            if let Some(path) = home.filter(|path| path.exists()) {
+                if comradex::accounts::validate_purge_home(config_path, &name, path).is_ok() {
+                    println!("credentials kept at {} ({retry})", path.display());
+                } else {
+                    println!("existing Codex login kept at {}", path.display());
                 }
             }
             Ok(())
         }
     }
+}
+
+/// Attempt every deletion even if one fails, so a stuck profile cannot strand
+/// credentials (or vice versa); whatever remains can be retried by name.
+fn purge_account_storage(name: &str, profile: Option<&Path>, home: Option<&Path>) -> Result<()> {
+    let mut failures = Vec::new();
+    for (label, path) in [("browser profile ", profile), ("", home)] {
+        let Some(path) = path else { continue };
+        match fs::remove_dir_all(path) {
+            Ok(()) => println!("deleted {label}{}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("delete {}: {error}", path.display())),
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{}; retry with `comradex account remove {name} --purge`",
+            failures.join("; ")
+        )
+    }
+    Ok(())
+}
+
+/// Cookies, and an isolated home at its default location, can outlive the
+/// config entry after a plain remove or an interrupted purge.
+fn purge_removed_account(config_path: &Path, config: &Config, name: &str) -> Result<()> {
+    let profile = comradex::browser::purgeable_profile(config_path, name)?;
+    let mut home = None;
+    if comradex::accounts::validate_name(name).is_ok() {
+        let path = std::path::absolute(config_path)?
+            .parent()
+            .context("configuration has no parent directory")?
+            .join("accounts")
+            .join(name);
+        let normalized = comradex::config::normalize_codex_home(&path)?;
+        // Never delete a home that another configured account still uses.
+        let in_use = config.accounts.values().any(|account| {
+            account.home().is_some_and(|home| {
+                comradex::config::normalize_codex_home(home).is_ok_and(|home| home == normalized)
+            })
+        });
+        if path.exists()
+            && !in_use
+            && comradex::accounts::validate_purge_home(config_path, name, &path).is_ok()
+        {
+            home = Some(path);
+        }
+    }
+    if profile.is_none() && home.is_none() {
+        bail!("unknown account {name}")
+    }
+    purge_account_storage(name, profile.as_deref(), home.as_deref())
 }
 
 /// Persist an edited configuration only after the full loader accepts it: the

@@ -127,7 +127,7 @@ fn ensure_display() -> Result<()> {
     #[cfg(target_os = "linux")]
     ensure!(
         std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some(),
-        "account browsers need a graphical session; use account login without --browser on a headless host"
+        "account browsers need a graphical session; on a headless host, pass --no-browser to account add or account login"
     );
     Ok(())
 }

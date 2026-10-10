@@ -308,3 +308,75 @@ fn new_account_waits_for_signup_and_preserves_config_edits_made_during_signup() 
     assert!(log.contains(browser::CODEX_DEVICE_URL));
     assert_eq!(log.matches("--user-data-dir=").count(), 2);
 }
+
+#[test]
+fn purge_after_plain_remove_deletes_retained_profile_and_home() {
+    let f = Fixture::new();
+    // The configuration must keep at least one account.
+    success(f.run(&["account", "add", "anna", "--no-login"]));
+    success(f.run(&["account", "browser", "grace"]));
+    let profile = browser::profile_path(&f.config, "grace").unwrap();
+    let home = f.dir.path().join("accounts/grace");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("auth.json"), "{}").unwrap();
+    let output = f.run(&["account", "remove", "grace"]);
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("run `comradex account remove grace --purge` to delete them")
+    );
+    success(output);
+    assert!(profile.exists() && home.exists());
+    success(f.run(&["account", "remove", "grace", "--purge"]));
+    assert!(!profile.exists());
+    assert!(!home.exists());
+    let output = f.run(&["account", "remove", "grace", "--purge"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown account grace"));
+}
+
+#[test]
+fn add_no_browser_ignores_retained_profile() {
+    let f = Fixture::new();
+    let profile = browser::profile_path(&f.config, "ada").unwrap();
+    fs::create_dir_all(&profile).unwrap();
+    assert!(
+        !f.run(&["account", "add", "ada", "--browser", "--no-browser"])
+            .status
+            .success()
+    );
+    success(f.run(&["account", "add", "ada", "--no-browser"]));
+    assert!(f.browser_log().is_empty());
+    assert!(f.dir.path().join("login.log").exists());
+    assert!(profile.exists());
+}
+
+#[test]
+fn purge_deletes_home_even_when_profile_deletion_fails() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // Root ignores the read-only directory used to force a failure.
+    }
+    let f = Fixture::new();
+    // The configuration must keep at least one account.
+    success(f.run(&["account", "add", "anna", "--no-login"]));
+    success(f.run(&["account", "browser", "grace"]));
+    let profile = browser::profile_path(&f.config, "grace").unwrap();
+    let profiles = profile.parent().unwrap();
+    let home = f.dir.path().join("accounts/grace");
+    fs::create_dir_all(&home).unwrap();
+    fs::set_permissions(profiles, fs::Permissions::from_mode(0o500)).unwrap();
+    let output = f.run(&["account", "remove", "grace", "--purge"]);
+    fs::set_permissions(profiles, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&profile.display().to_string()), "{stderr}");
+    assert!(!home.exists());
+    assert!(profile.exists());
+    assert!(
+        !Config::load(&f.config)
+            .unwrap()
+            .accounts
+            .contains_key("grace")
+    );
+    success(f.run(&["account", "remove", "grace", "--purge"]));
+    assert!(!profile.exists());
+}

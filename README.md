@@ -219,8 +219,8 @@ comradex account browser grace
 ```
 
 Once an account has a profile, later `account login <name>` commands reuse it automatically.
-Use `account login <name> --no-browser` for the ordinary login flow, including on a headless
-host. The menubar's sign-in flow is unchanged. Codex still uses the official device flow:
+Use `account login <name> --no-browser` (or `account add <name> --no-browser`) for the ordinary
+login flow, including on a headless host. The menubar's sign-in flow is unchanged. Codex still uses the official device flow:
 enter the code printed in the terminal into the page Comradex opens. Claude's official CLI
 opens its authorization URL in the account's browser through a temporary `BROWSER` launcher.
 Browser cookies and CLI OAuth grants remain separate; Comradex does not read cookies or
@@ -264,9 +264,13 @@ release service or failed download reports an error; it does not use your defaul
 Cookies are stored in private `browsers/profiles/<account-name-hash>/` directories next to
 the config. Commands print the selected profile path. The hash keeps names distinct even on
 case-insensitive filesystems. `account remove` retains browser cookies as well as credentials;
-`account remove --purge` deletes both. Close the account's browser before purging it. A profile
-with a Chrome singleton lock/socket, or a linked profile directory, is refused before changing
-the config. Reusing a removed account's name reuses its retained cookies.
+`account remove --purge` deletes both, and also deletes what a plain remove left behind. If one
+deletion fails, the other is still attempted and the command reports the failure; rerun it to
+retry. Close the account's browser before purging it. A profile with a Chrome singleton
+lock/socket, or a linked profile directory, is refused before changing the config. Reusing a
+removed account's name reuses its retained cookies, which may still be signed in to the old
+provider account. Purge them first, or pass `--no-browser` to `account add` and later
+`account login` commands to sign in without them.
 
 ### Inspecting and removing accounts
 
