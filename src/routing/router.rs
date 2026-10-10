@@ -301,22 +301,37 @@ impl AccountRuntime {
                 .sum::<f64>()
     }
 
-    /// Quota above an even pace through each window. The owner of a reserved account keeps
-    /// the rest; anything above that line would expire unused. Unknown timing reserves the
-    /// whole window.
+    /// Quota above an even pace through each long window. The owner of a reserved account
+    /// keeps the rest; anything above that line would expire unused. Short windows refill
+    /// within a session, so they only cap headroom. Unknown timing reserves the whole window.
     fn reserve_surplus(&self, now: i64) -> f64 {
-        self.usage_windows
-            .values()
-            .filter(|window| window.reset_at_unix.is_none_or(|reset| reset > now))
+        let windows = || {
+            self.usage_windows
+                .values()
+                .filter(move |window| window.reset_at_unix.is_none_or(|reset| reset > now))
+                .filter(|window| window.used_percent.is_some())
+        };
+        let short = |window: &QuotaWindowStatus| {
+            window
+                .limit_window_seconds
+                .is_some_and(|length| length < LONG_WINDOW_SECONDS)
+        };
+        if windows().all(short) {
+            return 0.0;
+        }
+        windows()
             .filter_map(|window| {
-                let used = window.used_percent?;
+                let headroom = f64::from(100u8.saturating_sub(window.used_percent?));
+                if short(window) {
+                    return Some(headroom);
+                }
                 let left = match (window.reset_at_unix, window.limit_window_seconds) {
                     (Some(reset), Some(length)) if length > 0 => {
                         ((reset - now) as f64 / length as f64).clamp(0.0, 1.0)
                     }
                     _ => 1.0,
                 };
-                Some(f64::from(100u8.saturating_sub(used)) - 100.0 * left)
+                Some(headroom - 100.0 * left)
             })
             .chain(self.legacy_usage.map(|used| -f64::from(used)))
             .reduce(f64::min)
@@ -3515,6 +3530,24 @@ mod tests {
             ..usage(&[("primary", weekly(0, DAY))])
         };
         assert_eq!(legacy.reserve_surplus(now), 0.0);
+        // A short window only caps headroom, whether idle, just started, or partly used.
+        let mut idle = weekly(0, 0);
+        idle.reset_at_unix = None;
+        idle.limit_window_seconds = Some(5 * 3600);
+        let mut started = weekly(0, 5 * 3600);
+        started.limit_window_seconds = Some(5 * 3600);
+        let mut partial = weekly(90, 3600);
+        partial.limit_window_seconds = Some(5 * 3600);
+        for (short, surplus) in [(idle, 600.0 / 7.0), (started, 600.0 / 7.0), (partial, 10.0)] {
+            assert!(close(
+                usage(&[("5h", short), ("7d", weekly(0, DAY))]).reserve_surplus(now),
+                surplus
+            ));
+        }
+        // Without a long window, its pace is unknown.
+        let mut short_only = weekly(0, 3600);
+        short_only.limit_window_seconds = Some(5 * 3600);
+        assert_eq!(usage(&[("5h", short_only)]).reserve_surplus(now), 0.0);
         // Banked resets stay with the reserved account.
         let mut reserved = usage(&[("primary", weekly(0, DAY))]);
         reserved.reset_credits = Some(banked_reset(DAY));
