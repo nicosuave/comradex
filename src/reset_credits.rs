@@ -6,12 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::routing::router::{LONG_WINDOW_SECONDS, QuotaWindowStatus};
 
-/// Usage of the fullest long window and the quota a reset would add now. A reset restarts
-/// the window, forfeiting the share of it already elapsed.
+/// Usage at which a banked reset is redeemed, so in-flight work rarely reaches the limit first.
+pub const AUTO_REDEEM_AT_PERCENT: u8 = 95;
+
+/// Usage of the fullest long window, the quota a reset would add now, and the seconds until
+/// that window resets on its own. A reset restarts the window, forfeiting the share of it
+/// already elapsed.
 pub fn redemption_gain(
     windows: &BTreeMap<String, QuotaWindowStatus>,
     now: i64,
-) -> Option<(u8, f64)> {
+) -> Option<(u8, f64, i64)> {
     windows
         .values()
         .filter_map(|window| {
@@ -21,9 +25,9 @@ pub fn redemption_gain(
                 .filter(|length| *length >= LONG_WINDOW_SECONDS)?;
             let reset = window.reset_at_unix.filter(|reset| *reset > now)?;
             let left = ((reset - now) as f64 / length as f64).min(1.0);
-            Some((used, f64::from(used) - 100.0 * (1.0 - left)))
+            Some((used, f64::from(used) - 100.0 * (1.0 - left), reset - now))
         })
-        .max_by_key(|(used, _)| *used)
+        .max_by_key(|(used, _, _)| *used)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,7 +138,7 @@ mod tests {
                     (name.to_string(), window)
                 })
                 .collect();
-            redemption_gain(&windows, NOW).map(|(used, gain)| (used, gain.round() as i64))
+            redemption_gain(&windows, NOW).map(|(used, gain, _)| (used, gain.round() as i64))
         };
         const DAY: i64 = 24 * 3600;
         const WEEK: u64 = 7 * DAY as u64;

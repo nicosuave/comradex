@@ -110,6 +110,9 @@ async fn reset_credit_fixture(
                                 if outcome == "http_error" {
                                     status = StatusCode::INTERNAL_SERVER_ERROR;
                                 }
+                                if outcome == "rejected" {
+                                    status = StatusCode::BAD_REQUEST;
+                                }
                                 let code = match outcome {
                                     "refresh_error" | "failed_before_consumption" => "reset",
                                     "lost_response" | "lost_missing_credit" => "already_redeemed",
@@ -661,4 +664,48 @@ async fn auto_redeem_waits_for_more_usage_after_the_provider_declines() {
             .as_ref()
             .is_some_and(|credits| credits.available_count == 1)
     );
+}
+
+#[tokio::test]
+async fn auto_redeem_backs_off_after_a_failed_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = reset_credit_fixture(dir.path(), "http_error", "2100-01-01T00:00:00Z").await;
+    enable_auto_redeem(&mut fixture);
+    let now = chrono::Utc::now().timestamp() as u64;
+    assert!(fixture.app.refresh_managed_usage_at(now).await);
+    // The uncertain attempt is not replayed on every sweep.
+    assert!(fixture.app.refresh_managed_usage_at(now).await);
+    assert_eq!(consume_requests(&fixture).len(), 1);
+}
+
+#[tokio::test]
+async fn provider_rejection_does_not_block_later_reset_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = reset_credit_fixture(dir.path(), "rejected", "2100-01-01T00:00:00Z").await;
+    for request in ["first-request", "second-request"] {
+        let error = fixture
+            .app
+            .use_reset_credit("a", "credit-one", request)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("HTTP 400"), "{error:#}");
+    }
+    assert_eq!(consume_requests(&fixture).len(), 2);
+}
+
+#[tokio::test]
+async fn auto_redeem_keeps_a_reset_that_outlives_a_window_about_to_restart() {
+    // The fixture's window resets at 2100-01-01; the buffer reaches past it.
+    for (expiry, consumed) in [("2101-01-01T00:00:00Z", 0), ("2099-01-01T00:00:00Z", 1)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = reset_credit_fixture(dir.path(), "reset", expiry).await;
+        let app = Arc::get_mut(&mut fixture.app).unwrap();
+        let mut config = (*app.config).clone();
+        config.proxy.auto_redeem_resets = true;
+        config.proxy.auto_redeem_reset_buffer_hours = 1_000_000;
+        app.config = Arc::new(config);
+        let now = chrono::Utc::now().timestamp() as u64;
+        assert!(fixture.app.refresh_managed_usage_at(now).await);
+        assert_eq!(consume_requests(&fixture).len(), consumed, "{expiry}");
+    }
 }

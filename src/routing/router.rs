@@ -658,13 +658,17 @@ impl Router {
             |id: &str| !has_capacity_alternative || !accounts[id].capacity.active(now);
         let eligible = |id: &str| eligible(id) && preferred_for_capacity(id);
         // Running out is harmless when Comradex can refill the account with a banked reset.
+        // Past the redemption threshold, other accounts carry new work until the next usage
+        // sweep redeems it.
         let below_switch_at = |id: &str| {
             accounts.get(id).is_some_and(|account| {
-                account
-                    .usage_at(wall_now)
-                    .is_none_or(|usage| usage < self.switch_at)
+                let usage = account.usage_at(wall_now);
+                usage.is_none_or(|usage| usage < self.switch_at)
                     || (self.auto_redeem_resets
                         && !is_preserved(id)
+                        && usage.is_none_or(|usage| {
+                            usage < crate::reset_credits::AUTO_REDEEM_AT_PERCENT
+                        })
                         && !account.redeemable_credit_expiries(wall_now).is_empty())
             })
         };
@@ -3642,7 +3646,8 @@ mod tests {
 
     #[tokio::test]
     async fn banked_resets_count_only_when_comradex_redeems_them() {
-        for (auto_redeem, expected) in [(false, "b"), (true, "a")] {
+        // Past the redemption threshold, the account waits for the sweep to refill it.
+        for (auto_redeem, used, expected) in [(false, 90, "b"), (true, 90, "a"), (true, 96, "b")] {
             let dir = tempfile::tempdir().unwrap();
             let mut cfg = config(dir.path());
             cfg.proxy.auto_redeem_resets = auto_redeem;
@@ -3659,7 +3664,7 @@ mod tests {
                 let mut accounts = router.accounts.lock().await;
                 let a = accounts.get_mut("a").unwrap();
                 // Past switch_at, but its reset expiring tomorrow needs this window spent first.
-                a.usage_windows = BTreeMap::from([("primary".into(), weekly(90, 5 * DAY))]);
+                a.usage_windows = BTreeMap::from([("primary".into(), weekly(used, 5 * DAY))]);
                 a.reset_credits = Some(banked_reset(DAY));
                 accounts.get_mut("b").unwrap().usage_windows =
                     BTreeMap::from([("primary".into(), weekly(10, 4 * DAY))]);
