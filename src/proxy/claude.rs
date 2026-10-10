@@ -1657,6 +1657,16 @@ kind="claude_inbound"
                 StatusCode::OK,
                 &["grace", "ada"][..],
             ),
+            // Claude Code surfaces deferred tools as definitions whose schemas can name
+            // container or file_id properties. Declarations are not owned state.
+            (
+                json!([
+                    {"type":"thinking","thinking":"synthetic","signature":"opaque"},
+                    {"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"bash","description":"Run a command","input_schema":{"type":"object","properties":{"container":{"type":"string"},"file_id":{"type":"string"}}}}}}
+                ]),
+                StatusCode::OK,
+                &["grace", "ada"][..],
+            ),
             (
                 json!([{"type":"compaction","content":"summary","signature":"opaque"},{"type":"document","source":{"type":"file","file_id":"file_1"}}]),
                 StatusCode::TOO_MANY_REQUESTS,

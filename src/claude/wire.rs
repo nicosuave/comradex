@@ -211,34 +211,38 @@ fn portability(value: &Value) -> Portability {
 
 fn block_portability(value: &Value, completed_text_fetch: bool) -> Portability {
     match value {
-        Value::Object(map) => map
-            .iter()
-            .map(|(key, value)| {
-                if key == "input" {
-                    return Portability::Portable;
-                }
-                let own = match (key.as_str(), value) {
-                    (_, Value::Null) => Portability::Portable,
-                    ("signature", _) => Portability::Sticky,
-                    (
-                        "file_id"
-                        | "container"
-                        | "container_id"
-                        | "fallback_credit_token"
-                        | "encrypted_content",
-                        _,
-                    ) => Portability::Account,
-                    ("type", Value::String(kind)) => match kind.as_str() {
-                        "redacted_thinking" | "compaction" => Portability::Sticky,
-                        "server_tool_use" if !completed_text_fetch => Portability::Account,
+        Value::Object(map) => {
+            // A deferred tool's definition declares a schema, like top-level `tools`. Its
+            // property names, such as `container` or `file_id`, are not owned state.
+            let declaration = map.get("type").and_then(Value::as_str) == Some("tool_definition");
+            map.iter()
+                .map(|(key, value)| {
+                    if key == "input" || declaration && key == "definition" {
+                        return Portability::Portable;
+                    }
+                    let own = match (key.as_str(), value) {
+                        (_, Value::Null) => Portability::Portable,
+                        ("signature", _) => Portability::Sticky,
+                        (
+                            "file_id"
+                            | "container"
+                            | "container_id"
+                            | "fallback_credit_token"
+                            | "encrypted_content",
+                            _,
+                        ) => Portability::Account,
+                        ("type", Value::String(kind)) => match kind.as_str() {
+                            "redacted_thinking" | "compaction" => Portability::Sticky,
+                            "server_tool_use" if !completed_text_fetch => Portability::Account,
+                            _ => Portability::Portable,
+                        },
                         _ => Portability::Portable,
-                    },
-                    _ => Portability::Portable,
-                };
-                own.max(portability(value))
-            })
-            .max()
-            .unwrap_or(Portability::Portable),
+                    };
+                    own.max(portability(value))
+                })
+                .max()
+                .unwrap_or(Portability::Portable)
+        }
         Value::Array(values) => {
             // Only the complete, inline text web-fetch history has been verified across
             // accounts. Unknown tools and unmatched calls retain their owner. Recursion
@@ -663,6 +667,23 @@ mod tests {
                 serde_json::json!([{"type":"tool_use","id":"t","name":"x","input":{"signature":"x","file_id":"y"}}])
             ),
             Portability::Portable
+        );
+        // Deferred tool definitions are declarations; schema property names are not state.
+        let definition = serde_json::json!({"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"bash","input_schema":{"type":"object","properties":{"container":{"type":"string"},"file_id":{"type":"string"},"encrypted_content":{"type":"string"}}}}}});
+        assert_eq!(
+            classify(serde_json::json!([
+                definition,
+                {"type":"tool_removal","tool":{"type":"tool_reference","name":"bash"}}
+            ])),
+            Portability::Portable
+        );
+        // Owned state beside a definition still pins the conversation.
+        let mut owned = definition.clone();
+        owned["tool"]["container"] = "owned".into();
+        assert_eq!(classify(serde_json::json!([owned])), Portability::Account);
+        assert_eq!(
+            classify(serde_json::json!([definition, {"type":"server_tool_use","id":"owned"}])),
+            Portability::Account
         );
         for field in [
             serde_json::json!({"type":"thinking","thinking":"x","signature":"opaque"}),
