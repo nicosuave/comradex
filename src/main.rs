@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -70,6 +71,15 @@ enum CommandName {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    /// Internal browser launcher used by the official provider CLI.
+    #[command(hide = true)]
+    BrowserOpen {
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        profile: PathBuf,
+        url: String,
+    },
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -97,7 +107,26 @@ enum AccountCommand {
         /// Skip the interactive sign-in (run `comradex account login <name>` later)
         #[arg(long)]
         no_login: bool,
+        /// Sign in using this account's persistent browser profile
+        #[arg(long, conflicts_with = "no_login")]
+        browser: bool,
     },
+    /// Create a provider account in its own browser, then connect it to Comradex
+    New {
+        /// Name for the account (prompted when omitted)
+        name: Option<String>,
+        /// Create a Claude account instead of a ChatGPT/Codex account
+        #[arg(long, conflicts_with = "codex")]
+        claude: bool,
+        /// Create a ChatGPT/Codex account without prompting for the provider
+        #[arg(long)]
+        codex: bool,
+        /// Pool to join [default: "claude" or "default", according to provider]
+        #[arg(long)]
+        pool: Option<String>,
+    },
+    /// Open this account's browser profile on the provider's website
+    Browser { name: String },
     /// Read current reset credits and their exact expiration timestamps
     ResetCredits {
         name: String,
@@ -138,8 +167,16 @@ enum AccountCommand {
         #[arg(long, conflicts_with = "name", required_unless_present = "name")]
         clear: bool,
     },
-    /// Sign an account in through the official Codex device flow
-    Login { name: String },
+    /// Sign an account in through its official provider CLI
+    Login {
+        name: String,
+        /// Create/reuse a persistent browser profile for this account
+        #[arg(long, conflicts_with = "no_browser")]
+        browser: bool,
+        /// Use the ordinary login flow even if this account has a browser profile
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Connect an inbound account to your existing Codex login
     Connect {
         name: String,
@@ -300,6 +337,11 @@ async fn main() -> Result<()> {
         }
         CommandName::RestartCodex => handle_running_codex(true),
         CommandName::Account { command } => account_command(&config_path, command),
+        CommandName::BrowserOpen {
+            executable,
+            profile,
+            url,
+        } => comradex::browser::open(&executable, &profile, &url),
         CommandName::Service { command } => service_command(&config_path, command),
         CommandName::Status { json } => status(&config_path, json),
     }
@@ -1006,6 +1048,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             pool,
             no_login,
             claude,
+            browser,
         } => {
             load_config(config_path)?;
             let pool = pool.unwrap_or_else(|| if claude { "claude" } else { "default" }.into());
@@ -1016,15 +1059,40 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             } else {
                 comradex::accounts::add_account(&text, &name, &pool)?
             };
+            let browser =
+                if !no_login && (browser || comradex::browser::has_profile(config_path, &name)?) {
+                    Some(comradex::browser::AccountBrowser::prepare(
+                        config_path,
+                        &name,
+                    )?)
+                } else {
+                    None
+                };
             write_config_validated(config_path, &updated)?;
             println!("added account {name} to pool {pool}");
             reload_daemon()?;
             if no_login {
                 println!("run `comradex account login {name}` to sign the account in");
             } else {
-                login(config_path, &name)?;
+                login(config_path, &name, browser.as_ref())?;
             }
             Ok(())
+        }
+        AccountCommand::New {
+            name,
+            claude,
+            codex,
+            pool,
+        } => new_account(config_path, name, claude, codex, pool),
+        AccountCommand::Browser { name } => {
+            let config = load_config(config_path)?;
+            let account = config
+                .accounts
+                .get(&name)
+                .with_context(|| format!("unknown account {name}"))?;
+            let claude = managed_provider(account)?;
+            comradex::browser::AccountBrowser::prepare(config_path, &name)?
+                .open(comradex::browser::provider_url(claude))
         }
         AccountCommand::ResetCredits { name, json } => {
             let config = load_config(config_path)?;
@@ -1058,7 +1126,30 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
-        AccountCommand::Login { name } => login(config_path, &name),
+        AccountCommand::Login {
+            name,
+            browser,
+            no_browser,
+        } => {
+            let config = load_config(config_path)?;
+            managed_provider(
+                config
+                    .accounts
+                    .get(&name)
+                    .with_context(|| format!("unknown account {name}"))?,
+            )?;
+            let browser = if !no_browser
+                && (browser || comradex::browser::has_profile(config_path, &name)?)
+            {
+                Some(comradex::browser::AccountBrowser::prepare(
+                    config_path,
+                    &name,
+                )?)
+            } else {
+                None
+            };
+            login(config_path, &name, browser.as_ref())
+        }
         AccountCommand::Connect { name, codex_home } => {
             load_config(config_path)?;
             let home = match codex_home {
@@ -1202,6 +1293,11 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
         }
         AccountCommand::Remove { name, purge } => {
             let config = load_config(config_path)?;
+            let browser_profile = if purge {
+                comradex::browser::purgeable_profile(config_path, &name)?
+            } else {
+                None
+            };
             if purge
                 && let Some(path) = config
                     .accounts
@@ -1216,6 +1312,15 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             write_config_validated(config_path, &updated)?;
             println!("removed account {name}");
             reload_daemon()?;
+            if let Some(profile) = browser_profile {
+                fs::remove_dir_all(&profile)?;
+                println!("deleted browser profile {}", profile.display());
+            } else if comradex::browser::has_profile(config_path, &name)? {
+                println!(
+                    "browser cookies kept at {} (pass --purge to delete them)",
+                    comradex::browser::profile_path(config_path, &name)?.display()
+                );
+            }
             // Resolve the home from the already-loaded config so relative
             // paths are anchored to the config directory, not the CWD.
             if let Some(path) = config
@@ -1322,20 +1427,120 @@ fn handle_running_codex(restart: bool) -> Result<()> {
     Ok(())
 }
 
-fn login(config_path: &Path, account_name: &str) -> Result<()> {
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line)? == 0 {
+        bail!("setup cancelled (end of input)")
+    }
+    Ok(line.trim().to_owned())
+}
+
+fn managed_provider(account: &comradex::config::AccountConfig) -> Result<bool> {
+    match account {
+        comradex::config::AccountConfig::ClaudeHome { .. } => Ok(true),
+        comradex::config::AccountConfig::CodexHome { .. } => Ok(false),
+        _ => bail!("this account uses the requesting client's login; add a managed account first"),
+    }
+}
+
+fn new_account(
+    config_path: &Path,
+    name: Option<String>,
+    claude: bool,
+    codex: bool,
+    pool: Option<String>,
+) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!(
+            "account new is interactive; run it in a terminal, or use account add <name> --browser"
+        )
+    }
+    load_config(config_path)?;
+    let name = match name {
+        Some(name) => name,
+        None => prompt_line("Account name: ")?,
+    };
+    comradex::accounts::validate_name(&name)?;
+    let claude = if claude || codex {
+        claude
+    } else {
+        loop {
+            match prompt_line("Provider [codex/claude]: ")?
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "codex" | "chatgpt" => break false,
+                "claude" => break true,
+                _ => println!("Enter codex or claude."),
+            }
+        }
+    };
+    let pool = pool.unwrap_or_else(|| if claude { "claude" } else { "default" }.into());
+    // Validate before asking the user to create a provider account. Re-read after
+    // their browser session so unrelated config edits during setup survive.
+    let candidate = account_add_text(config_path, &name, &pool, claude)?;
+    let mut validation = tempfile::NamedTempFile::new_in(
+        fs::canonicalize(config_path)?
+            .parent()
+            .context("config parent")?,
+    )?;
+    validation.write_all(candidate.as_bytes())?;
+    Config::load(validation.path())?;
+    let browser = comradex::browser::AccountBrowser::prepare(config_path, &name)?;
+    browser.open(comradex::browser::provider_url(claude))?;
+    println!("Create the provider account in this window and choose any subscription you need.");
+    println!("Keep this window signed in. Its cookies will be reused for {name}.");
+    prompt_line(
+        "When the account is ready, press Enter to connect it to Comradex (Ctrl-C to stop): ",
+    )?;
+    let updated = account_add_text(config_path, &name, &pool, claude)?;
+    write_config_validated(config_path, &updated)?;
+    println!(
+        "added account {name} to pool {pool}; resume with `comradex account login {name}` if login is interrupted"
+    );
+    reload_daemon()?;
+    login(config_path, &name, Some(&browser))?;
+    println!("account {name} is ready in pool {pool}");
+    Ok(())
+}
+
+fn account_add_text(config_path: &Path, name: &str, pool: &str, claude: bool) -> Result<String> {
+    let text = fs::read_to_string(config_path)?;
+    if claude {
+        comradex::accounts::add_claude_account(&text, name, pool)
+    } else {
+        comradex::accounts::add_account(&text, name, pool)
+    }
+}
+
+fn login(
+    config_path: &Path,
+    account_name: &str,
+    browser: Option<&comradex::browser::AccountBrowser>,
+) -> Result<()> {
     let config = load_config(config_path)?;
     let account = config
         .accounts
         .get(account_name)
         .with_context(|| format!("unknown account {account_name}"))?;
     if let comradex::config::AccountConfig::ClaudeHome { path } = account {
-        return service::while_daemon_stopped(|| comradex::claude::auth::login(path));
+        let launcher = browser.map(|browser| browser.launcher()).transpose()?;
+        let launcher_path = launcher.as_ref().map(|dir| dir.path().join("browser"));
+        return service::while_daemon_stopped(|| {
+            comradex::claude::auth::login_with_browser(path, launcher_path.as_deref())
+        });
     }
     let comradex::config::AccountConfig::CodexHome { path } = account else {
         bail!(
             "this uses the requesting client's login; use account connect to link an existing login"
         )
     };
+    if let Some(browser) = browser {
+        browser.open(comradex::browser::CODEX_DEVICE_URL)?;
+        println!("Enter the device code below in this account's browser window.");
+    }
     service::while_daemon_stopped(|| {
         login_managed_home_with(path, |path| {
             let status = Command::new("codex")
