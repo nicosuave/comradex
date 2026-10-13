@@ -304,7 +304,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     /// Chooses which Claude limit the account rows and desktop widget show.
     private func claudeUsageItem() -> NSMenuItem {
         let item = NSMenuItem(title: "Claude Usage", action: nil, keyEquivalent: "")
-        item.image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: nil)
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         for window in ClaudeUsageWindow.allCases {
