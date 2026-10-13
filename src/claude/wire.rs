@@ -134,13 +134,13 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
     ensure!(uuid(&session), "native session UUID required");
     // Native helper requests can omit the main Claude Code beta. Their SDK, identity,
     // and model signals must still agree; unknown callers never get a fabricated profile.
+    // Claude Code 2.1.288 (SDK 0.128.0) no longer sends `x-stainless-async`.
     if !betas.contains(&"claude-code-20250219") {
         ensure!(
             !count_tokens
                 && model.starts_with("claude-haiku-")
                 && header(headers, "x-stainless-lang") == "js"
-                && header(headers, "x-stainless-runtime") == "node"
-                && header(headers, "x-stainless-async") == "async",
+                && header(headers, "x-stainless-runtime") == "node",
             "unrecognized native helper profile"
         );
     }
@@ -607,6 +607,31 @@ mod tests {
         duplicate.splice(1..1, b"\"metadata\":{},".iter().copied());
         assert!(inspect(&good, &duplicate, false).is_err());
         assert!(inspect(&good, b"[]", false).is_err());
+    }
+    #[test]
+    fn helper_profile_matches_current_sdk_headers_and_rejects_other_shapes() {
+        // Shape captured from a Claude Code 2.1.288 Haiku helper request.
+        let mut helper = headers();
+        helper.insert(
+            "anthropic-beta",
+            "oauth-2025-04-20,structured-outputs-2025-12-15"
+                .parse()
+                .unwrap(),
+        );
+        helper.insert("x-stainless-lang", "js".parse().unwrap());
+        helper.insert("x-stainless-runtime", "node".parse().unwrap());
+        let haiku = String::from_utf8(body())
+            .unwrap()
+            .replace("claude-sonnet-5", "claude-haiku-4-5-20251001")
+            .into_bytes();
+        assert!(inspect(&helper, &haiku, false).is_ok());
+        assert!(inspect(&helper, &body(), false).is_err());
+        assert!(inspect(&helper, &haiku, true).is_err());
+        for name in ["x-stainless-lang", "x-stainless-runtime"] {
+            let mut bad = helper.clone();
+            bad.remove(name);
+            assert!(inspect(&bad, &haiku, false).is_err(), "{name}");
+        }
     }
     #[test]
     fn identity_edits_preserve_all_other_serialized_bytes() {
