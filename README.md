@@ -306,6 +306,8 @@ model_accounts = { "gpt-5.5" = "personal", "gpt-5.6-sol" = "work" }
 
 `model_accounts` matches the exact requested model ID. `models_account` selects the account for `GET /models` and `HEAD /models`, including query parameters, independently of model-specific pins. Both settings are optional; pinned accounts must exist and belong to the pool. These are strict assignments: an unavailable pinned account returns an error instead of falling back to another account. A conflicting account-owned continuation or file also returns an error. Unpinned requests keep the normal routing behavior. Removing an account clears its pins.
 
+For Daybreak, newer Codex clients send a base model with `access_programs.cyber` set to `"daybreak_blue"` or `"daybreak_red"`. These requests prefer the `gpt-daybreak-blue-latest` or `gpt-daybreak-red-latest` pin respectively, falling back to the base model's pin when the Daybreak pin is unset. Existing Daybreak pins therefore cover both request formats; standard requests keep their model-specific or normal pool routing. The request body is forwarded unchanged.
+
 Model-specific pins require the default `responses_websocket_mode = "http_bridge"` or `"direct"`. Configuration with model-specific pins and `"raw"` mode is rejected because raw WebSocket traffic cannot be inspected for model IDs. A model listing pin alone is compatible with every WebSocket mode.
 
 The equivalent manual configuration is:

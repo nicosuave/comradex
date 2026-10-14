@@ -23,6 +23,23 @@ impl Drop for PinFixture {
 }
 
 async fn fixture(dir: &Path, failure: Option<StatusCode>) -> PinFixture {
+    fixture_with_pins(
+        dir,
+        failure,
+        BTreeMap::from([
+            ("pinned-model".into(), "b".into()),
+            ("gpt-daybreak-blue-latest".into(), "b".into()),
+            ("gpt-daybreak-red-latest".into(), "b".into()),
+        ]),
+    )
+    .await
+}
+
+async fn fixture_with_pins(
+    dir: &Path,
+    failure: Option<StatusCode>,
+    model_accounts: BTreeMap<String, String>,
+) -> PinFixture {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
     let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -117,7 +134,7 @@ async fn fixture(dir: &Path, failure: Option<StatusCode>) -> PinFixture {
             PoolConfig {
                 members: vec!["a".into(), "b".into()],
                 preferred: Some("a".into()),
-                model_accounts: BTreeMap::from([("pinned-model".into(), "b".into())]),
+                model_accounts,
                 models_account: Some("b".into()),
                 ..Default::default()
             },
@@ -225,6 +242,72 @@ async fn http_model_pin_overrides_preferred_and_soft_affinity_without_changing_o
 }
 
 #[tokio::test]
+async fn http_access_program_pin_overrides_soft_affinity_and_keeps_standard_routing() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = fixture(dir.path(), None).await;
+    let key = fixture.app.router.affinity.key("thread:soft-thread");
+    assert!(fixture.app.router.bind(key, "a").await);
+    for program in ["standard", "daybreak_blue", "daybreak_red"] {
+        assert_eq!(
+            request(
+                &fixture,
+                Method::POST,
+                "/v1/responses",
+                &format!(
+                    r#"{{"model":"gpt-6-sol","access_programs":{{"cyber":"{program}"}},"input":[]}}"#
+                ),
+                None,
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+    let seen = fixture.seen.lock().unwrap();
+    assert_eq!(
+        seen.iter()
+            .map(|(auth, _)| auth.as_str())
+            .collect::<Vec<_>>(),
+        ["Bearer token-a", "Bearer token-b", "Bearer token-b"]
+    );
+}
+
+#[tokio::test]
+async fn access_program_pin_takes_precedence_but_an_unpinned_program_keeps_the_base_model_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = fixture_with_pins(
+        dir.path(),
+        None,
+        BTreeMap::from([
+            ("gpt-6-sol".into(), "b".into()),
+            ("gpt-daybreak-blue-latest".into(), "a".into()),
+        ]),
+    )
+    .await;
+    for (program, account) in [("daybreak_blue", "a"), ("daybreak_red", "b")] {
+        let body = format!(
+            r#"{{"model":"gpt-6-sol","access_programs":{{"cyber":"{program}"}},"input":[]}}"#
+        );
+        assert_eq!(
+            request(&fixture, Method::POST, "/v1/responses", &body, None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            fixture.seen.lock().unwrap().last().unwrap().0,
+            format!("Bearer token-{account}")
+        );
+        let replay =
+            ReplayBody::from_bytes(Bytes::from(body), 4096, 4096, fixture.app.stats.clone())
+                .unwrap();
+        let route = fixture
+            .app
+            .route_websocket_frame(&fixture.listener, &hyper::HeaderMap::new(), &replay, None)
+            .await
+            .unwrap();
+        assert_eq!(route.account_id, account);
+    }
+}
+
+#[tokio::test]
 async fn listing_pin_applies_to_get_and_head_with_query_parameters() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = fixture(dir.path(), None).await;
@@ -255,23 +338,30 @@ async fn http_pin_rejects_conflicting_owner_and_unavailable_account_before_dispa
     let fixture = fixture(dir.path(), None).await;
     let key = fixture.app.router.affinity.key("turn-state:owned-by-a");
     assert!(fixture.app.router.bind(key, "a").await);
-    let body = r#"{"model":"pinned-model","input":[]}"#;
-    assert_eq!(
-        request(
-            &fixture,
-            Method::POST,
-            "/v1/responses",
-            body,
-            Some("owned-by-a")
-        )
-        .await,
-        StatusCode::CONFLICT
-    );
+    let bodies = [
+        r#"{"model":"pinned-model","input":[]}"#,
+        r#"{"model":"gpt-6-sol","access_programs":{"cyber":"daybreak_blue"},"input":[]}"#,
+    ];
+    for body in bodies {
+        assert_eq!(
+            request(
+                &fixture,
+                Method::POST,
+                "/v1/responses",
+                body,
+                Some("owned-by-a")
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+    }
     fixture.app.router.auth_failure("b").await;
-    assert_eq!(
-        request(&fixture, Method::POST, "/v1/responses", body, None).await,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    for body in bodies {
+        assert_eq!(
+            request(&fixture, Method::POST, "/v1/responses", body, None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
     assert_eq!(
         request(&fixture, Method::GET, "/v1/models", "", None).await,
         StatusCode::SERVICE_UNAVAILABLE
@@ -285,27 +375,29 @@ async fn http_pin_does_not_fall_back_after_quota_or_capacity_failure() {
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::SERVICE_UNAVAILABLE,
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let fixture = fixture(dir.path(), Some(status)).await;
-        assert_eq!(
-            request(
-                &fixture,
-                Method::POST,
-                "/v1/responses",
-                r#"{"model":"pinned-model","input":[]}"#,
-                None
-            )
-            .await,
-            status
-        );
-        let seen = fixture.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1, "pin must suppress alternate-account retry");
-        assert_eq!(seen[0].0, "Bearer token-b");
+        for body in [
+            r#"{"model":"pinned-model","input":[]}"#,
+            r#"{"model":"gpt-6-sol","access_programs":{"cyber":"daybreak_blue"},"input":[]}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = fixture(dir.path(), Some(status)).await;
+            assert_eq!(
+                request(&fixture, Method::POST, "/v1/responses", body, None).await,
+                status
+            );
+            let seen = fixture.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "pin must suppress alternate-account retry");
+            assert_eq!(seen[0].0, "Bearer token-b");
+        }
     }
 }
 
 #[tokio::test]
 async fn direct_frame_pin_overrides_socket_and_soft_preference_and_is_a_hard_owner() {
+    for body in [
+        br#"{"type":"response.create","model":"pinned-model","input":[]}"#.as_slice(),
+        br#"{"type":"response.create","model":"gpt-6-sol","access_programs":{"cyber":"daybreak_blue"},"input":[]}"#.as_slice(),
+    ] {
     let dir = tempfile::tempdir().unwrap();
     let fixture = fixture(dir.path(), None).await;
     let key = fixture.app.router.affinity.key("thread:soft-thread");
@@ -313,7 +405,7 @@ async fn direct_frame_pin_overrides_socket_and_soft_preference_and_is_a_hard_own
     let mut headers = hyper::HeaderMap::new();
     headers.insert("thread-id", "soft-thread".parse().unwrap());
     let replay = ReplayBody::from_bytes(
-        Bytes::from_static(br#"{"type":"response.create","model":"pinned-model","input":[]}"#),
+        Bytes::copy_from_slice(body),
         fixture.app.config.proxy.max_request_bytes,
         fixture.app.config.proxy.max_spool_bytes,
         fixture.app.stats.clone(),
@@ -348,51 +440,66 @@ async fn direct_frame_pin_overrides_socket_and_soft_preference_and_is_a_hard_own
         .err()
         .expect("unavailable pinned account must fail");
     assert!(error.to_string().contains("unavailable"), "{error:#}");
+    }
 }
 
 #[tokio::test]
 async fn http_bridge_websocket_honors_model_pin() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let dir = tempfile::tempdir().unwrap();
-    let fixture = fixture(dir.path(), None).await;
-    let stream = tokio::net::TcpStream::connect(fixture.address)
-        .await
+    for (body, account) in [
+        (
+            r#"{"type":"response.create","model":"pinned-model","input":[]}"#,
+            "b",
+        ),
+        (
+            r#"{"type":"response.create","model":"gpt-6-sol","access_programs":{"cyber":"daybreak_blue"},"input":[]}"#,
+            "b",
+        ),
+        (
+            r#"{"type":"response.create","model":"gpt-6-sol","access_programs":{"cyber":"daybreak_red"},"input":[]}"#,
+            "b",
+        ),
+        (
+            r#"{"type":"response.create","model":"gpt-6-sol","access_programs":{"cyber":"standard"},"input":[]}"#,
+            "a",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = fixture(dir.path(), None).await;
+        let stream = tokio::net::TcpStream::connect(fixture.address)
+            .await
+            .unwrap();
+        let request = format!(
+            "ws://{}/{SECRET}/backend-api/codex/responses",
+            fixture.address
+        )
+        .into_client_request()
         .unwrap();
-    let request = format!(
-        "ws://{}/{SECRET}/backend-api/codex/responses",
-        fixture.address
-    )
-    .into_client_request()
-    .unwrap();
-    let (mut websocket, _) = tokio_tungstenite::client_async(request, stream)
-        .await
-        .unwrap();
-    websocket
-        .send(Message::Text(
-            r#"{"type":"response.create","model":"pinned-model","input":[]}"#.into(),
-        ))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let message = websocket.next().await.unwrap().unwrap();
-            let Message::Text(text) = message else {
-                continue;
-            };
-            let event: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
-            assert_ne!(event["type"], "error", "{event}");
-            assert_ne!(event["type"], "response.failed", "{event}");
-            if event["type"] == "response.completed" {
-                break;
+        let (mut websocket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+        websocket.send(Message::Text(body.into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = websocket.next().await.unwrap().unwrap();
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let event: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                assert_ne!(event["type"], "error", "{event}");
+                assert_ne!(event["type"], "response.failed", "{event}");
+                if event["type"] == "response.completed" {
+                    break;
+                }
             }
-        }
-    })
-    .await
-    .expect("bridge did not complete pinned response");
-    let seen = fixture.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].0, "Bearer token-b");
+        })
+        .await
+        .expect("bridge did not complete pinned response");
+        let seen = fixture.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, format!("Bearer token-{account}"));
+    }
 }
 
 #[tokio::test]
