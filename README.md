@@ -4,6 +4,13 @@
 
 Comradex is a small Rust relay that gives native Codex and Claude Code sticky, quota-aware account pools.
 
+The [macOS menu app](macos/ComradexMenu/README.md) and desktop widget show remaining quota and reset times for your Codex and Claude accounts.
+
+<p>
+  <img src="docs/screenshots/menu-bar.png" alt="Comradex menu showing Codex and Claude account usage and reset times" height="320">
+  <img src="docs/screenshots/account-usage-widget.png" alt="Comradex desktop widget showing remaining quota and reset countdowns for Codex and Claude accounts" height="320">
+</p>
+
 ## Quick start
 
 Install the latest release with Homebrew:
