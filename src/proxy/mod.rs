@@ -1755,12 +1755,8 @@ impl App {
                 .excluded_account
                 .clone()
         });
-        let pinned_account = request_account_pin(
-            pool,
-            &method,
-            &path,
-            if inspect_model { replay.model() } else { None },
-        );
+        let pinned_account =
+            request_account_pin(pool, &method, &path, inspect_model.then_some(&replay));
         if let Some(account) = pinned_account {
             if bound_account
                 .as_deref()
@@ -2998,17 +2994,14 @@ impl App {
         if missing_hard_owner {
             anyhow::bail!("request carries hard continuity state with no known account owner")
         }
-        if let Some(account) = replay
-            .model()
-            .and_then(|model| pool.model_accounts.get(model))
-        {
+        if let Some(account) = model_account_pin(pool, replay) {
             if hard_bound_account
                 .as_ref()
                 .is_some_and(|owner| owner != account)
             {
                 anyhow::bail!("configured account pin conflicts with request continuity owner")
             }
-            hard_bound_account = Some(account.clone());
+            hard_bound_account = Some(account.to_owned());
             hard_owner = true;
             non_previous_hard_owner = true;
         }
@@ -4903,13 +4896,25 @@ fn request_account_pin<'a>(
     pool: &'a PoolConfig,
     method: &Method,
     path: &str,
-    model: Option<&str>,
+    replay: Option<&ReplayBody>,
 ) -> Option<&'a str> {
     if matches!(*method, Method::GET | Method::HEAD) && path.split('?').next() == Some("/models") {
         pool.models_account.as_deref()
     } else {
-        model.and_then(|model| pool.model_accounts.get(model).map(String::as_str))
+        replay.and_then(|replay| model_account_pin(pool, replay))
     }
+}
+
+fn model_account_pin<'a>(pool: &'a PoolConfig, replay: &ReplayBody) -> Option<&'a str> {
+    replay
+        .routing_model()
+        .and_then(|model| pool.model_accounts.get(model))
+        .or_else(|| {
+            replay
+                .model()
+                .and_then(|model| pool.model_accounts.get(model))
+        })
+        .map(String::as_str)
 }
 
 fn is_legacy_compact_path(path: &str) -> bool {

@@ -60,6 +60,7 @@ pub struct ReplayBody {
     len: usize,
     stats: Arc<Stats>,
     model: Option<String>,
+    cyber_access_program: Option<String>,
     model_scan_complete: bool,
     thread_id: Option<String>,
     context_session_id: Option<String>,
@@ -74,6 +75,8 @@ pub struct ReplayBody {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyKind {
     Model,
+    AccessPrograms,
+    CyberAccessProgram,
     ClientMetadata,
     ThreadId,
     SessionId,
@@ -98,17 +101,19 @@ struct Container {
 struct MetadataScanner {
     containers: Vec<Container>,
     client_depth: Option<usize>,
+    access_programs_depth: Option<usize>,
     in_string: bool,
     escape: bool,
     string_is_key: bool,
     capture_value: Option<KeyKind>,
     token: Vec<u8>,
     token_overflow: bool,
-    model_token: Vec<u8>,
-    model_token_overflow: bool,
+    routing_token: Vec<u8>,
+    routing_token_overflow: bool,
     key: Option<KeyKind>,
     pending_value: Option<KeyKind>,
     model: Option<String>,
+    cyber_access_program: Option<String>,
     model_scan_incomplete: bool,
     thread_id: Option<String>,
     context_session_id: Option<String>,
@@ -134,24 +139,29 @@ impl MetadataScanner {
                 return;
             }
             if self.in_string {
-                // Keep a bounded JSON spelling for model names and property names,
-                // so escaped model names route exactly like their decoded spelling.
-                if ((self.string_is_key && self.containers.len() == 1)
-                    || self.capture_value == Some(KeyKind::Model))
-                    && !self.model_token_overflow
+                // Decode both model selectors and root property names so escaped
+                // spellings route exactly like the upstream JSON parser.
+                if ((self.string_is_key
+                    && (self.containers.len() == 1
+                        || self.access_programs_depth == Some(self.containers.len())))
+                    || matches!(
+                        self.capture_value,
+                        Some(KeyKind::Model | KeyKind::CyberAccessProgram)
+                    ))
+                    && !self.routing_token_overflow
                     && (byte != b'"' || self.escape)
                 {
                     // Each ASCII character can occupy six bytes as a JSON escape.
-                    // Only the five-character root key `model` needs decoding.
+                    // The longest routing key is `access_programs`.
                     let limit = if self.string_is_key {
-                        5 * 6
+                        b"access_programs".len() * 6
                     } else {
                         MAX_MODEL_BYTES * 6
                     };
-                    if self.model_token.len() < limit {
-                        self.model_token.push(byte);
+                    if self.routing_token.len() < limit {
+                        self.routing_token.push(byte);
                     } else {
-                        self.model_token_overflow = true;
+                        self.routing_token_overflow = true;
                     }
                 }
                 if self.escape {
@@ -188,12 +198,13 @@ impl MetadataScanner {
                     self.in_string = true;
                     self.token.clear();
                     self.token_overflow = false;
-                    self.model_token.clear();
-                    self.model_token_overflow = false;
+                    self.routing_token.clear();
+                    self.routing_token_overflow = false;
                     self.capture_value = self.pending_value.take().filter(|kind| {
                         matches!(
                             kind,
                             KeyKind::Model
+                                | KeyKind::CyberAccessProgram
                                 | KeyKind::ThreadId
                                 | KeyKind::SessionId
                                 | KeyKind::PreviousResponseId
@@ -218,6 +229,7 @@ impl MetadataScanner {
                         continue;
                     }
                     let is_client = self.pending_value == Some(KeyKind::ClientMetadata);
+                    let is_access_programs = self.pending_value == Some(KeyKind::AccessPrograms);
                     let native_input_item = self.containers.last().is_some_and(|v| v.input_array);
                     self.pending_value = None;
                     self.containers.push(Container {
@@ -230,6 +242,9 @@ impl MetadataScanner {
                     });
                     if is_client {
                         self.client_depth = Some(self.containers.len());
+                    }
+                    if is_access_programs {
+                        self.access_programs_depth = Some(self.containers.len());
                     }
                 }
                 b'[' => {
@@ -253,6 +268,9 @@ impl MetadataScanner {
                 b'}' | b']' => {
                     if self.client_depth == Some(self.containers.len()) {
                         self.client_depth = None;
+                    }
+                    if self.access_programs_depth == Some(self.containers.len()) {
+                        self.access_programs_depth = None;
                     }
                     if let Some(container) = self.containers.pop()
                         && container.account_scoped_file
@@ -294,11 +312,16 @@ impl MetadataScanner {
         // Also inspect an all-turns request without session metadata so it fails closed.
         self.context_envelope |= !self.string_is_key && self.token == b"all_turns";
         if let Some(kind) = self.capture_value {
-            if kind == KeyKind::Model {
-                self.model = self
-                    .decoded_model_token()
+            if matches!(kind, KeyKind::Model | KeyKind::CyberAccessProgram) {
+                let value = self
+                    .decoded_routing_token()
                     .filter(|value| !value.is_empty() && value.len() <= MAX_MODEL_BYTES);
-                self.model_scan_incomplete |= self.model_token_overflow;
+                match kind {
+                    KeyKind::Model => self.model = value,
+                    KeyKind::CyberAccessProgram => self.cyber_access_program = value,
+                    _ => unreachable!(),
+                }
+                self.model_scan_incomplete |= self.routing_token_overflow;
             }
             if !self.token_overflow && !self.token.is_empty() {
                 let value = String::from_utf8(self.token.clone()).ok();
@@ -333,7 +356,12 @@ impl MetadataScanner {
                             );
                         }
                     }
-                    KeyKind::Model | KeyKind::ClientMetadata | KeyKind::Other | KeyKind::Input => {}
+                    KeyKind::Model
+                    | KeyKind::AccessPrograms
+                    | KeyKind::CyberAccessProgram
+                    | KeyKind::ClientMetadata
+                    | KeyKind::Other
+                    | KeyKind::Input => {}
                 }
             }
         } else if self.string_is_key {
@@ -356,11 +384,20 @@ impl MetadataScanner {
             {
                 self.nonportable_state = true;
             }
-            self.key = if at_root && self.decoded_model_token().as_deref() == Some("model") {
+            self.key = if at_root && self.decoded_routing_token().as_deref() == Some("model") {
                 // A later non-string or oversized model must not leave an earlier
                 // model active when the upstream parser uses the final property.
                 self.model = None;
                 Some(KeyKind::Model)
+            } else if at_root && self.decoded_routing_token().as_deref() == Some("access_programs")
+            {
+                self.cyber_access_program = None;
+                Some(KeyKind::AccessPrograms)
+            } else if self.access_programs_depth == Some(self.containers.len())
+                && self.decoded_routing_token().as_deref() == Some("cyber")
+            {
+                self.cyber_access_program = None;
+                Some(KeyKind::CyberAccessProgram)
             } else if at_root && !self.token_overflow && self.token == b"client_metadata" {
                 Some(KeyKind::ClientMetadata)
             } else if in_client && !self.token_overflow && self.token == b"thread_id" {
@@ -388,16 +425,16 @@ impl MetadataScanner {
         self.string_is_key = false;
     }
 
-    fn decoded_model_token(&self) -> Option<String> {
-        if self.model_token_overflow {
+    fn decoded_routing_token(&self) -> Option<String> {
+        if self.routing_token_overflow {
             return None;
         }
-        if !self.model_token.contains(&b'\\') {
-            return String::from_utf8(self.model_token.clone()).ok();
+        if !self.routing_token.contains(&b'\\') {
+            return String::from_utf8(self.routing_token.clone()).ok();
         }
-        let mut quoted = Vec::with_capacity(self.model_token.len() + 2);
+        let mut quoted = Vec::with_capacity(self.routing_token.len() + 2);
         quoted.push(b'"');
-        quoted.extend_from_slice(&self.model_token);
+        quoted.extend_from_slice(&self.routing_token);
         quoted.push(b'"');
         serde_json::from_slice(&quoted).ok()
     }
@@ -465,6 +502,7 @@ impl ReplayBody {
             storage: Storage::Memory(bytes),
             stats,
             model: metadata.model,
+            cyber_access_program: metadata.cyber_access_program,
             model_scan_complete: !metadata.disabled && !metadata.model_scan_incomplete,
             thread_id: metadata.thread_id,
             context_session_id: metadata.context_session_id,
@@ -599,6 +637,7 @@ impl ReplayBody {
             len,
             stats,
             model: metadata.model,
+            cyber_access_program: metadata.cyber_access_program,
             model_scan_complete: !metadata.disabled && !metadata.model_scan_incomplete,
             thread_id: metadata.thread_id,
             context_session_id: metadata.context_session_id,
@@ -613,6 +652,16 @@ impl ReplayBody {
 
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// Newer Codex clients request Daybreak as a treatment on a base model.
+    /// Keep the existing Daybreak account pins effective for both wire formats.
+    pub fn routing_model(&self) -> Option<&str> {
+        match self.cyber_access_program.as_deref() {
+            Some("daybreak_blue") => Some("gpt-daybreak-blue-latest"),
+            Some("daybreak_red") => Some("gpt-daybreak-red-latest"),
+            _ => self.model(),
+        }
     }
 
     pub fn model_scan_complete(&self) -> bool {
@@ -748,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn zstd_metadata_and_replay_survive_chunking_and_disk_spooling() {
-        let payload = Bytes::from_static(br#"{"model":"gpt-5","client_metadata":{"thread_id":"thread-1","session_id":"session-1"},"previous_response_id":"resp-1","prompt_cache_key":"cache-1","input":[{"type":"input_file","file_id":"file-1"},{"type":"compaction","encrypted_content":"owned"}]}"#);
+        let payload = Bytes::from_static(br#"{"model":"gpt-5","access_programs":{"cyber":"daybreak_blue"},"client_metadata":{"thread_id":"thread-1","session_id":"session-1"},"previous_response_id":"resp-1","prompt_cache_key":"cache-1","input":[{"type":"input_file","file_id":"file-1"},{"type":"compaction","encrypted_content":"owned"}]}"#);
         let wire = zstd_bytes(&payload).await;
         for memory_limit in [1, 4096] {
             let stats = Arc::new(Stats::default());
@@ -762,6 +811,7 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(replay.model(), Some("gpt-5"));
+            assert_eq!(replay.routing_model(), Some("gpt-daybreak-blue-latest"));
             assert!(replay.model_scan_complete());
             assert_eq!(replay.thread_id(), Some("thread-1"));
             assert_eq!(replay.context_session_id(), Some("session-1"));
@@ -892,6 +942,73 @@ mod tests {
     }
 
     #[test]
+    fn access_program_routing_uses_only_the_final_root_property_across_chunks() {
+        for (properties, expected) in [
+            (
+                r#""access_programs":{"cyber":"daybreak_blue"}"#,
+                "gpt-daybreak-blue-latest",
+            ),
+            (
+                r#""access_programs":{"cyber":"daybreak_red"}"#,
+                "gpt-daybreak-red-latest",
+            ),
+            (r#""access_programs":{"cyber":"standard"}"#, "gpt-6-sol"),
+            (
+                r#""input":[{"access_programs":{"cyber":"daybreak_blue"}}]"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#""access_programs":{"cyber":"daybreak_blue"},"access_programs":null"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#""access_programs":{"cyber":"daybreak_blue","cyber":"standard"}"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#""access_programs":{"cyber":"daybreak_blue","cyber":null}"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#""access_progr\u0061ms":{"cy\u0062er":"daybreak_\u0062lue"}"#,
+                "gpt-daybreak-blue-latest",
+            ),
+            (
+                r#""access_programs":{"nested":{"cyber":"daybreak_blue"}}"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#""access_programs":{"cyber":"daybreak_blue"},"access_programs":{}"#,
+                "gpt-6-sol",
+            ),
+            (
+                r#""access_programs":{"cyber":"daybreak_blue"},"access_programs":{"cyber":"daybreak_red"}"#,
+                "gpt-daybreak-red-latest",
+            ),
+        ] {
+            let payload = format!(r#"{{"model":"gpt-6-sol",{properties}}}"#);
+            for size in [1, 3, payload.len()] {
+                let mut scanner = MetadataScanner::default();
+                for chunk in payload.as_bytes().chunks(size) {
+                    scanner.feed(chunk);
+                }
+                scanner.finish();
+                let replay = ReplayBody::from_bytes(
+                    Bytes::from(payload.clone()),
+                    4096,
+                    4096,
+                    Arc::new(Stats::default()),
+                )
+                .unwrap();
+                assert_eq!(scanner.cyber_access_program, replay.cyber_access_program);
+                assert_eq!(replay.model(), Some("gpt-6-sol"));
+                assert_eq!(replay.routing_model(), Some(expected), "{payload}");
+                assert!(replay.model_scan_complete());
+            }
+        }
+    }
+
+    #[test]
     fn model_scan_reports_limits_and_incomplete_requests() {
         let nested = format!("{}null{}", "[".repeat(129), "]".repeat(129));
         for payload in [
@@ -900,6 +1017,11 @@ mod tests {
             format!(r#"{{"model":"{}"}}"#, "x".repeat(MAX_MODEL_BYTES * 6 + 1)),
             r#"{"model":"unfinished"#.to_owned(),
             r#"{"model":"gpt-5""#.to_owned(),
+            format!(
+                r#"{{"access_programs":{{"cyber":"{}"}}}}"#,
+                "x".repeat(MAX_MODEL_BYTES * 6 + 1)
+            ),
+            r#"{"model":"gpt-6-sol","access_programs":{"cyber":"daybreak_blue"#.to_owned(),
         ] {
             let replay = ReplayBody::from_bytes(
                 Bytes::from(payload),
