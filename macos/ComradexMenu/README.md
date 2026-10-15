@@ -2,6 +2,25 @@
 
 A native macOS 14+ menu-bar companion for viewing Comradex daemon, routing, account, and pool status; changing each account's routing settings; and completing account login when authentication is required.
 
+## Install with Homebrew
+
+Install the CLI and menu bar app from the tap:
+
+```sh
+brew install nicosuave/tap/comradex
+brew install --cask nicosuave/tap/comradex-menu
+```
+
+Follow the [quick start](../../README.md#quick-start) to configure and start the relay, then open the app:
+
+```sh
+open -a ComradexMenu
+```
+
+The cask includes the desktop widget described below. It requires macOS 14 (Sonoma) or later and connects to the running Comradex daemon; installing the cask does not install or start the daemon.
+
+## Menu and accounts
+
 Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m`. Codex accounts show their primary quota window. Claude accounts show the limit chosen under **Claude Usage**: **5-Hour Limit** (the default) or **Weekly Limit**. The choice persists, applies to the desktop widget too, and does not affect routing. The menu offers it only when a Claude account is configured. Zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details. Tooltips explicitly label reset countdowns.
 
 Top-level account rows have no checkmarks or routing labels. The tooltip identifies the account most recently used for an upstream request (`wired`). A single pool has no section header. Multiple pools get section headers named for their provider, Codex before Claude; when a provider has more than one pool, the header adds the pool name, such as `Codex · work`.

@@ -19,6 +19,12 @@ Install the latest release with Homebrew:
 brew install nicosuave/tap/comradex
 ```
 
+On macOS 14 (Sonoma) or later, also install the menu bar app and desktop widget:
+
+```sh
+brew install --cask nicosuave/tap/comradex-menu
+```
+
 Create the default configuration, verify it, and start the relay:
 
 ```sh
@@ -46,6 +52,14 @@ comradex account add personal_2
 ```
 
 The command updates the configuration, restarts the daemon if it is installed as a service, and walks through device login. See [Accounts](#accounts) for the manual setup and credential details.
+
+With the relay running, open the menu bar app:
+
+```sh
+open -a ComradexMenu
+```
+
+See the [menu app instructions](macos/ComradexMenu/README.md#install-with-homebrew) for details, including adding the desktop widget.
 
 ## Claude Code
 
@@ -173,6 +187,17 @@ Or install a prebuilt release from GitHub with `cargo-binstall`:
 ```sh
 cargo binstall --git https://github.com/nicosuave/comradex comradex
 ```
+
+### macOS menu bar app
+
+Install the menu bar app and desktop widget on macOS 14 (Sonoma) or later:
+
+```sh
+brew install --cask nicosuave/tap/comradex-menu
+open -a ComradexMenu
+```
+
+The app requires the Comradex CLI and a running relay; the cask does not install or start the daemon. Follow the [quick start](#quick-start) to set those up. To add the **Account Usage** widget, right-click the desktop and choose **Edit Widgets…**.
 
 ### From source
 
