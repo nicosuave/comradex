@@ -217,8 +217,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             action: nil,
             keyEquivalent: ""
         )
-        item.toolTip = [isLastUsed ? "Last used for an upstream request" : nil, accountDetail(account, expanded: true)]
-            .compactMap { $0 }.joined(separator: " · ")
         let submenu = NSMenu()
         submenu.autoenablesItems = false
         if let pool {
@@ -232,9 +230,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 )
                 choice.state = role == current ? .on : .off
                 choice.representedObject = AccountRoleAction(pool: pool.name, account: account.name, role: role)
-                choice.toolTip = "Applies to new work. Existing conversations keep their account."
                 submenu.addItem(choice)
             }
+        }
+        if isLastUsed {
+            submenu.addItem(.separator())
+            let lastUsed = NSMenuItem(title: "Last used for an upstream request", action: nil, keyEquivalent: "")
+            lastUsed.isEnabled = false
+            submenu.addItem(lastUsed)
         }
         if loginAction {
             if !submenu.items.isEmpty { submenu.addItem(.separator()) }
@@ -245,7 +248,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                     && (hasRunningLogin || (!store.isLoginRunning && !account.isLoginInProgress))
             )
             login.representedObject = account.name
-            login.toolTip = "Sign in without changing this account's routing role."
             submenu.addItem(login)
         }
         if account.isInbound && !account.isClaude {
@@ -257,7 +259,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 enabled: store.connectingAccount == nil && !store.isLoginRunning && store.updatingPool == nil
             )
             connect.representedObject = account.name
-            connect.toolTip = "Reuse your local Codex login and show its usage."
             submenu.addItem(connect)
         }
         let pendingResets = store.pendingResetCredits[account.name] ?? [:]
@@ -310,7 +311,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             let choice = actionItem(title: window.title, action: #selector(claudeUsageSelected(_:)))
             choice.state = window == store.claudeUsage ? .on : .off
             choice.representedObject = window.rawValue
-            choice.toolTip = "Show this limit for Claude accounts here and in the desktop widget."
             submenu.addItem(choice)
         }
         item.submenu = submenu
@@ -464,14 +464,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         connectionLabel == "Running" ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
     }
 
-    private func accountState(_ account: AccountSnapshot, expanded: Bool) -> String {
+    private func accountState(_ account: AccountSnapshot) -> String {
         if !account.available {
             switch account.unavailableReason?.lowercased() {
             case "quota":
-                if expanded, let retry = retryDescription(account.retryAtUnix) {
-                    return "Rate limited · retry in \(retry)"
-                }
-                if expanded { return "Rate limited" }
                 // Show the exhausted window, even when a different primary window has quota.
                 let reset = account.usageWindows.values
                     .filter { ($0.usedPercent ?? 0) >= 100 && $0.limitWindowSeconds != 0 }
@@ -494,26 +490,26 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func accountDetail(_ account: AccountSnapshot, expanded: Bool = false) -> String {
+    private func accountDetail(_ account: AccountSnapshot) -> String {
         if account.isLoginInProgress { return "Login in progress" }
         if account.reauthRequired { return "Sign-in needed for renewal" }
         if !account.available
             || account.authState?.lowercased() == "login_in_progress"
             || account.authState?.lowercased() == "signed_out"
         {
-            return accountState(account, expanded: expanded)
+            return accountState(account)
         }
         if account.isInbound { return "Requesting client’s login" }
-        return usageDescription(account, expanded: expanded) ?? "Usage pending"
+        return usageDescription(account) ?? "Usage pending"
     }
 
-    private func usageDescription(_ account: AccountSnapshot, expanded: Bool) -> String? {
+    private func usageDescription(_ account: AccountSnapshot) -> String? {
         guard let window = account.summaryWindowKey(claudeUsage: store.claudeUsage).flatMap({ account.usageWindows[$0] }) else {
             return account.usagePercent.map { "\(max(0, 100 - $0))% left" }
         }
         var detail = "\(max(0, 100 - window.usedPercent!))% left"
         if let reset = retryDescription(window.resetAtUnix) {
-            detail += expanded ? " · resets in \(reset)" : " · \(reset)"
+            detail += " · \(reset)"
         }
         return detail
     }
