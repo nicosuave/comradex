@@ -481,7 +481,7 @@ impl ProtocolState {
                 Vec::new()
             }
         } else if failure.kind == FailureKind::PreviousResponseNotFound {
-            self.match_previous_response_miss(previous_response_anchor_hint)
+            self.previous_response_miss_turns(previous_response_anchor_hint)
         } else if self.pending.len() == 1 {
             self.pending
                 .front()
@@ -869,24 +869,37 @@ impl ProtocolState {
         Ok(Some(candidate))
     }
 
-    fn match_previous_response_miss(&self, anchor_hint: Option<&str>) -> Vec<TurnId> {
+    /// Turns a `previous_response_not_found` can legitimately concern. The only attribution
+    /// rule for this failure; the dispatch loop in `proxy::mod` defers to it rather than
+    /// keeping a second copy.
+    ///
+    /// Only a create upstream has not accepted yet can be the subject: once a turn streams
+    /// under its own response id, a missing anchor cannot be about it. Without that
+    /// restriction a sibling turn sharing the anchor gets force-failed while upstream keeps
+    /// streaming it -- and `settle` drops its `response_index` entry, so the frames that
+    /// follow arrive unassociated.
+    pub fn previous_response_miss_turns(&self, anchor_hint: Option<&str>) -> Vec<TurnId> {
         if let Some(anchor) = anchor_hint {
             return self
                 .pending
                 .iter()
-                .filter(|turn| turn.previous_response_id.as_deref() == Some(anchor))
+                .filter(|turn| {
+                    turn.is_precreated() && turn.previous_response_id.as_deref() == Some(anchor)
+                })
                 .map(|turn| turn.id)
                 .collect();
         }
-        if self.pending.len() == 1 {
-            return self
-                .pending
-                .front()
-                .map(|turn| turn.id)
-                .into_iter()
-                .collect();
+        // No anchor could be resolved from the message. A single unaccepted create that
+        // carries an anchor of its own is then the only unambiguous subject; a lone turn
+        // with no anchor at all cannot be one, however few turns are in flight.
+        let mut anchored = self
+            .pending
+            .iter()
+            .filter(|turn| turn.is_precreated() && turn.previous_response_id.is_some());
+        match (anchored.next(), anchored.next()) {
+            (Some(turn), None) => vec![turn.id],
+            _ => Vec::new(),
         }
-        Vec::new()
     }
 }
 
@@ -1610,6 +1623,65 @@ mod tests {
 
     fn create(input: Value) -> Value {
         json!({"type":"response.create","model":"gpt-test","input":input})
+    }
+
+    #[test]
+    fn a_previous_response_miss_only_concerns_unaccepted_creates() {
+        let anchored = |anchor: &str| json!({"type":"response.create","model":"gpt-test","input":"x","previous_response_id":anchor});
+        let mut shared = state();
+
+        // One streaming turn and one unaccepted create share the anchor. Only the create
+        // upstream has not accepted can be the subject: failing the streaming turn would
+        // drop its response_index entry while upstream keeps sending its frames.
+        let streaming = shared.admit_response_create(&anchored("resp_p")).unwrap();
+        shared
+            .observe_upstream_event(
+                &json!({"type":"response.created","response":{"id":"resp_a"}}),
+                None,
+            )
+            .unwrap();
+        let unaccepted = shared.admit_response_create(&anchored("resp_p")).unwrap();
+        assert_eq!(
+            shared.previous_response_miss_turns(Some("resp_p")),
+            [unaccepted]
+        );
+        assert!(
+            !shared
+                .previous_response_miss_turns(Some("resp_p"))
+                .contains(&streaming)
+        );
+
+        // A different anchor matches nothing.
+        assert!(
+            shared
+                .previous_response_miss_turns(Some("resp_q"))
+                .is_empty()
+        );
+
+        // With no anchor resolved, a lone unaccepted create carrying an anchor is the only
+        // unambiguous subject.
+        let mut single = state();
+        let only = single.admit_response_create(&anchored("resp_p")).unwrap();
+        assert_eq!(single.previous_response_miss_turns(None), [only]);
+
+        // A lone turn with no anchor at all cannot be the subject, however few are in
+        // flight: a missing previous response says nothing about a request that named none.
+        let mut anchorless = state();
+        anchorless
+            .admit_response_create(&create(json!("no anchor")))
+            .unwrap();
+        assert!(anchorless.previous_response_miss_turns(None).is_empty());
+
+        // Neither can a lone turn upstream has already accepted.
+        let mut accepted = state();
+        accepted.admit_response_create(&anchored("resp_p")).unwrap();
+        accepted
+            .observe_upstream_event(
+                &json!({"type":"response.created","response":{"id":"resp_c"}}),
+                None,
+            )
+            .unwrap();
+        assert!(accepted.previous_response_miss_turns(None).is_empty());
     }
 
     #[test]

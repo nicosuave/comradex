@@ -293,7 +293,9 @@ impl OwnedChain {
                 self.continuation_pending = true;
                 self.successor_deadline = Some(now + CONFIRM_TIMEOUT);
             }
-            Some("response.processed") => return Ok(()),
+            // Needs no validation, but still falls through to the chain budget below so it
+            // cannot be relayed without limit.
+            Some("response.processed") => {}
             _ => {
                 return Err(
                     "unsupported frame in owned native chain; use raw mode for opaque protocols",
@@ -511,6 +513,21 @@ impl App {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn processed_frames_are_charged_to_the_chain_budget() {
+        // `response.processed` needs no validation, but an uncharged relay would let a client
+        // stream unlimited frames onto an owned socket bounded only by CHAIN_TIMEOUT.
+        let mut chain = chain(false);
+        let processed = json!({"type":"response.processed"});
+        for _ in 0..MAX_CONTROLS {
+            assert_eq!(chain.submit(&processed, 1), Ok(()));
+        }
+        assert_eq!(
+            chain.submit(&processed, 1),
+            Err("native chain control count or byte limit exceeded; finish on this socket")
+        );
+    }
 
     fn chain(injection: bool) -> OwnedChain {
         let create = if injection {

@@ -415,26 +415,10 @@ fn legacy_migration_complete(connection: &Connection) -> Result<bool> {
 }
 
 fn remove_incomplete_database(database_path: &Path) {
-    for path in [
-        database_path.to_path_buf(),
-        sqlite_path_with_suffix(database_path, "-wal"),
-        sqlite_path_with_suffix(database_path, "-shm"),
-    ] {
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                error!(%error, path = %path.display(), "failed to remove incomplete affinity database")
-            }
-        }
-    }
+    crate::sqlite_store::discard_database(database_path, "affinity");
 }
 
-fn sqlite_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    value.into()
-}
+use crate::sqlite_store::path_with_suffix as sqlite_path_with_suffix;
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> Result<()> {
@@ -456,11 +440,9 @@ fn configure_migration_database(connection: &Connection) -> Result<()> {
 }
 
 fn configure_database(connection: &Connection) -> Result<()> {
-    connection.busy_timeout(Duration::from_secs(5))?;
-    connection.pragma_update(None, "journal_mode", "wal")?;
-    connection.pragma_update(None, "synchronous", "normal")?;
-    connection.pragma_update(None, "foreign_keys", true)?;
-    Ok(())
+    // Bindings are a routing cache the daemon rebuilds, so this store trades full
+    // durability for write throughput. The context store opts into `full` instead.
+    crate::sqlite_store::configure(connection, "normal")
 }
 
 fn create_schema(connection: &Connection) -> Result<()> {

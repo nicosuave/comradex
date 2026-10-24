@@ -2127,23 +2127,20 @@ impl App {
                             .map_file_finalize_response(response, &account, &file_id)
                             .await;
                     }
+                    // Account health is recorded for every rejection; `retry` only decides
+                    // whether *this* request may move to an alternate below. Gating the
+                    // recording on retryability used to hide a `POST /files` 429 entirely,
+                    // leaving an exhausted account in the rotation.
+                    self.record_rejection_health(
+                        &account,
+                        status,
+                        response.headers(),
+                        &inspection,
+                        &credentials,
+                    )
+                    .await;
                     let retry = inspection.permits_account_failure()
                         && retryable_http_status(status, &method, &path);
-                    if retry && !capacity {
-                        if status == StatusCode::TOO_MANY_REQUESTS
-                            || status == StatusCode::PAYMENT_REQUIRED
-                        {
-                            self.router
-                                .quota_failure_for_owner(
-                                    &account,
-                                    response.headers(),
-                                    &credentials.quota_owner(),
-                                )
-                                .await;
-                        } else {
-                            self.router.soft_failure(&account).await;
-                        }
-                    }
                     if retry && attempt == 0 && !hard_owner && payload_dispatch_owner.is_none() {
                         let alternate = self
                             .router
@@ -3230,19 +3227,17 @@ impl App {
                     }
                 }
             }
-            if capacity || !inspection.permits_account_failure() {
-                // The body classification takes precedence over quota/gateway status.
-            } else if is_quota_status(status) {
-                self.router
-                    .quota_failure_for_owner(
-                        account,
-                        response.headers(),
-                        &credentials.quota_owner(),
-                    )
-                    .await;
-            } else if is_selected_gateway_failure(status) {
-                self.router.soft_failure(account).await;
-            } else if status == StatusCode::UNAUTHORIZED
+            self.record_rejection_health(
+                account,
+                status,
+                response.headers(),
+                &inspection,
+                &credentials,
+            )
+            .await;
+            if rejection_account_health(status, &inspection).is_none()
+                && !capacity
+                && status == StatusCode::UNAUTHORIZED
                 && matches!(
                     self.config.accounts[account],
                     crate::config::AccountConfig::CodexHome { .. }
@@ -3253,6 +3248,27 @@ impl App {
             anyhow::bail!("upstream WebSocket handshake failed with {status}")
         }
         unreachable!()
+    }
+
+    /// Apply [`rejection_account_health`] to the router. Every dispatch lane records account
+    /// health through this, so a lane cannot quietly grow its own rule.
+    async fn record_rejection_health(
+        &self,
+        account: &str,
+        status: StatusCode,
+        headers: &hyper::HeaderMap,
+        inspection: &RejectionInspection,
+        credentials: &Credentials,
+    ) {
+        match rejection_account_health(status, inspection) {
+            Some(FailureKind::Quota) => {
+                self.router
+                    .quota_failure_for_owner(account, headers, &credentials.quota_owner())
+                    .await;
+            }
+            Some(FailureKind::Transient) => self.router.soft_failure(account).await,
+            _ => {}
+        }
     }
 
     async fn run_responses_direct(
@@ -3425,6 +3441,13 @@ impl App {
                         if parsed.as_ref().and_then(|value| value.get("type")).and_then(serde_json::Value::as_str)
                             == Some("response.create")
                         {
+                            // Check the limit before admission: the queue is bounded in frame
+                            // count, so an unchecked frame would let `MAX_QUEUED_DIRECT_CREATES`
+                            // oversized creates accumulate uncharged to any byte budget.
+                            if text.len() > self.config.proxy.max_request_bytes {
+                                send_direct_error(&mut client, "invalid_request_error", "response.create exceeds configured request limit").await?;
+                                continue;
+                            }
                             if awaiting_response_created.is_some() {
                                 if queued_creates.len() >= MAX_QUEUED_DIRECT_CREATES {
                                     send_direct_error(
@@ -3436,10 +3459,6 @@ impl App {
                                 } else {
                                     queued_creates.push_back(client_message);
                                 }
-                                continue;
-                            }
-                            if text.len() > self.config.proxy.max_request_bytes {
-                                send_direct_error(&mut client, "invalid_request_error", "response.create exceeds configured request limit").await?;
                                 continue;
                             }
                             let mut value = parsed.expect("response.create was checked");
@@ -4722,22 +4741,14 @@ impl App {
             let retry = inspection.permits_account_failure()
                 && (is_quota_status(response.status())
                     || is_selected_gateway_failure(response.status()));
-            if capacity || !inspection.permits_account_failure() {
-                // The body classification takes precedence over quota/gateway status.
-            } else if matches!(
+            self.record_rejection_health(
+                &selection.account_id,
                 response.status(),
-                StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYMENT_REQUIRED
-            ) {
-                self.router
-                    .quota_failure_for_owner(
-                        &selection.account_id,
-                        response.headers(),
-                        &credentials.quota_owner(),
-                    )
-                    .await;
-            } else if is_selected_gateway_failure(response.status()) {
-                self.router.soft_failure(&selection.account_id).await;
-            }
+                response.headers(),
+                &inspection,
+                &credentials,
+            )
+            .await;
             if retry && !forced_live && !hard_owner && attempt == 0 {
                 let alternate = self
                     .router
@@ -4896,6 +4907,29 @@ fn selected_subprotocol_is_offered(
         .get("sec-websocket-protocol")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|offered| offered.split(',').any(|value| value.trim() == selected))
+}
+
+/// Whether an upstream rejection means this account should stop taking new work, and why.
+///
+/// One rule for all three dispatch lanes. The body classification outranks the status line:
+/// a scoped refusal or a truncated inspection says nothing about the account, and capacity
+/// is its own backoff recorded by the caller, which may also need to tag the response.
+///
+/// Deliberately independent of whether *this* request can be retried. An account whose
+/// included quota is exhausted has to leave the rotation even when the request that
+/// discovered it is not replayable -- a `POST /files` 429 is just as much proof as a
+/// `/responses` one.
+fn rejection_account_health(
+    status: StatusCode,
+    inspection: &RejectionInspection,
+) -> Option<FailureKind> {
+    if inspection.failure == Some(FailureKind::Capacity) || !inspection.permits_account_failure() {
+        return None;
+    }
+    if is_quota_status(status) {
+        return Some(FailureKind::Quota);
+    }
+    is_selected_gateway_failure(status).then_some(FailureKind::Transient)
 }
 
 fn is_quota_status(status: StatusCode) -> bool {
@@ -5991,14 +6025,11 @@ fn direct_failure_turns(
             .map(|turn| turn.id())
             .collect();
     }
-    if failure.kind == FailureKind::PreviousResponseNotFound
-        && let Some(anchor) = anchor_hint
-    {
-        return protocol
-            .pending()
-            .filter(|turn| turn.previous_response_id() == Some(anchor))
-            .map(|turn| turn.id())
-            .collect();
+    // One attribution rule, owned by the state machine. This loop used to keep its own
+    // copy, which carried the same defect and could also name a different turn than the
+    // one `observe_upstream_event` settles for the very same frame.
+    if failure.kind == FailureKind::PreviousResponseNotFound {
+        return protocol.previous_response_miss_turns(anchor_hint);
     }
     if protocol.pending_len() == 1 {
         return protocol.pending().map(|turn| turn.id()).collect();
@@ -6762,6 +6793,68 @@ async fn collect_proxy_body_with_initial(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_health_is_recorded_independently_of_request_retryability() {
+        use super::*;
+        let complete = |failure| RejectionInspection {
+            failure,
+            complete: true,
+        };
+        // A quota rejection is proof about the account wherever it lands. This used to be
+        // gated on `retryable_http_status`, so a non-idempotent path recorded nothing and
+        // an exhausted account kept taking new sessions.
+        for path in ["/responses", "/files", "/files/file_1/uploaded"] {
+            assert_eq!(
+                rejection_account_health(StatusCode::TOO_MANY_REQUESTS, &complete(None)),
+                Some(FailureKind::Quota),
+                "quota on {path}"
+            );
+            assert!(
+                !retryable_http_status(StatusCode::TOO_MANY_REQUESTS, &Method::POST, path)
+                    || path == "/responses"
+            );
+        }
+        assert_eq!(
+            rejection_account_health(StatusCode::PAYMENT_REQUIRED, &complete(None)),
+            Some(FailureKind::Quota)
+        );
+        // The body classification still outranks the status line.
+        assert_eq!(
+            rejection_account_health(
+                StatusCode::TOO_MANY_REQUESTS,
+                &complete(Some(FailureKind::ScopedQuota))
+            ),
+            None
+        );
+        assert_eq!(
+            rejection_account_health(
+                StatusCode::TOO_MANY_REQUESTS,
+                &complete(Some(FailureKind::Capacity))
+            ),
+            None
+        );
+        // A truncated inspection cannot rule out a scoped refusal further into the body.
+        assert_eq!(
+            rejection_account_health(
+                StatusCode::TOO_MANY_REQUESTS,
+                &RejectionInspection {
+                    failure: None,
+                    complete: false,
+                }
+            ),
+            None
+        );
+        // Plain client errors say nothing about account health.
+        assert_eq!(
+            rejection_account_health(StatusCode::BAD_REQUEST, &complete(None)),
+            None
+        );
+        assert_eq!(
+            rejection_account_health(StatusCode::UNAUTHORIZED, &complete(None)),
+            None
+        );
+    }
+
     include!("capacity_tests.rs");
     include!("quota_identity_tests.rs");
     include!("scoped_quota_tests.rs");
