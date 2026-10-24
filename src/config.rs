@@ -56,8 +56,8 @@ fn default_auto_redeem_reset_buffer_hours() -> u64 {
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesWebsocketMode {
     Raw,
-    #[default]
     HttpBridge,
+    #[default]
     Direct,
 }
 
@@ -136,7 +136,7 @@ impl Default for ProxyConfig {
             max_bridge_sessions: default_bridge_sessions(),
             bridge_idle_seconds: default_bridge_idle_seconds(),
             bridge_admission_timeout_millis: default_bridge_admission_timeout_millis(),
-            responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
+            responses_websocket_mode: ResponsesWebsocketMode::Direct,
             replay_memory_bytes: default_replay_memory(),
             max_request_bytes: default_request_limit(),
             max_spool_bytes: default_global_spool(),
@@ -604,9 +604,21 @@ kind = "inbound"
     }
 
     #[test]
-    fn http_bridge_is_the_default_websocket_mode() {
+    fn direct_is_the_default_websocket_mode() {
         assert_eq!(
             ProxyConfig::default().responses_websocket_mode,
+            ResponsesWebsocketMode::Direct
+        );
+        assert_eq!(
+            toml::from_str::<ProxyConfig>("")
+                .unwrap()
+                .responses_websocket_mode,
+            ResponsesWebsocketMode::Direct
+        );
+        assert_eq!(
+            toml::from_str::<ProxyConfig>("responses_websocket_mode = \"http_bridge\"")
+                .unwrap()
+                .responses_websocket_mode,
             ResponsesWebsocketMode::HttpBridge
         );
         assert_eq!(ProxyConfig::default().max_bridge_sessions, 256);

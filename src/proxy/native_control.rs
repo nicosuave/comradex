@@ -16,6 +16,16 @@ pub(super) fn is_control(kind: Option<&str>) -> bool {
     matches!(kind, Some("response.steer" | "response.inject"))
 }
 
+pub(super) fn interrupt_response_id(value: &Value) -> std::result::Result<&str, &'static str> {
+    if value["mode"] != "discard_partial_items" {
+        return Err("unsupported response.interrupt mode");
+    }
+    value["response_id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 512)
+        .ok_or("response.interrupt requires a response identity")
+}
+
 pub(super) struct Candidate {
     response_id: String,
     settings: Value,
@@ -209,6 +219,13 @@ impl OwnedChain {
         }
         let now = tokio::time::Instant::now();
         match value["type"].as_str() {
+            Some("response.interrupt") => {
+                if !self.responses.contains(interrupt_response_id(value)?) {
+                    return Err("interrupted response does not belong to the owned socket");
+                }
+                // Cancel and Drain use the same wire frame. The client decides
+                // whether to require an ACK; do not invent a successor or clear calls.
+            }
             Some("response.steer" | "response.inject") => {
                 self.candidate.validate_control(value)?;
                 if value["type"] == "response.inject" {
