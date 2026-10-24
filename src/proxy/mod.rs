@@ -6025,14 +6025,11 @@ fn direct_failure_turns(
             .map(|turn| turn.id())
             .collect();
     }
-    if failure.kind == FailureKind::PreviousResponseNotFound
-        && let Some(anchor) = anchor_hint
-    {
-        return protocol
-            .pending()
-            .filter(|turn| turn.previous_response_id() == Some(anchor))
-            .map(|turn| turn.id())
-            .collect();
+    // One attribution rule, owned by the state machine. This loop used to keep its own
+    // copy, which carried the same defect and could also name a different turn than the
+    // one `observe_upstream_event` settles for the very same frame.
+    if failure.kind == FailureKind::PreviousResponseNotFound {
+        return protocol.previous_response_miss_turns(anchor_hint);
     }
     if protocol.pending_len() == 1 {
         return protocol.pending().map(|turn| turn.id()).collect();
