@@ -405,7 +405,7 @@ max_upgrades = 32
 max_bridge_sessions = 256
 bridge_idle_seconds = 900
 bridge_admission_timeout_millis = 2000
-responses_websocket_mode = "http_bridge"
+responses_websocket_mode = "direct"
 installation_secret = "{}"
 affinity_key = "{}"
 
@@ -1626,6 +1626,10 @@ mod tests {
         );
         assert_eq!(config.pools["default"].members, vec!["app"]);
         assert_eq!(config.pools["default"].preferred, None);
+        assert_eq!(
+            config.proxy.responses_websocket_mode,
+            comradex::config::ResponsesWebsocketMode::Direct
+        );
         for (index, home) in [
             None,
             Some(directory.path()),

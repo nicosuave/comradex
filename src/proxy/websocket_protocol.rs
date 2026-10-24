@@ -379,6 +379,7 @@ pub struct ProtocolState {
     next_turn_id: u64,
     pending: VecDeque<PendingTurn>,
     response_index: HashMap<String, TurnId>,
+    requires_original_socket: bool,
 }
 
 impl ProtocolState {
@@ -388,7 +389,18 @@ impl ProtocolState {
             next_turn_id: 1,
             pending: VecDeque::new(),
             response_index: HashMap::new(),
+            requires_original_socket: false,
         })
+    }
+
+    /// Native interruption belongs to the physical socket even after a terminal.
+    /// Acknowledgements can arrive later, and neither controls nor their state can replay.
+    pub fn pin_socket(&mut self) {
+        self.requires_original_socket = true;
+    }
+
+    pub fn requires_original_socket(&self) -> bool {
+        self.requires_original_socket
     }
 
     pub fn pending_len(&self) -> usize {
@@ -546,6 +558,9 @@ impl ProtocolState {
         let Some(turn) = self.turn(id) else {
             return Err(ReplayRefusal::UnknownTurn);
         };
+        if self.requires_original_socket {
+            return Err(ReplayRefusal::HardContinuity);
+        }
         if self.pending.len() != 1 {
             return Err(ReplayRefusal::MultiplePendingTurns);
         }

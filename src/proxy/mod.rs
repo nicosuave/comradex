@@ -2551,10 +2551,12 @@ impl App {
                         continue;
                     }
                     if frame_type != Some("response.create") {
+                        let needs_socket = native_control::is_control(frame_type)
+                            || frame_type == Some("response.interrupt");
                         send_ws_error(
                             &control,
-                            if native_control::is_control(frame_type) { "native_control_unsupported" } else { "invalid_request_error" },
-                            if native_control::is_control(frame_type) {
+                            if needs_socket { "native_control_unsupported" } else { "invalid_request_error" },
+                            if needs_socket {
                                 "native Responses controls require responses_websocket_mode = direct or raw; HTTP bridge cannot preserve the upstream socket"
                             } else { "expected response.create" },
                         )
@@ -3357,6 +3359,43 @@ impl App {
                     let client_message = client_message.context("read downstream Responses frame")?;
                     if let Message::Text(text) = &client_message {
                         let parsed = serde_json::from_str::<serde_json::Value>(text.as_str()).ok();
+                        if parsed.as_ref().is_some_and(|value| value["type"] == "response.interrupt") {
+                            if text.len() > self.config.proxy.max_request_bytes {
+                                send_direct_error(
+                                    &mut client,
+                                    "native_control_limit",
+                                    "native frame exceeds configured request limit",
+                                ).await?;
+                                continue;
+                            }
+                            let response_id = match native_control::interrupt_response_id(parsed.as_ref().unwrap()) {
+                                Ok(id) => id,
+                                Err(reason) => {
+                                    send_direct_error(&mut client, "native_control_invalid", reason).await?;
+                                    continue;
+                                }
+                            };
+                            let owns_response = protocol.pending()
+                                .any(|turn| turn.response_id() == Some(response_id))
+                                || native_candidate.as_ref()
+                                    .is_some_and(|candidate| candidate.response_id() == response_id);
+                            if !owns_response {
+                                send_direct_error(
+                                    &mut client,
+                                    "native_control_invalid",
+                                    "interrupted response does not belong to this socket",
+                                ).await?;
+                                continue;
+                            }
+                            self.flush_direct_lifecycle(
+                                &mut protocol, &mut turns, &mut client, &account, None, true,
+                            ).await?;
+                            // Pin before dispatch: an ACK can follow the terminal, and
+                            // Drain intentionally permits failed or missing ACKs.
+                            protocol.pin_socket();
+                            upstream.send(client_message).await?;
+                            continue;
+                        }
                         if native_control::is_control(parsed.as_ref().and_then(|value| value.get("type")).and_then(serde_json::Value::as_str))
                             || parsed.as_ref().is_some_and(|value| native_candidate.as_ref().is_some_and(|candidate| candidate.is_result_continuation(value))) {
                             if protocol.pending_len() > 1 || awaiting_response_created.is_some() || !queued_creates.is_empty() {
@@ -3434,11 +3473,12 @@ impl App {
                             };
                             let rejected_socket = self.auth.ensure_bearer_usable(
                                 &self.config.accounts[&account], &upstream_credentials).is_err();
-                            if protocol.pending_len() > 0 && (route.account_id != account || rejected_socket) {
+                            if (protocol.pending_len() > 0 || protocol.requires_original_socket())
+                                && (route.account_id != account || rejected_socket) {
                                 send_direct_error(
                                     &mut client,
                                     "continuity_owner_conflict",
-                                    "cannot switch upstream account while other Responses turns are pending",
+                                    "cannot replace the upstream socket while Responses turns or native controls own it; open a new connection",
                                 )
                                 .await?;
                                 continue;
@@ -4285,7 +4325,8 @@ impl App {
             }
             turns.remove(&action.turn_id);
         }
-        if plan.downstream == DownstreamEndAction::Close1011 {
+        if plan.downstream == DownstreamEndAction::Close1011 || protocol.requires_original_socket()
+        {
             let _ = client
                 .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
                     code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error,
@@ -7859,6 +7900,8 @@ mod tests {
             proxy: ProxyConfig {
                 max_bridge_sessions,
                 bridge_admission_timeout_millis,
+                upstream: "http://127.0.0.1:4999/backend-api/codex".into(),
+                responses_websocket_mode: ResponsesWebsocketMode::HttpBridge,
                 installation_secret: "0123456789abcdef".into(),
                 affinity_key: "0123456789abcdef0123456789abcdef".into(),
                 state_dir: Some(dir.join("state")),
@@ -7885,7 +7928,7 @@ mod tests {
             .unwrap(),
         );
         let router = Arc::new(Router::new(&config, affinity));
-        App::new(config, router, Arc::new(Stats::default())).unwrap()
+        App::new_unvalidated(config, router, Arc::new(Stats::default())).unwrap()
     }
 
     fn pending_sse_response(

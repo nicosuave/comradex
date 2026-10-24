@@ -162,6 +162,213 @@ where
 }
 
 #[tokio::test]
+async fn interruption_preserves_items_usage_and_same_socket_continuation() {
+    // Codex Cancel and Drain send identical frames. Drain also accepts rejected
+    // or missing acknowledgements; the proxy must preserve the backend's events.
+    for (acknowledgement, terminal_first) in [
+        (Some("response.interrupt.accepted"), false),
+        (Some("response.interrupt.accepted"), true),
+        (Some("response.interrupt.failed"), false),
+        (None, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = backend().await;
+        let (address, task, _) = start_two_account_proxy(
+            dir.path(),
+            format!("http://{}/backend-api/codex", backend.address),
+        )
+        .await;
+        let mut socket = connect_test_websocket(address).await;
+        socket
+            .send(Message::Text(
+                r#"{"type":"response.create","model":"native","input":[]}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let (physical, _) = receive(&mut backend).await;
+        emit(
+            &backend,
+            json!({"type":"response.created","response":{"id":"parent"}}),
+        );
+        assert_eq!(event(&mut socket).await["type"], "response.created");
+        let finalized_call = json!({"type":"response.output_item.done","response_id":"parent","item":{"type":"function_call","call_id":"call_1","name":"save","arguments":"{}"}});
+        emit(&backend, finalized_call.clone());
+        assert_eq!(event(&mut socket).await, finalized_call);
+
+        let interrupt = r#"{ "type":"response.interrupt", "response_id":"parent", "mode":"discard_partial_items" }"#;
+        socket.send(Message::Text(interrupt.into())).await.unwrap();
+        assert_eq!(receive(&mut backend).await, (physical, interrupt.into()));
+        let interrupted_item = json!({"type":"response.output_item.interrupted","response_id":"parent","item_id":"partial","output_index":1});
+        let terminal = json!({"type":"response.incomplete","response":{"id":"parent","status":"incomplete","incomplete_details":{"reason":"interrupted"},"output":[finalized_call["item"].clone()],"usage":{"input_tokens":40,"output_tokens":2,"total_tokens":42}}});
+        let mut events = vec![interrupted_item, terminal];
+        if let Some(kind) = acknowledgement {
+            let ack = json!({"type":kind,"response_id":"parent"});
+            events.insert(if terminal_first { events.len() } else { 0 }, ack);
+        }
+        for expected in events {
+            emit(&backend, expected.clone());
+            assert_eq!(event(&mut socket).await, expected);
+        }
+        // Ordinary continuation may change settings and carry the finalized
+        // tool's result; it must not enter steer/inject's stricter OwnedChain.
+        let continuation = r#"{"type":"response.create","model":"native","temperature":0.5,"previous_response_id":"parent","input":[{"type":"function_call_output","call_id":"call_1","output":"saved"}]}"#;
+        socket
+            .send(Message::Text(continuation.into()))
+            .await
+            .unwrap();
+        let (continued_socket, received) = receive(&mut backend).await;
+        assert_eq!(continued_socket, physical);
+        assert_eq!(
+            serde_json::from_str::<Value>(&received).unwrap(),
+            serde_json::from_str::<Value>(continuation).unwrap()
+        );
+        emit(
+            &backend,
+            json!({"type":"response.created","response":{"id":"continued"}}),
+        );
+        emit(
+            &backend,
+            json!({"type":"response.completed","response":{"id":"continued","output":[]}}),
+        );
+        assert_eq!(event(&mut socket).await["type"], "response.created");
+        assert_eq!(event(&mut socket).await["type"], "response.completed");
+        assert_eq!(backend.connections.load(Ordering::SeqCst), 1);
+        socket.close(None).await.unwrap();
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn interruption_validates_owner_and_mode_without_forwarding_invalid_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut backend = backend().await;
+    let (address, task, _) = start_two_account_proxy(
+        dir.path(),
+        format!("http://{}/backend-api/codex", backend.address),
+    )
+    .await;
+    let mut socket = connect_test_websocket(address).await;
+    socket
+        .send(Message::Text(
+            r#"{"type":"response.create","input":[]}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let (physical, _) = receive(&mut backend).await;
+    emit(
+        &backend,
+        json!({"type":"response.created","response":{"id":"parent"}}),
+    );
+    assert_eq!(event(&mut socket).await["type"], "response.created");
+    for invalid in [
+        json!({"type":"response.interrupt","mode":"discard_partial_items"}),
+        json!({"type":"response.interrupt","response_id":"foreign","mode":"discard_partial_items"}),
+        json!({"type":"response.interrupt","response_id":"parent","mode":"unknown"}),
+    ] {
+        socket
+            .send(Message::Text(invalid.to_string().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            event(&mut socket).await["error"]["type"],
+            "native_control_invalid"
+        );
+        assert!(backend.received.try_recv().is_err());
+    }
+    let valid =
+        r#"{"type":"response.interrupt","response_id":"parent","mode":"discard_partial_items"}"#;
+    socket.send(Message::Text(valid.into())).await.unwrap();
+    assert_eq!(receive(&mut backend).await, (physical, valid.into()));
+    socket.close(None).await.unwrap();
+    task.abort();
+}
+
+#[tokio::test]
+async fn interruption_pins_socket_after_terminal_even_without_acknowledgement() {
+    for capacity_failure in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = backend().await;
+        let (address, task, router) = start_two_account_proxy(
+            dir.path(),
+            format!("http://{}/backend-api/codex", backend.address),
+        )
+        .await;
+        let mut socket = connect_test_websocket(address).await;
+        socket
+            .send(Message::Text(
+                r#"{"type":"response.create","input":[]}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let (physical, _) = receive(&mut backend).await;
+        emit(
+            &backend,
+            json!({"type":"response.created","response":{"id":"parent"}}),
+        );
+        assert_eq!(event(&mut socket).await["type"], "response.created");
+        socket.send(Message::Text(r#"{"type":"response.interrupt","response_id":"parent","mode":"discard_partial_items"}"#.into())).await.unwrap();
+        assert_eq!(receive(&mut backend).await.0, physical);
+        emit(
+            &backend,
+            json!({"type":"response.incomplete","response":{"id":"parent","incomplete_details":{"reason":"interrupted"}}}),
+        );
+        assert_eq!(event(&mut socket).await["type"], "response.incomplete");
+
+        // There are no pending turns now, but an interruption ACK can still be
+        // in flight. A fresh create must not gain a new socket's replay budget.
+        socket
+            .send(Message::Text(
+                r#"{"type":"response.create","input":[]}"#.into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(receive(&mut backend).await.0, physical);
+        if capacity_failure {
+            for _ in 0..2 {
+                router.capacity_failure("a").await;
+            }
+            let terminal = json!({"type":"error","error":{"code":"server_is_overloaded","message":"capacity"}});
+            emit(&backend, terminal.clone());
+            assert_eq!(event(&mut socket).await, terminal);
+            assert!(
+                router.routing_snapshot().await.account_states["a"]
+                    .capacity_backoff_until_unix
+                    .is_some()
+            );
+            let cohort = router.affinity.key("prompt-cache:other-account");
+            router.bind(cohort, "b").await;
+            socket
+                .send(Message::Text(
+                    r#"{"type":"response.create","prompt_cache_key":"other-account","input":[]}"#
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                event(&mut socket).await["error"]["type"],
+                "continuity_owner_conflict"
+            );
+            assert!(backend.received.try_recv().is_err());
+        }
+        backend.send.send(Message::Close(None)).unwrap();
+        if !capacity_failure {
+            assert_eq!(
+                event(&mut socket).await["response"]["error"]["code"],
+                "stream_incomplete"
+            );
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), socket.next())
+                .await
+                .unwrap(),
+            Some(Ok(Message::Close(_))) | None
+        ));
+        assert_eq!(backend.connections.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn steering_successor_and_saved_results_keep_exact_socket_and_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let mut backend = backend().await;
@@ -255,6 +462,23 @@ async fn steering_successor_and_saved_results_keep_exact_socket_and_bytes() {
     );
     assert_eq!(event(&mut socket).await["type"], "response.created");
     assert_eq!(router.affinity.get(&cohort).await.unwrap().account_id, "b");
+    let interrupt =
+        r#"{"type":"response.interrupt","response_id":"continued","mode":"discard_partial_items"}"#;
+    socket.send(Message::Text(interrupt.into())).await.unwrap();
+    assert_eq!(receive(&mut backend).await, (physical, interrupt.into()));
+    emit(
+        &backend,
+        json!({"type":"response.interrupt.accepted","response_id":"continued"}),
+    );
+    emit(
+        &backend,
+        json!({"type":"response.incomplete","response":{"id":"continued","incomplete_details":{"reason":"interrupted"}}}),
+    );
+    assert_eq!(
+        event(&mut socket).await["type"],
+        "response.interrupt.accepted"
+    );
+    assert_eq!(event(&mut socket).await["type"], "response.incomplete");
     assert_eq!(backend.connections.load(Ordering::SeqCst), 1);
     socket.close(None).await.unwrap();
     task.abort();
@@ -487,7 +711,7 @@ async fn bridge_controls_explicitly_require_direct_or_raw() {
     )
     .await;
     let mut socket = connect_test_websocket(address).await;
-    for kind in ["response.steer", "response.inject"] {
+    for kind in ["response.steer", "response.inject", "response.interrupt"] {
         socket
             .send(Message::Text(json!({"type":kind}).to_string().into()))
             .await

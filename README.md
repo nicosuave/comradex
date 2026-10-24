@@ -333,7 +333,7 @@ model_accounts = { "gpt-5.5" = "personal", "gpt-5.6-sol" = "work" }
 
 For Daybreak, newer Codex clients send a base model with `access_programs.cyber` set to `"daybreak_blue"` or `"daybreak_red"`. These requests prefer the `gpt-daybreak-blue-latest` or `gpt-daybreak-red-latest` pin respectively, falling back to the base model's pin when the Daybreak pin is unset. Existing Daybreak pins therefore cover both request formats; standard requests keep their model-specific or normal pool routing. The request body is forwarded unchanged.
 
-Model-specific pins require the default `responses_websocket_mode = "http_bridge"` or `"direct"`. Configuration with model-specific pins and `"raw"` mode is rejected because raw WebSocket traffic cannot be inspected for model IDs. A model listing pin alone is compatible with every WebSocket mode.
+Model-specific pins require `responses_websocket_mode = "direct"` (the default) or `"http_bridge"`. Configuration with model-specific pins and `"raw"` mode is rejected because raw WebSocket traffic cannot be inspected for model IDs. A model listing pin alone is compatible with every WebSocket mode.
 
 The equivalent manual configuration is:
 
@@ -559,11 +559,20 @@ Comradex terminates TLS and uses its own HTTP client, so framing, header order, 
 
 Select behavior with `proxy.responses_websocket_mode`:
 
-- `http_bridge` is the default. It accepts downstream WebSocket frames and sends each `response.create` through the account-aware HTTP/SSE pipeline. Frame-level conversation metadata takes precedence over connection-level session and cache hints, so a new conversation on an existing downstream socket receives fresh quota-aware routing. Turn state, previous responses, and owned files remain pinned to their account. The bridge supersedes an older in-flight turn when a new create arrives and converts bounded, validated SSE or JSON lifecycle events back into WebSocket text frames.
+- `http_bridge` is an optional compatibility mode. It accepts downstream WebSocket frames and sends each `response.create` through the account-aware HTTP/SSE pipeline. Frame-level conversation metadata takes precedence over connection-level session and cache hints, so a new conversation on an existing downstream socket receives fresh quota-aware routing. Turn state, previous responses, and owned files remain pinned to their account. The bridge supersedes an older in-flight turn when a new create arrives and converts bounded, validated SSE or JSON lifecycle events back into WebSocket text frames.
 - `raw` preserves the original handshake-pinned byte relay. One account owns the socket, and Comradex does not inspect its frames, so this mode cannot rotate accounts between conversations on a reused socket.
-- `direct` keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend. If safe internal replay is unavailable, it preserves Codex's canonical `previous_response_not_found` retry classifier while removing account-scoped details.
+- `direct` is the default. It keeps upstream WebSocket transport while routing and tracking each `response.create` frame independently. It supports multiplexed, out-of-order turns, reconnects only before visible output, refreshes an expired credential on the same account before considering one alternate, and can remove a stale `previous_response_id` only when the request contains a verified self-contained full resend. If safe internal replay is unavailable, it preserves Codex's canonical `previous_response_not_found` retry classifier while removing account-scoped details.
 
 Direct mode uses the explicit refresh-then-alternate sequence above. Live Voice upgrades are separate from these modes and remain raw, call-bound relays.
+
+Codex interruption uses `response.interrupt` with `mode: "discard_partial_items"`. Direct mode
+forwards this control, acknowledgements, finalized items, interrupted items, and terminal usage
+unchanged. Once an interrupt is dispatched, the connection keeps its original upstream socket;
+later creates cannot replace that socket or replay on another connection. The client decides
+whether to require an acknowledgement before continuing. HTTP bridge mode cannot implement
+upstream interruption and returns `native_control_unsupported` with guidance to use direct or raw
+mode. Existing configurations explicitly selecting `http_bridge` must change that setting and
+restart the daemon to use native interruption.
 
 Direct mode also supports native `response.steer`, `response.inject`, and multi-agent result
 continuations on their original physical upstream socket. Once a control chain starts, reconnect
