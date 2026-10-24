@@ -246,6 +246,41 @@ impl AccountRuntime {
         self.needs_login || self.bearer_unusable
     }
 
+    /// Conditions that disqualify an account from *any* work, bound or fresh. This is the
+    /// single source of truth for every selector and for `validate_selection`: when a
+    /// selector and its validator disagree, the selector hands back a selection its own
+    /// validator rejects, and fail-closed callers turn that into a 503.
+    fn hard_block(&self, now: Instant, wall_now: DateTime<Utc>) -> Option<SelectionStaleReason> {
+        if self.auth_unavailable() {
+            return Some(SelectionStaleReason::NeedsLogin);
+        }
+        if self.login_in_progress {
+            return Some(SelectionStaleReason::LoginInProgress);
+        }
+        if self.quota_blocked(now, wall_now) {
+            return Some(SelectionStaleReason::Quota);
+        }
+        None
+    }
+
+    /// The short transient cooldown `soft_failure` sets. It keeps *fresh* placements off the
+    /// account, but bound work stays put: rebinding a warm cohort over a few seconds of
+    /// transient trouble throws away more than it saves.
+    fn avoided(&self, now: Instant) -> bool {
+        self.avoid_until.is_some_and(|until| until > now)
+    }
+
+    /// Whether this account may take work of the given kind right now.
+    fn dispatch_block(
+        &self,
+        bound: bool,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Option<SelectionStaleReason> {
+        self.hard_block(now, wall_now)
+            .or_else(|| (!bound && self.avoided(now)).then_some(SelectionStaleReason::Avoid))
+    }
+
     fn usage_at(&self, now: DateTime<Utc>) -> Option<u8> {
         self.usage_windows
             .values()
@@ -608,12 +643,11 @@ impl Router {
             let eligible = exclude != Some(binding.account_id.as_str())
                 && pool.members.contains(&binding.account_id)
                 && accounts.get(&binding.account_id).is_some_and(|a| {
+                    // Keep warm cohorts past the soft switch threshold and through a
+                    // transient cooldown, but leave accounts whose included quota is
+                    // exhausted or whose credential is unusable.
                     binding_epoch == Some(binding.account_generation)
-                        && !a.auth_unavailable()
-                        && !a.login_in_progress
-                        // Keep warm cohorts past the soft switch threshold, but
-                        // leave accounts whose included quota is exhausted.
-                        && !a.quota_blocked(now, wall_now)
+                        && a.dispatch_block(true, now, wall_now).is_none()
                 });
             if eligible {
                 let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
@@ -631,12 +665,9 @@ impl Router {
         let is_preserved = |id: &str| preserved.as_deref() == Some(id);
         let eligible = |id: &str| {
             exclude != Some(id)
-                && accounts.get(id).is_some_and(|a| {
-                    !a.auth_unavailable()
-                        && !a.login_in_progress
-                        && !a.quota_blocked(now, wall_now)
-                        && a.avoid_until.is_none_or(|v| v <= now)
-                })
+                && accounts
+                    .get(id)
+                    .is_some_and(|a| a.dispatch_block(false, now, wall_now).is_none())
         };
         // A preserved account with no surplus over an even pace waits until nothing else is
         // eligible; its surplus would otherwise expire unused.
@@ -876,38 +907,20 @@ impl Router {
         let now = Instant::now();
         let wall_now = Utc::now();
         // Snapshot runtime state without holding the mutex across affinity I/O below.
-        struct RuntimeProbe {
-            known: bool,
-            needs_login: bool,
-            login_in_progress: bool,
-            quota_blocked: bool,
-            avoid_blocked: bool,
-        }
+        // Evaluated through the same predicate the selectors use, against the same
+        // `selection.bound` kind, so this can never reject what a selector just returned.
         let probe = {
             let mut accounts = self.account_runtimes().await;
             for runtime in accounts.values_mut() {
                 reconcile_runtime(runtime, now, wall_now);
             }
-            match accounts.get(&selection.account_id) {
-                Some(runtime) => RuntimeProbe {
-                    known: true,
-                    needs_login: runtime.auth_unavailable(),
-                    login_in_progress: runtime.login_in_progress,
-                    quota_blocked: runtime.quota_blocked(now, wall_now),
-                    avoid_blocked: runtime.avoid_until.is_some_and(|until| until > now),
-                },
-                None => RuntimeProbe {
-                    known: false,
-                    needs_login: false,
-                    login_in_progress: false,
-                    quota_blocked: false,
-                    avoid_blocked: false,
-                },
-            }
+            accounts
+                .get(&selection.account_id)
+                .map(|runtime| runtime.dispatch_block(selection.bound, now, wall_now))
         };
-        if !probe.known {
+        let Some(block) = probe else {
             return Err(SelectionStaleReason::UnknownAccount);
-        }
+        };
         if !pool
             .members
             .iter()
@@ -915,17 +928,8 @@ impl Router {
         {
             return Err(SelectionStaleReason::NotPoolMember);
         }
-        if probe.needs_login {
-            return Err(SelectionStaleReason::NeedsLogin);
-        }
-        if probe.login_in_progress {
-            return Err(SelectionStaleReason::LoginInProgress);
-        }
-        if probe.quota_blocked {
-            return Err(SelectionStaleReason::Quota);
-        }
-        if probe.avoid_blocked {
-            return Err(SelectionStaleReason::Avoid);
+        if let Some(reason) = block {
+            return Err(reason);
         }
         // Epoch check catches `invalidate_account` (auth failure / reauth) mid-resolve.
         let current_epoch = self.affinity.account_epoch(&selection.account_id).await;
@@ -972,10 +976,7 @@ impl Router {
                         id != &selection.account_id
                             && selection.excluded_account.as_ref() != Some(id)
                             && accounts.get(id).is_some_and(|runtime| {
-                                !runtime.auth_unavailable()
-                                    && !runtime.login_in_progress
-                                    && !runtime.quota_blocked(now, wall_now)
-                                    && runtime.avoid_until.is_none_or(|until| until <= now)
+                                runtime.dispatch_block(false, now, wall_now).is_none()
                             })
                     });
                 if has_alternative {
@@ -990,10 +991,7 @@ impl Router {
                 let preferred_eligible = {
                     let accounts = self.account_runtimes().await;
                     accounts.get(&preferred_id).is_some_and(|runtime| {
-                        !runtime.auth_unavailable()
-                            && !runtime.login_in_progress
-                            && !runtime.quota_blocked(now, wall_now)
-                            && runtime.avoid_until.is_none_or(|until| until <= now)
+                        runtime.dispatch_block(false, now, wall_now).is_none()
                             && (!runtime.capacity.active(now)
                                 || accounts
                                     .get(&selection.account_id)
@@ -1039,29 +1037,17 @@ impl Router {
             for runtime in accounts.values_mut() {
                 reconcile_runtime(runtime, now, wall_now);
             }
-            accounts.get(account).map(|runtime| {
-                (
-                    runtime.auth_unavailable(),
-                    runtime.login_in_progress,
-                    runtime.quota_blocked(now, wall_now),
-                    runtime.avoid_until.is_some_and(|until| until > now),
-                )
-            })
+            // This path carries no bound/fresh context, so it keeps the stricter fresh-work
+            // rule it has always applied and refuses an account in a transient cooldown.
+            accounts
+                .get(account)
+                .map(|runtime| runtime.dispatch_block(false, now, wall_now))
         };
-        let Some((needs_login, login_in_progress, quota_blocked, avoid_blocked)) = probe else {
+        let Some(block) = probe else {
             return Err(SelectionStaleReason::UnknownAccount);
         };
-        if needs_login {
-            return Err(SelectionStaleReason::NeedsLogin);
-        }
-        if login_in_progress {
-            return Err(SelectionStaleReason::LoginInProgress);
-        }
-        if quota_blocked {
-            return Err(SelectionStaleReason::Quota);
-        }
-        if avoid_blocked {
-            return Err(SelectionStaleReason::Avoid);
+        if let Some(reason) = block {
+            return Err(reason);
         }
         if let Some(expected) = expected_generation {
             let current = self.affinity.account_epoch(account).await;
@@ -1129,15 +1115,17 @@ impl Router {
         let wall_now = Utc::now();
         let mut accounts = self.account_runtimes().await;
         if let Some(runtime) = accounts.get_mut(account) {
-            reconcile_expired_quota(runtime, now, wall_now);
+            // Full reconciliation, as the other selectors do: an elapsed request-time auth
+            // retry window must not keep a hard owner ineligible here while
+            // `select_with_preference` and `validate_selection` already consider it usable.
+            reconcile_runtime(runtime, now, wall_now);
         }
+        // A hard owner is bound work: it tolerates a transient cooldown rather than failing
+        // closed on it.
         let eligible = pool.members.iter().any(|v| v == account)
-            && accounts.get(account).is_some_and(|a| {
-                !a.auth_unavailable()
-                    && !a.login_in_progress
-                    && !a.quota_blocked(now, wall_now)
-                    && a.avoid_until.is_none_or(|v| v <= now)
-            });
+            && accounts
+                .get(account)
+                .is_some_and(|a| a.dispatch_block(true, now, wall_now).is_none());
         if !eligible {
             return None;
         }
@@ -3286,6 +3274,65 @@ mod tests {
                 Err(SelectionStaleReason::EpochChanged) | Err(SelectionStaleReason::BindingChanged)
             ),
             "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bound_selection_survives_a_transient_cooldown_on_its_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, affinity, router, pool) = stale_test_router(dir.path());
+        let key = affinity.key("warm-cohort");
+        // The first selection on a new cohort is fresh and creates the binding; the next
+        // one on that key is the bound case under test.
+        let first = router
+            .select("default", &pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        let bound = router
+            .select("default", &pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        assert!(bound.bound);
+        assert_eq!(bound.account_id, first.account_id);
+
+        // A 5s transient cooldown must not evict a warm cohort: the selector keeps it and
+        // the validator has to agree, or fail-closed callers return 503 for a blip.
+        router.soft_failure(&bound.account_id).await;
+        assert!(
+            router
+                .validate_selection(&bound, "default", &pool)
+                .await
+                .is_ok()
+        );
+        let reselected = router
+            .select("default", &pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(reselected.account_id, bound.account_id);
+        assert!(reselected.bound);
+        // A hard owner is bound work too.
+        assert!(
+            router
+                .select_exact(&pool, &bound.account_id)
+                .await
+                .is_some()
+        );
+
+        // Fresh work still avoids it while the cooldown holds.
+        let fresh = router.select("default", &pool, None, None).await.unwrap();
+        assert_ne!(fresh.account_id, bound.account_id);
+
+        // A hard block still disqualifies bound work.
+        router.reauth_required(&bound.account_id).await;
+        assert_eq!(
+            router.validate_selection(&bound, "default", &pool).await,
+            Err(SelectionStaleReason::NeedsLogin)
+        );
+        assert!(
+            router
+                .select_exact(&pool, &bound.account_id)
+                .await
+                .is_none()
         );
     }
 
