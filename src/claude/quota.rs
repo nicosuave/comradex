@@ -31,7 +31,9 @@ pub fn snapshot(headers: &HeaderMap, now: u64) -> Option<UsageSnapshot> {
         let used = header(headers, &format!("{prefix}-utilization"))
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .map(|v| (v * 100.0).ceil().min(100.0) as u8);
+            // Routing treats 100 as confirmed exhaustion, so remaining allowance never rounds
+            // up to it. Matches the JSON parser in `claude::maintenance`.
+            .map(|v| (v * 100.0).floor().min(100.0) as u8);
         if used.is_none() && status != Some("rejected") {
             continue;
         }
@@ -109,5 +111,23 @@ mod tests {
         let value = snapshot(&headers, 100).unwrap();
         assert_eq!(value.windows["5h"].used_percent, Some(45));
         assert_eq!(value.windows.len(), 1);
+    }
+    #[test]
+    fn remaining_allowance_never_rounds_up_to_confirmed_exhaustion() {
+        // Routing treats 100 as confirmed exhaustion and will block the account and
+        // permanently reassign portable work, so only a genuine 1.0 may report 100.
+        for (utilization, expected) in [("0.996", 99), ("0.991", 99), ("0.9999", 99), ("1", 100)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "anthropic-ratelimit-unified-5h-utilization",
+                utilization.parse().unwrap(),
+            );
+            let value = snapshot(&headers, 100).unwrap();
+            assert_eq!(
+                value.windows["5h"].used_percent,
+                Some(expected),
+                "utilization {utilization}"
+            );
+        }
     }
 }

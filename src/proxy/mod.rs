@@ -3425,6 +3425,13 @@ impl App {
                         if parsed.as_ref().and_then(|value| value.get("type")).and_then(serde_json::Value::as_str)
                             == Some("response.create")
                         {
+                            // Check the limit before admission: the queue is bounded in frame
+                            // count, so an unchecked frame would let `MAX_QUEUED_DIRECT_CREATES`
+                            // oversized creates accumulate uncharged to any byte budget.
+                            if text.len() > self.config.proxy.max_request_bytes {
+                                send_direct_error(&mut client, "invalid_request_error", "response.create exceeds configured request limit").await?;
+                                continue;
+                            }
                             if awaiting_response_created.is_some() {
                                 if queued_creates.len() >= MAX_QUEUED_DIRECT_CREATES {
                                     send_direct_error(
@@ -3436,10 +3443,6 @@ impl App {
                                 } else {
                                     queued_creates.push_back(client_message);
                                 }
-                                continue;
-                            }
-                            if text.len() > self.config.proxy.max_request_bytes {
-                                send_direct_error(&mut client, "invalid_request_error", "response.create exceeds configured request limit").await?;
                                 continue;
                             }
                             let mut value = parsed.expect("response.create was checked");

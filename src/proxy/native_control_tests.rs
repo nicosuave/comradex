@@ -12,6 +12,18 @@ async fn start_two_account_proxy(
     tokio::task::JoinHandle<Result<()>>,
     Arc<Router>,
 ) {
+    start_two_account_proxy_with_request_limit(dir, upstream, None).await
+}
+
+async fn start_two_account_proxy_with_request_limit(
+    dir: &Path,
+    upstream: String,
+    max_request_bytes: Option<usize>,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<Result<()>>,
+    Arc<Router>,
+) {
     let mut accounts = BTreeMap::new();
     for name in ["a", "b"] {
         let path = dir.join(name);
@@ -36,6 +48,8 @@ async fn start_two_account_proxy(
             installation_secret: "0123456789abcdef".into(),
             affinity_key: "0123456789abcdef0123456789abcdef".into(),
             state_dir: Some(dir.join("state")),
+            max_request_bytes: max_request_bytes
+                .unwrap_or_else(|| ProxyConfig::default().max_request_bytes),
             ..Default::default()
         },
         listeners: BTreeMap::from([("default".into(), listener.clone())]),
@@ -159,6 +173,48 @@ where
         .into_text()
         .unwrap();
     serde_json::from_str(&text).unwrap()
+}
+
+#[tokio::test]
+async fn an_oversized_create_is_rejected_before_it_can_be_queued() {
+    // The queue is bounded in frame count, so admitting an unchecked frame would let
+    // MAX_QUEUED_DIRECT_CREATES oversized creates accumulate against no byte budget.
+    let dir = tempfile::tempdir().unwrap();
+    let mut backend = backend().await;
+    let (address, task, _) = start_two_account_proxy_with_request_limit(
+        dir.path(),
+        format!("http://{}/backend-api/codex", backend.address),
+        Some(4096),
+    )
+    .await;
+    let mut socket = connect_test_websocket(address).await;
+    socket
+        .send(Message::Text(
+            r#"{"type":"response.create","input":[]}"#.into(),
+        ))
+        .await
+        .unwrap();
+    receive(&mut backend).await;
+    // The first create is still awaiting `response.created`, so the next one takes the
+    // queueing branch. It must be refused on size rather than parked.
+    let oversized = serde_json::json!({
+        "type": "response.create",
+        "input": [{"type": "message", "role": "user", "content": "x".repeat(8192)}]
+    })
+    .to_string();
+    socket.send(Message::Text(oversized.into())).await.unwrap();
+    let error = event(&mut socket).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds configured request limit"),
+        "unexpected error: {error}"
+    );
+    assert!(backend.received.try_recv().is_err());
+    socket.close(None).await.unwrap();
+    task.abort();
 }
 
 #[tokio::test]
