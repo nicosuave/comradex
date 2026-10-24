@@ -2,7 +2,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
-    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -214,23 +213,33 @@ fn hash_component(key: &[u8; 32], domain: &[u8], raw: &str) -> String {
 }
 
 fn open_database(path: &Path) -> Result<Connection> {
-    let existed = path.exists();
+    // An unusable database must never be what stops the daemon serving every pool. This used
+    // to be a hard `ensure!`, so a crash between creating the file and committing the schema
+    // -- the file and its WAL header are written first -- left `user_version = 0` with no
+    // tables and bricked every later start until the file was deleted by hand.
+    if path.exists() {
+        let connection = Connection::open(path)
+            .with_context(|| format!("open context database {}", path.display()))?;
+        crate::sqlite_store::configure(&connection, "full")?;
+        match crate::sqlite_store::user_version(&connection)? {
+            version if version == DATABASE_VERSION => return Ok(connection),
+            // Nothing was ever committed: no schema, so no state to lose.
+            0 => {
+                drop(connection);
+                crate::sqlite_store::discard_database(path, "context");
+            }
+            // A version this build does not understand, most likely a downgrade. Keep the
+            // file rather than deleting state this daemon did not write.
+            _ => {
+                drop(connection);
+                crate::sqlite_store::quarantine_database(path, "context")?;
+            }
+        }
+    }
+
     let mut connection = Connection::open(path)
         .with_context(|| format!("open context database {}", path.display()))?;
-    connection.busy_timeout(Duration::from_secs(5))?;
-    connection.pragma_update(None, "journal_mode", "wal")?;
-    connection.pragma_update(None, "synchronous", "full")?;
-    connection.pragma_update(None, "foreign_keys", true)?;
-
-    if existed {
-        let version =
-            connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
-        anyhow::ensure!(
-            version == DATABASE_VERSION,
-            "unsupported context database version {version}"
-        );
-        return Ok(connection);
-    }
+    crate::sqlite_store::configure(&connection, "full")?;
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -271,10 +280,7 @@ fn open_database(path: &Path) -> Result<Connection> {
 
     let connection = Connection::open(path)
         .with_context(|| format!("reopen context database {}", path.display()))?;
-    connection.busy_timeout(Duration::from_secs(5))?;
-    connection.pragma_update(None, "journal_mode", "wal")?;
-    connection.pragma_update(None, "synchronous", "full")?;
-    connection.pragma_update(None, "foreign_keys", true)?;
+    crate::sqlite_store::configure(&connection, "full")?;
     Ok(connection)
 }
 
@@ -294,6 +300,61 @@ mod tests {
     use super::*;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn an_unusable_database_does_not_stop_the_daemon_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contexts.sqlite3");
+
+        // A crash between creating the file and committing the schema leaves user_version 0
+        // and no tables. That must be discarded, not treated as fatal for every pool.
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "wal")
+                .unwrap();
+        }
+        let store = ContextStore::open(&path, KEY).unwrap();
+        store
+            .record_dispatch("scope", "session", "primary", "physical-one")
+            .await
+            .unwrap();
+        drop(store);
+
+        // A version this build does not understand is kept rather than deleted, so a
+        // downgrade still starts and the operator can recover the old file.
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "user_version", DATABASE_VERSION + 1)
+                .unwrap();
+        }
+        let store = ContextStore::open(&path, KEY).unwrap();
+        // Started clean: the quarantined database's rows are not visible.
+        assert!(store.lookup("scope", "session").await.unwrap().is_none());
+        let quarantined: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".unsupported-")
+            })
+            .collect();
+        assert!(
+            !quarantined.is_empty(),
+            "old database was deleted, not kept"
+        );
+
+        // The recovered store is fully usable.
+        store
+            .record_dispatch("scope", "session", "primary", "physical-one")
+            .await
+            .unwrap();
+        let recovered = store.lookup("scope", "session").await.unwrap().unwrap();
+        assert_eq!(recovered.owner.alias, "primary");
+    }
 
     #[tokio::test]
     async fn dispatches_persist_without_storing_raw_context_identifiers() {

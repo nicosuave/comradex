@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod reset_credits;
 pub mod routing;
 pub mod service;
+pub(crate) mod sqlite_store;
 pub mod state;
 mod transport;
 pub mod usage;
