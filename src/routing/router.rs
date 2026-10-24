@@ -1254,13 +1254,15 @@ impl Router {
     }
     pub async fn auth_failure(&self, account: &str) {
         if let Some(a) = self.accounts.lock().await.get_mut(account) {
-            if a.needs_login && a.needs_login_retry_at.is_none() {
-                return;
+            // Durable reauth state owned by the refresh scheduler must not be downgraded to a
+            // short retry window, but the invalidation below still has to run: repairing a
+            // rejected credential can put a different upstream identity behind this alias.
+            if !(a.needs_login && a.needs_login_retry_at.is_none()) {
+                a.needs_login = true;
+                let retry_at = Instant::now() + Duration::from_secs(60);
+                a.needs_login_retry_at = Some(retry_at);
+                a.avoid_until = Some(retry_at);
             }
-            a.needs_login = true;
-            let retry_at = Instant::now() + Duration::from_secs(60);
-            a.needs_login_retry_at = Some(retry_at);
-            a.avoid_until = Some(retry_at);
         }
         if !self.affinity.invalidate_account(account).await {
             error!(account, "failed to invalidate durable affinity bindings");
@@ -3284,6 +3286,34 @@ mod tests {
                 Err(SelectionStaleReason::EpochChanged) | Err(SelectionStaleReason::BindingChanged)
             ),
             "unexpected outcome: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_failure_invalidates_affinity_even_in_durable_reauth_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cfg, affinity, router, pool) = stale_test_router(dir.path());
+        let key = affinity.key("bound-thread");
+        let selected = router
+            .select("default", &pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        assert!(affinity.get(&key).await.is_some());
+
+        // A refresh-token rejection parks the account in durable reauth state. A later
+        // request-time 401 must still drop the bindings and bump the epoch: repairing that
+        // credential can put a different upstream identity behind the same alias, and this
+        // is the only path that invalidates inference affinity.
+        router.reauth_required(&selected.account_id).await;
+        let epoch = affinity.account_epoch(&selected.account_id).await;
+        router.auth_failure(&selected.account_id).await;
+
+        assert_ne!(affinity.account_epoch(&selected.account_id).await, epoch);
+        assert!(affinity.get(&key).await.is_none());
+        // The durable reauth state still outranks the short request-time retry window.
+        assert_eq!(
+            router.validate_selection(&selected, "default", &pool).await,
+            Err(SelectionStaleReason::NeedsLogin)
         );
     }
 
