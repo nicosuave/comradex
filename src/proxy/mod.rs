@@ -16,6 +16,7 @@ mod context_ws_tests;
 mod desktop;
 #[cfg(test)]
 mod desktop_tests;
+mod direct_sessions;
 mod headers;
 #[cfg(test)]
 mod http_continuity_tests;
@@ -848,6 +849,7 @@ pub struct App {
     http_slots: Arc<Semaphore>,
     bridge_turn_slots: Arc<Semaphore>,
     upgrade_slots: Arc<Semaphore>,
+    direct_sessions: Arc<direct_sessions::DirectSessions>,
     bridge_sessions: AsyncMutex<HashMap<u64, BridgeSessionEntry>>,
     bridge_sessions_changed: Arc<Notify>,
     next_bridge_session_id: AtomicU64,
@@ -901,6 +903,7 @@ impl App {
             http_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             bridge_turn_slots: Arc::new(Semaphore::new(config.proxy.max_inflight)),
             upgrade_slots: Arc::new(Semaphore::new(config.proxy.max_upgrades)),
+            direct_sessions: Arc::new(direct_sessions::DirectSessions::default()),
             bridge_sessions: AsyncMutex::new(HashMap::new()),
             bridge_sessions_changed: Arc::new(Notify::new()),
             next_bridge_session_id: AtomicU64::new(1),
@@ -3293,7 +3296,16 @@ impl App {
         let mut upstream_idle_deadlines = HashMap::<TurnId, tokio::time::Instant>::new();
         let mut queued_creates = VecDeque::<Message>::new();
         let mut native_candidate: Option<native_control::Candidate> = None;
+        let mut session = self.direct_sessions.register();
         loop {
+            let idle = protocol.pending_len() == 0
+                && turns.is_empty()
+                && queued_creates.is_empty()
+                && !protocol.requires_original_socket()
+                && !native_candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.multi_agent_enabled());
+            session.set_idle(idle);
             let earliest_idle_deadline = earliest_turn_deadline(&upstream_idle_deadlines);
             let lifecycle_deadline = turns
                 .values()
@@ -3307,6 +3319,19 @@ impl App {
             let from_queue = queued_message.is_some();
             tokio::select! {
                 biased;
+                // Recheck local state before consuming an eviction requested concurrently
+                // with a new create. Never cancel a turn or an owned native control chain.
+                _ = session.evicted(), if idle => {
+                    info!("reclaiming idle direct Responses WebSocket at capacity");
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        client.close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Away,
+                            reason: "idle WebSocket reclaimed for capacity".into(),
+                        })),
+                    ).await;
+                    break;
+                }
                 _ = wait_for_optional_deadline(lifecycle_deadline) => {
                     let now = tokio::time::Instant::now();
                     let ready: Vec<_> = turns.iter().filter_map(|(id, turn)| {
@@ -3373,6 +3398,9 @@ impl App {
                         queued_creates.pop_front();
                     }
                     let client_message = client_message.context("read downstream Responses frame")?;
+                    if client_message.is_text() || client_message.is_binary() {
+                        session.set_idle(false);
+                    }
                     if let Message::Text(text) = &client_message {
                         let parsed = serde_json::from_str::<serde_json::Value>(text.as_str()).ok();
                         if parsed.as_ref().is_some_and(|value| value["type"] == "response.interrupt") {
@@ -4388,6 +4416,25 @@ impl App {
         }
     }
 
+    async fn acquire_upgrade_slot(
+        &self,
+        reclaim_idle: bool,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(permit) = self.upgrade_slots.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        if !reclaim_idle || !self.direct_sessions.evict_oldest_idle() {
+            return None;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.upgrade_slots.clone().acquire_owned(),
+        )
+        .await
+        .ok()?
+        .ok()
+    }
+
     async fn handle_upgrade(
         self: &Arc<Self>,
         mut req: Request<Incoming>,
@@ -4395,9 +4442,12 @@ impl App {
         path: String,
         live_call_id: Option<String>,
     ) -> Result<Response<ProxyBody>> {
-        let permit = match self.upgrade_slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => return Ok(upgrade_capacity_response()),
+        let direct = live_call_id.is_none()
+            && is_native_responses(&path)
+            && (self.config.proxy.responses_websocket_mode == ResponsesWebsocketMode::Direct
+                || Self::is_backend_shaped_downstream_path(req.uri().path()));
+        let Some(permit) = self.acquire_upgrade_slot(direct).await else {
+            return Ok(upgrade_capacity_response());
         };
         let inbound_headers = req.headers().clone();
         let pool = self.pool(listener)?;
@@ -4625,11 +4675,6 @@ impl App {
                 let listener = listener.clone();
                 let path = path.clone();
                 let headers = inbound_headers.clone();
-                let direct = !forced_live
-                    && is_native_responses(&path)
-                    && (self.config.proxy.responses_websocket_mode
-                        == ResponsesWebsocketMode::Direct
-                        || Self::is_backend_shaped_downstream_path(req.uri().path()));
                 stats.open_upgrades.fetch_add(1, Ordering::Relaxed);
                 let upgrade_guard = OpenUpgradeGuard(stats.clone());
                 let spawned = self
@@ -6856,6 +6901,7 @@ mod tests {
     }
 
     include!("capacity_tests.rs");
+    include!("direct_session_tests.rs");
     include!("quota_identity_tests.rs");
     include!("scoped_quota_tests.rs");
     include!("usage_activation_tests.rs");
@@ -7938,6 +7984,14 @@ mod tests {
         dir: &std::path::Path,
         upstream: String,
     ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
+        direct_test_app_with_upgrade_limit(dir, upstream, ProxyConfig::default().max_upgrades)
+    }
+
+    fn direct_test_app_with_upgrade_limit(
+        dir: &std::path::Path,
+        upstream: String,
+        max_upgrades: usize,
+    ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {
         let listener = ListenerConfig {
             address: "127.0.0.1:0".parse().unwrap(),
             pool: "default".into(),
@@ -7945,6 +7999,7 @@ mod tests {
         let config = Arc::new(Config {
             proxy: ProxyConfig {
                 upstream,
+                max_upgrades,
                 responses_websocket_mode: ResponsesWebsocketMode::Direct,
                 installation_secret: "0123456789abcdef".into(),
                 affinity_key: "0123456789abcdef0123456789abcdef".into(),
