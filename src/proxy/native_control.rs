@@ -35,6 +35,10 @@ pub(super) struct Candidate {
 }
 
 impl Candidate {
+    pub(super) fn multi_agent_enabled(&self) -> bool {
+        self.settings.pointer("/multi_agent/enabled") == Some(&Value::Bool(true))
+    }
+
     pub(super) fn response_id(&self) -> &str {
         &self.response_id
     }
