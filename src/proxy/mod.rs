@@ -31,6 +31,8 @@ mod usage_activation;
 mod usage_management;
 #[cfg(test)]
 mod usage_management_tests;
+#[cfg(test)]
+mod websocket_extensions_tests;
 #[allow(dead_code)]
 mod websocket_protocol;
 
@@ -55,7 +57,8 @@ use hyper::{
     body::{Body, Frame, Incoming, SizeHint},
     header::{
         ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION,
-        SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
+        SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
+        UPGRADE,
     },
     service::service_fn,
 };
@@ -3135,6 +3138,8 @@ impl App {
             if clear_session_state {
                 strip_direct_session_headers(upstream_req.headers_mut());
             }
+            // These sockets parse frames without extension support, including on reconnect.
+            upstream_req.headers_mut().remove(SEC_WEBSOCKET_EXTENSIONS);
             normalize_websocket_beta(upstream_req.headers_mut(), path);
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(account).await;
@@ -4623,6 +4628,11 @@ impl App {
                 .body(empty_body())?;
             *upstream_req.headers_mut() = inbound_headers.clone();
             upstream_req.headers_mut().remove(HOST);
+            if direct {
+                // Do not negotiate compression that our frame parser cannot decode.
+                // Raw tunnels keep the client's extension negotiation intact.
+                upstream_req.headers_mut().remove(SEC_WEBSOCKET_EXTENSIONS);
+            }
             normalize_websocket_beta(upstream_req.headers_mut(), &path);
             apply_credentials(upstream_req.headers_mut(), credentials.clone())?;
             self.router.begin(&selection.account_id).await;
@@ -4710,7 +4720,7 @@ impl App {
                                         )
                                         .await
                                     {
-                                        warn!(%error, "direct Responses WebSocket ended");
+                                        warn!(error = %format!("{error:#}"), "direct Responses WebSocket ended");
                                     }
                                 } else {
                                     let _ = tokio::io::copy_bidirectional(
