@@ -12,6 +12,8 @@ async fn exercise_extensions(mode: ResponsesWebsocketMode, path: &str, raw: bool
         for turn in 0..if raw { 1 } else { 2 } {
             let (stream, _) = listener.accept().await.unwrap();
             let handshakes = handshakes.clone();
+            // Tungstenite fixes the callback's error type to an unboxed HTTP response.
+            #[allow(clippy::result_large_err)]
             let mut socket = tokio_tungstenite::accept_hdr_async(
                 stream,
                 move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
