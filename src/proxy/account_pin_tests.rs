@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 const SECRET: &str = "0123456789abcdef";
 
+include!("session_tests.rs");
+
 struct PinFixture {
     address: std::net::SocketAddr,
     app: Arc<App>,

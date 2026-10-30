@@ -31,7 +31,10 @@ use crate::{
     accounts,
     auth_lock::HomeAuthLock,
     config::{self, Config},
-    routing::{Router, RoutingSnapshot},
+    routing::{
+        Router, RoutingSnapshot,
+        sessions::{SessionAction, SessionStatus, manage_session},
+    },
     state::{Stats, StatsSnapshot},
 };
 
@@ -66,6 +69,12 @@ enum Request {
     },
     RoutingStatus {
         secret: String,
+    },
+    Session {
+        secret: String,
+        session_id: String,
+        pool: Option<String>,
+        action: SessionAction,
     },
     UiStatus,
     UiRefreshUsage,
@@ -105,7 +114,8 @@ impl Request {
         match self {
             Self::SetPreferred { secret, .. }
             | Self::SetPreserved { secret, .. }
-            | Self::RoutingStatus { secret } => Some(secret),
+            | Self::RoutingStatus { secret }
+            | Self::Session { secret, .. } => Some(secret),
             Self::UiStatus
             | Self::UiRefreshUsage
             | Self::UiResetCredits { .. }
@@ -122,6 +132,8 @@ impl Request {
 #[derive(Debug, Serialize, Deserialize)]
 struct Response {
     ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<SessionStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -806,6 +818,7 @@ async fn handle(
             login: None,
             reset_credits: None,
             reset_result: None,
+            session: None,
         }
     } else {
         match serde_json::from_slice::<Request>(&bytes) {
@@ -833,6 +846,7 @@ async fn handle(
                 login: None,
                 reset_credits: None,
                 reset_result: None,
+                session: None,
             },
         }
     };
@@ -875,6 +889,14 @@ async fn process(
     let result: Result<Response> = async {
         Ok(match request {
             Request::RoutingStatus { .. } => Response::routing(router.routing_snapshot().await),
+            Request::Session {
+                session_id,
+                pool,
+                action,
+                ..
+            } => Response::session(
+                manage_session(config, router, &session_id, pool.as_deref(), action).await?,
+            ),
             Request::SetPreferred { pool, account, .. }
             | Request::UiSetPreferred { pool, account } => {
                 update_preferred(config_path, config, router, edit_lock, &pool, account).await?;
@@ -964,6 +986,19 @@ async fn process(
 }
 
 impl Response {
+    fn session(session: SessionStatus) -> Self {
+        Self {
+            ok: true,
+            session: Some(session),
+            error: None,
+            routing: None,
+            status: None,
+            login: None,
+            reset_credits: None,
+            reset_result: None,
+        }
+    }
+
     fn error(error: impl Into<String>) -> Self {
         Self {
             ok: false,
@@ -973,6 +1008,7 @@ impl Response {
             login: None,
             reset_credits: None,
             reset_result: None,
+            session: None,
         }
     }
 
@@ -985,6 +1021,7 @@ impl Response {
             login: None,
             reset_credits: None,
             reset_result: None,
+            session: None,
         }
     }
 
@@ -997,6 +1034,7 @@ impl Response {
             login: None,
             reset_credits: None,
             reset_result: None,
+            session: None,
         }
     }
 
@@ -1009,6 +1047,7 @@ impl Response {
             login: Some(login),
             reset_credits: None,
             reset_result: None,
+            session: None,
         }
     }
 }
@@ -1340,6 +1379,26 @@ pub fn set_preserved(
     )
 }
 
+pub fn session(
+    state_dir: &Path,
+    secret: &str,
+    session_id: &str,
+    pool: Option<&str>,
+    action: SessionAction,
+) -> Result<SessionStatus> {
+    send_response(
+        state_dir,
+        &Request::Session {
+            secret: secret.to_owned(),
+            session_id: session_id.to_owned(),
+            pool: pool.map(str::to_owned),
+            action,
+        },
+    )?
+    .session
+    .context("control response omitted session status")
+}
+
 pub fn routing_status(state_dir: &Path, secret: &str) -> Result<RoutingSnapshot> {
     send(
         state_dir,
@@ -1510,6 +1569,90 @@ kind = "inbound"
         );
         let usage_refresh = server.usage_refresh_requested();
         let task = tokio::spawn(server.run());
+
+        let state = state_dir.clone();
+        let unauthorized_session = tokio::task::spawn_blocking(move || {
+            session(
+                &state,
+                "wrong-secret",
+                "manual-session",
+                Some("default"),
+                SessionAction::Move {
+                    account: "b".into(),
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(unauthorized_session.to_string().contains("unauthorized"));
+
+        let state = state_dir.clone();
+        let unknown_session = tokio::task::spawn_blocking(move || {
+            session(
+                &state,
+                "0123456789abcdef",
+                "manual-session",
+                None,
+                SessionAction::Show,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(unknown_session.is_err());
+
+        let state = state_dir.clone();
+        let moved = tokio::task::spawn_blocking(move || {
+            session(
+                &state,
+                "0123456789abcdef",
+                "manual-session",
+                Some("default"),
+                SessionAction::Move {
+                    account: "b".into(),
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(moved.pool, "default");
+        assert_eq!(moved.provider, "codex");
+        assert_eq!(moved.assigned_account.as_deref(), Some("b"));
+        assert!(moved.overridden);
+
+        let state = state_dir.clone();
+        let shown = tokio::task::spawn_blocking(move || {
+            session(
+                &state,
+                "0123456789abcdef",
+                "manual-session",
+                None,
+                SessionAction::Show,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(shown.assigned_account, moved.assigned_account);
+        assert_eq!(shown.pool, moved.pool);
+
+        let state = state_dir.clone();
+        let reset = tokio::task::spawn_blocking(move || {
+            session(
+                &state,
+                "0123456789abcdef",
+                "manual-session",
+                None,
+                SessionAction::Reset,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(reset.assigned_account.is_none());
+        assert!(reset.account.is_none());
+        assert!(reset.overridden);
 
         let state = state_dir.clone();
         let refreshed = tokio::task::spawn_blocking(move || {
