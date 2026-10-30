@@ -163,6 +163,50 @@ async fn soft_affinity_key(
     candidates.first().map(|(_, key)| (*key).clone())
 }
 
+impl App {
+    async fn codex_session_route(
+        &self,
+        listener: &ListenerConfig,
+        values: &[metadata::AffinityValue],
+        context_session: Option<&str>,
+        soft_key: Option<&crate::routing::ThreadKey>,
+    ) -> Result<crate::routing::sessions::SessionRoute> {
+        let mut ids: Vec<_> = values
+            .iter()
+            .filter_map(|value| {
+                use metadata::AffinityKind::*;
+                let priority = match value.kind {
+                    ThreadHeader | BodyThread | TurnMetadata => 0,
+                    Session => 1,
+                    PromptCache => 2,
+                    _ => return None,
+                };
+                Some((priority, value.value.clone()))
+            })
+            .collect();
+        if let Some(id) = context_session {
+            ids.push((1, id.to_owned()));
+        }
+        ids.sort_by_key(|(priority, _)| *priority);
+        let ids: Vec<_> = ids.into_iter().map(|(_, id)| id).collect();
+        let mut route = self
+            .router
+            .affinity
+            .session_route("codex", &listener.pool, &ids)
+            .await?;
+        if route.overridden()
+            && route.previous.is_none()
+            && let Some(key) = soft_key
+            && let Some(binding) = self.router.affinity.get(key).await
+        {
+            route
+                .remember_previous(&self.router.affinity, binding.account_id)
+                .await?;
+        }
+        Ok(route)
+    }
+}
+
 fn affinity_bind_key(
     kind: metadata::AffinityKind,
     key: &crate::routing::ThreadKey,
@@ -226,6 +270,7 @@ struct WebSocketFrameRoute {
     hard_owner: bool,
     non_previous_hard_owner: bool,
     soft_keys: Vec<crate::routing::ThreadKey>,
+    session_route: crate::routing::sessions::SessionRoute,
 }
 
 struct DirectTurn {
@@ -1699,7 +1744,18 @@ impl App {
         let mut non_previous_hard_owner = false;
         let mut known_file_owners = 0usize;
         let mut missing_hard_owner = false;
-        let soft_routing_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let mut soft_routing_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let session_route = self
+            .codex_session_route(
+                listener,
+                &affinity_values,
+                replay.context_session_id(),
+                soft_routing_key.as_ref(),
+            )
+            .await?;
+        if let Some(key) = &session_route.placement {
+            soft_routing_key = Some(key.clone());
+        }
         let session_key = soft_routing_key.clone();
         for (kind, key) in &affinity_keys {
             let binding = if *kind == metadata::AffinityKind::File {
@@ -1761,6 +1817,7 @@ impl App {
                 .excluded_account
                 .clone()
         });
+        let payload_owner = bound_account.clone();
         let pinned_account =
             request_account_pin(pool, &method, &path, inspect_model.then_some(&replay));
         if let Some(account) = pinned_account {
@@ -1783,7 +1840,7 @@ impl App {
         // and completed output. Keep the previous account while it is healthy,
         // but do not make that now-redundant anchor block a portable continuation.
         // Raw HTTP anchors and independent owners still require their account.
-        let materialized_previous_owner = routing_previous_response_id.is_some()
+        let mut materialized_previous_owner = routing_previous_response_id.is_some()
             && !non_previous_hard_owner
             && file_ids.is_empty()
             && !replay.has_nonportable_state()
@@ -1792,6 +1849,53 @@ impl App {
             });
         if materialized_previous_owner {
             hard_owner = false;
+            if session_route.overridden() {
+                bound_account = None;
+            }
+        }
+        // An operator can replace soft placement, never encrypted provider state.
+        if let Err(error) = session_route
+            .check_opaque_history(replay.has_nonportable_state(), payload_owner.as_deref())
+        {
+            return Ok(error_response(
+                StatusCode::CONFLICT,
+                "session_owner_conflict",
+                &error.to_string(),
+            ));
+        }
+        if session_route.overridden()
+            && replay.has_nonportable_state()
+            && payload_owner.is_none()
+            && let Some(previous) = &session_route.previous
+        {
+            if bound_account
+                .as_ref()
+                .is_some_and(|account| account != previous)
+            {
+                return Ok(error_response(
+                    StatusCode::CONFLICT,
+                    "account_pin_conflict",
+                    "configured account pin conflicts with encrypted session history owner",
+                ));
+            }
+            bound_account = Some(previous.clone());
+            hard_owner = true;
+            non_previous_hard_owner = true;
+        }
+        if let Err(error) =
+            session_route.check_owner(bound_account.as_deref().filter(|_| hard_owner))
+        {
+            return Ok(error_response(
+                StatusCode::CONFLICT,
+                "session_owner_conflict",
+                &error.to_string(),
+            ));
+        }
+        if let Some(account) = &session_route.assigned {
+            bound_account = Some(account.clone());
+            materialized_previous_owner = false;
+            hard_owner = true;
+            non_previous_hard_owner = true;
         }
         if bound_account
             .as_ref()
@@ -1914,6 +2018,9 @@ impl App {
             // after this revalidation. No token is ever substituted into an already-built
             // Request, and the 401-continue path re-enters this fence before rebuilding.
             self.router.note_wired(&listener.pool, &account).await;
+            session_route
+                .observe(&self.router.affinity, &account)
+                .await?;
             if let Some(key) = &session_key {
                 self.router.note_session(key, &account).await;
             }
@@ -2091,6 +2198,13 @@ impl App {
                         ));
                     }
                     if status.is_success() {
+                        if !hard_owner && let Some(key) = &session_route.placement {
+                            if defer_affinity {
+                                deferred_affinity.push(key.clone());
+                            } else {
+                                self.router.bind(key.clone(), &account).await;
+                            }
+                        }
                         for (kind, key) in &affinity_keys {
                             if let Some(key) = affinity_bind_key(*kind, key, hard_owner)
                                 && !(materialized_previous_owner
@@ -2957,7 +3071,18 @@ impl App {
             .map(|value| (value.kind, self.router.affinity.key(&value.namespaced())))
             .collect();
         let mut hard_bound_account: Option<String> = None;
-        let soft_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let mut soft_key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let session_route = self
+            .codex_session_route(
+                listener,
+                &affinity_values,
+                replay.context_session_id(),
+                soft_key.as_ref(),
+            )
+            .await?;
+        if let Some(key) = &session_route.placement {
+            soft_key = Some(key.clone());
+        }
         let session_key = soft_key.clone();
         let mut hard_owner = false;
         let mut non_previous_hard_owner = false;
@@ -2999,6 +3124,7 @@ impl App {
         if missing_hard_owner {
             anyhow::bail!("request carries hard continuity state with no known account owner")
         }
+        let payload_owner = hard_bound_account.clone();
         if let Some(account) = model_account_pin(pool, replay) {
             if hard_bound_account
                 .as_ref()
@@ -3007,6 +3133,31 @@ impl App {
                 anyhow::bail!("configured account pin conflicts with request continuity owner")
             }
             hard_bound_account = Some(account.to_owned());
+            hard_owner = true;
+            non_previous_hard_owner = true;
+        }
+        session_route
+            .check_opaque_history(replay.has_nonportable_state(), payload_owner.as_deref())?;
+        if session_route.overridden()
+            && replay.has_nonportable_state()
+            && payload_owner.is_none()
+            && let Some(previous) = &session_route.previous
+        {
+            if hard_bound_account
+                .as_ref()
+                .is_some_and(|account| account != previous)
+            {
+                anyhow::bail!(
+                    "configured account pin conflicts with encrypted session history owner"
+                );
+            }
+            hard_bound_account = Some(previous.clone());
+            hard_owner = true;
+            non_previous_hard_owner = true;
+        }
+        session_route.check_owner(hard_bound_account.as_deref())?;
+        if let Some(account) = &session_route.assigned {
+            hard_bound_account = Some(account.clone());
             hard_owner = true;
             non_previous_hard_owner = true;
         }
@@ -3035,6 +3186,9 @@ impl App {
             self.router.note_session(key, &selection.account_id).await;
         }
         let mut soft_keys = Vec::new();
+        if !hard_owner && let Some(key) = &session_route.placement {
+            soft_keys.push(key.clone());
+        }
         for (kind, key) in &affinity_keys {
             if let Some(key) = affinity_bind_key(*kind, key, hard_owner) {
                 soft_keys.push(key);
@@ -3048,6 +3202,7 @@ impl App {
             hard_owner,
             non_previous_hard_owner,
             soft_keys,
+            session_route,
         })
     }
 
@@ -3598,6 +3753,7 @@ impl App {
                             };
                             self.record_context_dispatch(&value, &listener.pool, &account, &upstream_credentials).await?;
                             self.auth.ensure_bearer_usable(&self.config.accounts[&account], &upstream_credentials)?;
+                            route.session_route.observe(&self.router.affinity, &account).await?;
                             upstream.send(client_message.clone()).await?;
                             if analysis.has_nonportable_state {
                                 route.hard_owner = true;
@@ -4223,6 +4379,10 @@ impl App {
             }
             return Err(error);
         }
+        turn.route
+            .session_route
+            .observe(&self.router.affinity, &replacement_account)
+            .await?;
         if let Err(error) = replacement.socket.send(replay_message.clone()).await {
             warn!(%error, account = replacement_account, "safe direct replay send failed");
             return Ok(None);
@@ -4504,7 +4664,43 @@ impl App {
                 ));
             }
         }
-        let key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let mut key = soft_affinity_key(&self.router.affinity, &affinity_keys).await;
+        let session_route = if forced_live {
+            crate::routing::sessions::SessionRoute::default()
+        } else {
+            self.codex_session_route(listener, &affinity_values, None, key.as_ref())
+                .await?
+        };
+        if let Some(placement) = &session_route.placement {
+            key = Some(placement.clone());
+        }
+        if !direct
+            && !forced_live
+            && is_native_responses(&path)
+            && session_route.overridden()
+            && !hard_owner
+            && let Some(previous) = &session_route.previous
+            && session_route.assigned.as_ref() != Some(previous)
+        {
+            return Ok(error_response(
+                StatusCode::CONFLICT,
+                "session_transport_unsupported",
+                "moving an existing session requires direct or http_bridge mode so Comradex can inspect account-owned state; raw WebSockets cannot inspect continuations",
+            ));
+        }
+        if let Err(error) =
+            session_route.check_owner(bound_account.as_deref().filter(|_| hard_owner))
+        {
+            return Ok(error_response(
+                StatusCode::CONFLICT,
+                "session_owner_conflict",
+                &error.to_string(),
+            ));
+        }
+        if let Some(account) = &session_route.assigned {
+            bound_account = Some(account.clone());
+            hard_owner = true;
+        }
         let mut selection = if let Some(call_id) = &live_call_id {
             let Some(account) = self.live_calls.account(call_id).await else {
                 return Ok(error_response(
@@ -4618,6 +4814,15 @@ impl App {
             self.router
                 .note_wired(&listener.pool, &selection.account_id)
                 .await;
+            if direct {
+                session_route
+                    .observe_connection(&self.router.affinity, &selection.account_id)
+                    .await?;
+            } else {
+                session_route
+                    .observe(&self.router.affinity, &selection.account_id)
+                    .await?;
+            }
             if let Some(key) = &key {
                 self.router.note_session(key, &selection.account_id).await;
             }
@@ -6912,6 +7117,7 @@ mod tests {
 
     include!("capacity_tests.rs");
     include!("direct_session_tests.rs");
+    include!("session_direct_tests.rs");
     include!("quota_identity_tests.rs");
     include!("scoped_quota_tests.rs");
     include!("usage_activation_tests.rs");

@@ -284,6 +284,21 @@ impl App {
         let key = self.router.affinity.key(&routing_id);
         let pool = &self.config.pools[&listener.pool];
         let binding = self.router.affinity.get(&key).await;
+        let session_route = self
+            .router
+            .affinity
+            .session_route(
+                "claude",
+                &listener.pool,
+                std::slice::from_ref(&native.session),
+            )
+            .await?;
+        let placement_key = session_route.placement.as_ref().unwrap_or(&key);
+        let placement_binding = if session_route.overridden() {
+            self.router.affinity.get(placement_key).await
+        } else {
+            binding.clone()
+        };
         // The session binding places portable work. Account-owned context follows the account
         // that served its conversation, which a helper sharing the session cannot move.
         let conversation_key = self.router.affinity.key(&format!(
@@ -292,7 +307,8 @@ impl App {
         ));
         let conversation = self.router.affinity.get(&conversation_key).await;
         let account_bound = native.portability == wire::Portability::Account;
-        let hard = native.portability != wire::Portability::Portable
+        let hard = account_bound
+            || (native.portability != wire::Portability::Portable && !session_route.overridden())
             || session.active.load(Ordering::Acquire) > 0;
         let pinned = pool.model_accounts.get(&native.model).cloned();
         let owner = if hard {
@@ -333,11 +349,18 @@ impl App {
                 "model pin conflicts with conversation ownership",
             ));
         }
+        if let Err(error) = session_route.check_owner(owner.as_deref().or(pinned.as_deref())) {
+            return Ok(error_response(
+                StatusCode::CONFLICT,
+                "session_owner_conflict",
+                &error.to_string(),
+            ));
+        }
         // Thinking, compaction, and overlapping generations stay with their owner until it
         // exhausts its included quota, then move instead of stopping. The new account becomes
         // the owner, so the conversation does not return when the old window resets.
-        let movable = !account_bound && pinned.is_none();
-        let mut exact = owner.or(pinned);
+        let movable = !account_bound && pinned.is_none() && session_route.assigned.is_none();
+        let mut exact = session_route.assigned.clone().or(owner).or(pinned);
         let mut moved_from = None;
         let mut remaining = pool.clone();
         let mut last_rejection = None;
@@ -355,7 +378,7 @@ impl App {
             let selection = if let Some(account) = &exact {
                 self.router.select_exact(&remaining, account).await
             } else {
-                let bound = match binding
+                let bound = match placement_binding
                     .as_ref()
                     .filter(|_| std::mem::take(&mut try_binding))
                 {
@@ -456,6 +479,9 @@ impl App {
                 self.router.note_session(&key, &account).await;
             }
             self.router.note_wired(&listener.pool, &account).await;
+            session_route
+                .observe(&self.router.affinity, &account)
+                .await?;
             self.router.begin(&account).await;
             let lease = DirectAccountLease::new_for_selection(self.router.clone(), &selected);
             let mut response = self
@@ -542,6 +568,9 @@ impl App {
                 && !count
                 && (!self.router.bind(identity_key, &account).await
                     || !self.router.bind(conversation_key.clone(), &account).await
+                    || (session_route.overridden()
+                        && !hard
+                        && !self.router.bind(placement_key.clone(), &account).await)
                     || (leads && !self.router.bind(key.clone(), &account).await))
             {
                 return Ok(error_response(
@@ -711,6 +740,8 @@ mod tests {
     use serde_json::json;
     use std::convert::Infallible;
     use tokio::net::TcpListener;
+
+    include!("session_claude_tests.rs");
 
     const SESSION: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     const ACCOUNT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";

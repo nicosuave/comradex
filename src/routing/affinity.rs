@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tracing::error;
 
+pub mod sessions;
+
 const DATABASE_VERSION: i64 = 1;
 const MAX_TOUCH_PERSIST_INTERVAL_SECONDS: u64 = 15 * 60;
 
@@ -467,6 +469,7 @@ fn create_schema(connection: &Connection) -> Result<()> {
         ",
     )?;
     connection.pragma_update(None, "user_version", DATABASE_VERSION)?;
+    sessions::create_schema(connection)?;
     Ok(())
 }
 
@@ -568,6 +571,10 @@ fn expire_stale_bindings(connection: &Connection, idle: Duration) -> Result<()> 
     connection.execute(
         "delete from bindings where last_seen < ?1",
         [to_sql_u64(cutoff, "binding expiration cutoff")?],
+    )?;
+    connection.execute(
+        "delete from session_routes where last_seen < ?1",
+        [to_sql_u64(cutoff, "session expiration cutoff")?],
     )?;
     Ok(())
 }

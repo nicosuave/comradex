@@ -16,7 +16,7 @@ use comradex::{
     config::Config,
     control, install,
     proxy::App,
-    routing::{AffinityStore, Router},
+    routing::{AffinityStore, Router, sessions::SessionAction},
     service,
     state::Stats,
 };
@@ -71,6 +71,11 @@ enum CommandName {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    /// Inspect or change a Claude or Codex session's routing
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Internal browser launcher used by the official provider CLI.
     #[command(hide = true)]
     BrowserOpen {
@@ -87,6 +92,36 @@ enum CommandName {
     /// Show configuration, service, Codex wiring, accounts, and live traffic
     Status {
         /// Print the raw stats snapshot as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Show the session's latest account and manual routing override
+    Show {
+        session_id: String,
+        #[arg(long)]
+        pool: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Route subsequent requests strictly to this account
+    Move {
+        session_id: String,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        pool: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Return subsequent requests to automatic selection, ignoring old soft placement
+    Reset {
+        session_id: String,
+        #[arg(long)]
+        pool: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -337,6 +372,7 @@ async fn main() -> Result<()> {
         }
         CommandName::RestartCodex => handle_running_codex(true),
         CommandName::Account { command } => account_command(&config_path, command),
+        CommandName::Session { command } => session_command(&config_path, command),
         CommandName::BrowserOpen {
             executable,
             profile,
@@ -345,6 +381,54 @@ async fn main() -> Result<()> {
         CommandName::Service { command } => service_command(&config_path, command),
         CommandName::Status { json } => status(&config_path, json),
     }
+}
+
+fn session_command(config_path: &Path, command: SessionCommand) -> Result<()> {
+    let (session_id, pool, json, action) = match command {
+        SessionCommand::Show {
+            session_id,
+            pool,
+            json,
+        } => (session_id, pool, json, SessionAction::Show),
+        SessionCommand::Move {
+            session_id,
+            account,
+            pool,
+            json,
+        } => (session_id, pool, json, SessionAction::Move { account }),
+        SessionCommand::Reset {
+            session_id,
+            pool,
+            json,
+        } => (session_id, pool, json, SessionAction::Reset),
+    };
+    let config = load_config(config_path)?;
+    let status = control::session(
+        &state_dir(&config),
+        &config.proxy.installation_secret,
+        &session_id,
+        pool.as_deref(),
+        action,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!("session: {session_id}");
+        println!("pool: {} ({})", status.pool, status.provider);
+        println!(
+            "latest account: {}",
+            status.account.as_deref().unwrap_or("none")
+        );
+        println!(
+            "assigned account: {}",
+            status.assigned_account.as_deref().unwrap_or("automatic")
+        );
+        println!("override active: {}", status.overridden);
+        if let Some(last_seen) = status.last_seen {
+            println!("last activity (Unix seconds): {last_seen}");
+        }
+    }
+    Ok(())
 }
 
 fn default_config_path(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
@@ -1570,6 +1654,75 @@ fn state_dir(config: &Config) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_cli_parses_actions_and_optional_pool_and_json() {
+        for verb in ["show", "reset"] {
+            let cli = Cli::try_parse_from([
+                "comradex",
+                "session",
+                verb,
+                "session-id",
+                "--pool",
+                "claude",
+                "--json",
+            ])
+            .unwrap();
+            match cli.command {
+                CommandName::Session {
+                    command:
+                        SessionCommand::Show {
+                            session_id,
+                            pool,
+                            json,
+                        },
+                }
+                | CommandName::Session {
+                    command:
+                        SessionCommand::Reset {
+                            session_id,
+                            pool,
+                            json,
+                        },
+                } => {
+                    assert_eq!(session_id, "session-id");
+                    assert_eq!(pool.as_deref(), Some("claude"));
+                    assert!(json);
+                }
+                _ => panic!("expected session show or reset"),
+            }
+            assert!(Cli::try_parse_from(["comradex", "session", verb, "session-id"]).is_ok());
+            assert!(Cli::try_parse_from(["comradex", "session", verb]).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "comradex",
+            "session",
+            "move",
+            "session-id",
+            "--account",
+            "work",
+            "--pool",
+            "default",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command,
+            CommandName::Session { command: SessionCommand::Move { session_id, account, pool, json: true } }
+            if session_id == "session-id" && account == "work" && pool.as_deref() == Some("default")));
+        assert!(
+            Cli::try_parse_from([
+                "comradex",
+                "session",
+                "move",
+                "session-id",
+                "--account",
+                "work"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["comradex", "session", "move", "session-id"]).is_err());
+        assert!(Cli::try_parse_from(["comradex", "session", "move", "--account", "work"]).is_err());
+    }
+
     #[test]
     fn reset_cli_requires_target_credit_and_explicit_confirmation() {
         assert!(

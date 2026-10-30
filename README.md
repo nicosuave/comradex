@@ -360,6 +360,21 @@ For each request, the daemon reads the account's `auth.json`, derives a missing 
 
 On macOS, `comradex account login` temporarily unloads an installed, running Comradex LaunchAgent while the official Codex client writes the selected account home, then restores the service and waits for its listeners. This prevents login and daemon refresh from racing over rotating credentials.
 
+### Inspecting and moving sessions
+
+```sh
+comradex session show SESSION_ID
+comradex session move SESSION_ID --account work
+comradex session reset SESSION_ID
+comradex session show SESSION_ID --pool claude --json
+```
+
+These commands work with both Claude and Codex sessions and require the running daemon. Each accepts `--pool` and `--json`. The pool is inferred from observed sessions and existing affinity bindings; unknown or ambiguous IDs require an explicit `--pool`. Supplying a pool also allows assigning an unseen session before its first request. `show` reports the provider, pool, account routed since the last edit, strict assigned account (if any), whether an override is active, and the last routing activity or edit time.
+
+`move` durably assigns subsequent requests to exactly `--account`. An unavailable target or conflicting account-owned state produces an error instead of silently falling back. `reset` durably returns the session to automatic selection and ignores its old soft cache, session, and thread placement. Automatic selection can choose the same account again. A reset remains an active override so stale soft placement cannot restore the old assignment. Neither command interrupts an active answer or requires a daemon restart.
+
+Account-owned provider state and configured model pins remain enforced and are never rewritten by these commands. Claude signed thinking and compaction history can move, with the existing cross-account thinking and cache caveats; files, containers, server-side thread continuations, and other nonportable state still block a conflicting move. Codex hard continuity can require the client to send a fresh or full portable request before a new account can be used. After a session has dispatched on several accounts, unanchored encrypted Codex history has ambiguous ownership and is rejected; it needs an original continuity anchor or portable history. Direct and HTTP bridge WebSockets apply changes per `response.create`. Raw WebSockets cannot inspect continuations, so migrating an existing raw session requires switching to `direct` or `http_bridge`; active raw sockets retain their account until disconnected. Native control chains that require their original socket remain bound to that socket.
+
 ## Connecting Codex
 
 ```sh
