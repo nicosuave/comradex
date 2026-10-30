@@ -13,6 +13,7 @@ struct PinFixture {
     app: Arc<App>,
     listener: ListenerConfig,
     seen: Arc<StdMutex<Vec<(String, String)>>>,
+    bodies: Arc<StdMutex<Vec<Bytes>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -46,13 +47,17 @@ async fn fixture_with_pins(
     let upstream_address = upstream.local_addr().unwrap();
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let upstream_seen = seen.clone();
+    let bodies = Arc::new(StdMutex::new(Vec::new()));
+    let upstream_bodies = bodies.clone();
     let upstream_task = tokio::spawn(async move {
         loop {
             let (stream, _) = upstream.accept().await.unwrap();
             let seen = upstream_seen.clone();
+            let bodies = upstream_bodies.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req: Request<Incoming>| {
                     let seen = seen.clone();
+                    let bodies = bodies.clone();
                     async move {
                         let authorization =
                             req.headers()[AUTHORIZATION].to_str().unwrap().to_owned();
@@ -60,6 +65,7 @@ async fn fixture_with_pins(
                         let is_head = req.method() == Method::HEAD;
                         let is_upload = req.uri().path() == "/backend-api/codex/files";
                         let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                        bodies.lock().unwrap().push(bytes.clone());
                         let streaming = serde_json::from_slice::<serde_json::Value>(&bytes)
                             .ok()
                             .is_some_and(|body| body["stream"] == true);
@@ -166,6 +172,7 @@ async fn fixture_with_pins(
         app,
         listener,
         seen,
+        bodies,
         tasks: vec![proxy_task, upstream_task],
     }
 }

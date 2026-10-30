@@ -28,7 +28,6 @@ struct Record {
     revision: i64,
     account: Option<String>,
     previous: Option<String>,
-    multiple_accounts: bool,
     assigned: Option<String>,
     overridden: bool,
     last_seen: u64,
@@ -42,7 +41,6 @@ pub(crate) struct SessionRoute {
     pub placement: Option<ThreadKey>,
     pub assigned: Option<String>,
     pub previous: Option<String>,
-    multiple_accounts: bool,
 }
 
 impl SessionRoute {
@@ -57,14 +55,6 @@ impl SessionRoute {
                 "session is assigned to {assigned}, but this request requires {owner}; start a fresh request with portable history or reset the session assignment"
             );
         }
-        Ok(())
-    }
-
-    pub fn check_opaque_history(&self, opaque: bool, owner: Option<&str>) -> Result<()> {
-        ensure!(
-            !self.overridden() || !opaque || owner.is_some() || !self.multiple_accounts,
-            "encrypted session history has ambiguous ownership after account switching; use its original continuity anchor or resend portable history"
-        );
         Ok(())
     }
 
@@ -154,7 +144,6 @@ fn read_record(connection: &Connection, key: &str) -> Result<Option<Record>> {
             revision: row.get(0)?,
             account: row.get(1)?,
             previous: row.get(5)?,
-            multiple_accounts: row.get(6)?,
             assigned: row.get(2)?,
             overridden: row.get(3)?,
             last_seen: row.get::<_, i64>(4)?.max(0) as u64,
@@ -223,7 +212,6 @@ impl AffinityStore {
                 ))
             }),
             previous: previous.and_then(|record| record.previous.clone()),
-            multiple_accounts: previous.is_some_and(|record| record.multiple_accounts),
             records,
         })
     }
