@@ -125,7 +125,7 @@ async fn session_direct_ownership_and_thread_scope_remain_enforced() {
 }
 
 #[tokio::test]
-async fn session_direct_handshake_cannot_transfer_ownership_of_encrypted_history() {
+async fn session_direct_manual_move_allows_unanchored_encrypted_history() {
     use crate::routing::sessions::{SessionAction, manage_session};
     for legacy in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -174,10 +174,19 @@ async fn session_direct_handshake_cannot_transfer_ownership_of_encrypted_history
         )
         .await;
         socket.send(Message::Text(r#"{"type":"response.create","input":[{"type":"reasoning","encrypted_content":"from-a"}]}"#.into())).await.unwrap();
-        let error = direct_capacity_event(&mut socket).await;
-        assert_eq!(error["type"], "error");
-        assert!(error.to_string().contains("requires a"), "{error}");
-        // A portable create can use B, but cannot make earlier opaque history portable.
+        assert_eq!(
+            direct_capacity_event(&mut socket).await["type"],
+            "response.created"
+        );
+        assert_eq!(
+            direct_capacity_event(&mut socket).await["type"],
+            "response.completed"
+        );
+        assert_eq!(
+            app.router.wired_account("default").await.as_deref(),
+            Some("b")
+        );
+        // A helper on B does not change subsequent manual routing decisions.
         socket
             .send(Message::Text(
                 r#"{"type":"response.create","input":[]}"#.into(),
@@ -193,9 +202,14 @@ async fn session_direct_handshake_cannot_transfer_ownership_of_encrypted_history
             "response.completed"
         );
         socket.send(Message::Text(r#"{"type":"response.create","input":[{"type":"reasoning","encrypted_content":"from-a"}]}"#.into())).await.unwrap();
-        let error = direct_capacity_event(&mut socket).await;
-        assert_eq!(error["type"], "error");
-        assert!(error.to_string().contains("ambiguous ownership"), "{error}");
+        assert_eq!(
+            direct_capacity_event(&mut socket).await["type"],
+            "response.created"
+        );
+        assert_eq!(
+            direct_capacity_event(&mut socket).await["type"],
+            "response.completed"
+        );
         app.shutdown_connections().await;
         proxy.abort();
         server.abort();

@@ -1817,7 +1817,6 @@ impl App {
                 .excluded_account
                 .clone()
         });
-        let payload_owner = bound_account.clone();
         let pinned_account =
             request_account_pin(pool, &method, &path, inspect_model.then_some(&replay));
         if let Some(account) = pinned_account {
@@ -1853,38 +1852,26 @@ impl App {
                 bound_account = None;
             }
         }
-        // An operator can replace soft placement, never encrypted provider state.
-        if let Err(error) = session_route
-            .check_opaque_history(replay.has_nonportable_state(), payload_owner.as_deref())
-        {
-            return Ok(error_response(
-                StatusCode::CONFLICT,
-                "session_owner_conflict",
-                &error.to_string(),
-            ));
-        }
-        if session_route.overridden()
-            && replay.has_nonportable_state()
-            && payload_owner.is_none()
-            && let Some(previous) = &session_route.previous
-        {
-            if bound_account
-                .as_ref()
-                .is_some_and(|account| account != previous)
-            {
-                return Ok(error_response(
-                    StatusCode::CONFLICT,
-                    "account_pin_conflict",
-                    "configured account pin conflicts with encrypted session history owner",
-                ));
-            }
-            bound_account = Some(previous.clone());
-            hard_owner = true;
-            non_previous_hard_owner = true;
-        }
+        // A manual placement chooses the initial dispatch. Prior soft placement
+        // cannot prove ownership of encrypted input; automatic replay remains
+        // separately gated by the payload's portability after dispatch.
         if let Err(error) =
             session_route.check_owner(bound_account.as_deref().filter(|_| hard_owner))
         {
+            warn!(
+                pool = listener.pool,
+                assigned = session_route.assigned.as_deref().unwrap_or("automatic"),
+                required = bound_account.as_deref().unwrap_or("none"),
+                configured_pin = pinned_account.is_some(),
+                turn_state = affinity_keys
+                    .iter()
+                    .any(|(kind, _)| *kind == metadata::AffinityKind::TurnState),
+                previous_response = affinity_keys
+                    .iter()
+                    .any(|(kind, _)| *kind == metadata::AffinityKind::PreviousResponse),
+                files = file_ids.len(),
+                "manual session placement conflicts with explicit request ownership"
+            );
             return Ok(error_response(
                 StatusCode::CONFLICT,
                 "session_owner_conflict",
@@ -3124,7 +3111,6 @@ impl App {
         if missing_hard_owner {
             anyhow::bail!("request carries hard continuity state with no known account owner")
         }
-        let payload_owner = hard_bound_account.clone();
         if let Some(account) = model_account_pin(pool, replay) {
             if hard_bound_account
                 .as_ref()
@@ -3133,25 +3119,6 @@ impl App {
                 anyhow::bail!("configured account pin conflicts with request continuity owner")
             }
             hard_bound_account = Some(account.to_owned());
-            hard_owner = true;
-            non_previous_hard_owner = true;
-        }
-        session_route
-            .check_opaque_history(replay.has_nonportable_state(), payload_owner.as_deref())?;
-        if session_route.overridden()
-            && replay.has_nonportable_state()
-            && payload_owner.is_none()
-            && let Some(previous) = &session_route.previous
-        {
-            if hard_bound_account
-                .as_ref()
-                .is_some_and(|account| account != previous)
-            {
-                anyhow::bail!(
-                    "configured account pin conflicts with encrypted session history owner"
-                );
-            }
-            hard_bound_account = Some(previous.clone());
             hard_owner = true;
             non_previous_hard_owner = true;
         }

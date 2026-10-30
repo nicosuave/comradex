@@ -112,13 +112,33 @@ mod session_controls {
             .await,
             StatusCode::CONFLICT
         );
+        fixture
+            .app
+            .file_owners
+            .put(
+                fixture.app.router.affinity.key("file:owned-file"),
+                "a".into(),
+                0,
+            )
+            .await;
+        assert_eq!(
+            request(
+                &fixture,
+                Method::POST,
+                "/v1/responses",
+                r#"{"input":[{"type":"input_file","file_id":"owned-file"}]}"#,
+                None
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
         let opaque =
             r#"{"model":"unlisted","input":[{"type":"reasoning","encrypted_content":"owned"}]}"#;
         assert_eq!(
             request(&fixture, Method::POST, "/v1/responses", opaque, None).await,
-            StatusCode::CONFLICT
+            StatusCode::OK
         );
-        assert_eq!(fixture.seen.lock().unwrap().len(), 1);
+        assert_eq!(fixture.seen.lock().unwrap().len(), 2);
         edit(
             &fixture,
             SessionAction::Move {
@@ -149,7 +169,7 @@ mod session_controls {
             request(&fixture, Method::POST, "/v1/responses", body, None).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        assert_eq!(fixture.seen.lock().unwrap().len(), 1);
+        assert_eq!(fixture.seen.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -184,7 +204,7 @@ mod session_controls {
     }
 
     #[tokio::test]
-    async fn session_portable_requests_and_model_pins_do_not_certify_old_encrypted_history() {
+    async fn session_move_routes_unanchored_native_history_unchanged_to_the_assigned_account() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = fixture(dir.path(), None).await;
         let portable = r#"{"input":[]}"#;
@@ -199,27 +219,34 @@ mod session_controls {
             },
         )
         .await;
-        let opaque = r#"{"model":"pinned-model","input":[{"type":"reasoning","encrypted_content":"from-a"}]}"#;
-        assert_eq!(
-            request(&fixture, Method::POST, "/v1/responses", opaque, None).await,
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            request(&fixture, Method::POST, "/v1/responses", portable, None).await,
-            StatusCode::OK
-        );
-        // Knowing that B served a portable helper does not prove who owns the opaque item.
-        assert_eq!(
-            request(&fixture, Method::POST, "/v1/responses", opaque, None).await,
-            StatusCode::CONFLICT
-        );
+        let history = r#"{"model":"gpt-6-astra","input":[{"role":"user","content":"continue"},{"type":"reasoning","id":"rs_from_a","encrypted_content":"from-a","summary":[]},{"type":"function_call","id":"fc_from_a","call_id":"call_1","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"done"}]}"#;
+        for body in [history, portable, history] {
+            assert_eq!(
+                request(&fixture, Method::POST, "/v1/responses", body, None).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                fixture.seen.lock().unwrap().last().unwrap().0,
+                "Bearer token-b"
+            );
+            assert_eq!(
+                fixture.bodies.lock().unwrap().last().unwrap().as_ref(),
+                body.as_bytes()
+            );
+        }
         edit(&fixture, SessionAction::Reset).await;
         assert_eq!(
-            request(&fixture, Method::POST, "/v1/responses", opaque, None).await,
-            StatusCode::CONFLICT
+            request(&fixture, Method::POST, "/v1/responses", history, None).await,
+            StatusCode::OK
         );
-        assert_eq!(fixture.seen.lock().unwrap().len(), 2);
-        // A real continuity anchor still identifies its required account.
+        assert_eq!(
+            fixture.seen.lock().unwrap().last().unwrap().0,
+            "Bearer token-a"
+        );
+        assert_eq!(
+            fixture.bodies.lock().unwrap().last().unwrap().as_ref(),
+            history.as_bytes()
+        );
         fixture
             .app
             .router
@@ -230,7 +257,7 @@ mod session_controls {
                 &fixture,
                 Method::POST,
                 "/v1/responses",
-                opaque,
+                history,
                 Some("owned-b")
             )
             .await,
@@ -240,6 +267,46 @@ mod session_controls {
             fixture.seen.lock().unwrap().last().unwrap().0,
             "Bearer token-b"
         );
+    }
+
+    #[tokio::test]
+    async fn session_reset_initial_dispatch_does_not_allow_automatic_nonportable_replay() {
+        for failure in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fixture = fixture(dir.path(), Some(failure)).await;
+            assert_eq!(
+                request(
+                    &fixture,
+                    Method::POST,
+                    "/v1/responses",
+                    r#"{"input":[]}"#,
+                    None
+                )
+                .await,
+                StatusCode::OK
+            );
+            fixture
+                .app
+                .router
+                .set_preferred("default", Some("b".into()))
+                .await;
+            edit(&fixture, SessionAction::Reset).await;
+            let history = r#"{"input":[{"type":"reasoning","id":"rs_original","encrypted_content":"original"}]}"#;
+            assert_eq!(
+                request(&fixture, Method::POST, "/v1/responses", history, None).await,
+                failure
+            );
+            let seen = fixture.seen.lock().unwrap();
+            assert_eq!(
+                seen.len(),
+                2,
+                "nonportable requests cannot retry on another account"
+            );
+            assert_eq!(seen[1].0, "Bearer token-b");
+        }
     }
 
     #[tokio::test]
@@ -266,7 +333,7 @@ mod session_controls {
             if let Some(action) = action {
                 edit(&fixture, action).await;
             }
-            websocket.send(Message::Text(r#"{"type":"response.create","client_metadata":{"thread_id":"soft-thread"},"input":[]}"#.into())).await.unwrap();
+            websocket.send(Message::Text(r#"{"type":"response.create","client_metadata":{"thread_id":"soft-thread"},"input":[{"type":"reasoning","id":"rs_prior","encrypted_content":"prior"}]}"#.into())).await.unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let message = websocket.next().await.unwrap().unwrap();
