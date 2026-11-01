@@ -1,0 +1,58 @@
+# Generate the Xcode project with `xcodegen generate`; Scripts/install.sh does this.
+name: ComradexPhone
+options:
+  bundleIdPrefix: com.nicosuave.comradex
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  ComradexMenu:
+    path: ../../macos/ComradexMenu
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    # The Mac's tailnet origin, such as https://mac.tailnet.ts.net:4363. Scripts/install.sh
+    # derives it from `tailscale status`; the app and widget read it from Info.plist.
+    COMRADEX_USAGE_SERVER: ""
+    SWIFT_VERSION: "5.10"
+targets:
+  ComradexPhone:
+    type: application
+    platform: iOS
+    sources: [App, Shared]
+    dependencies:
+      - package: ComradexMenu
+        product: ComradexWidgetCore
+      - target: ComradexPhoneWidgets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nicosuave.comradex.phone
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Comradex
+        UILaunchScreen: {}
+        ComradexUsageServer: $(COMRADEX_USAGE_SERVER)
+  ComradexPhoneWidgets:
+    type: app-extension
+    platform: iOS
+    sources: [Widgets, Shared]
+    dependencies:
+      - package: ComradexMenu
+        product: ComradexWidgetCore
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nicosuave.comradex.phone.widgets
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: Comradex
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        ComradexUsageServer: $(COMRADEX_USAGE_SERVER)

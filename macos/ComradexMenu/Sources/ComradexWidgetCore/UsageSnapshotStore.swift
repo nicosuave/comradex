@@ -22,7 +22,7 @@ public struct UsageSnapshotStore: Sendable {
 
     public func load() -> UsageSnapshot? {
         guard let fileURL, let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? Self.decoder.decode(UsageSnapshot.self, from: data)
+        return try? Self.decode(data)
     }
 
     public func save(_ snapshot: UsageSnapshot) throws {
@@ -31,7 +31,16 @@ public struct UsageSnapshotStore: Sendable {
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try Self.encoder.encode(snapshot).write(to: fileURL, options: .atomic)
+        try Self.encode(snapshot).write(to: fileURL, options: .atomic)
+    }
+
+    /// The snapshot file format, also served to the iPhone app over HTTP.
+    public static func encode(_ snapshot: UsageSnapshot) throws -> Data {
+        try encoder.encode(snapshot)
+    }
+
+    public static func decode(_ data: Data) throws -> UsageSnapshot {
+        try decoder.decode(UsageSnapshot.self, from: data)
     }
 
     private static let encoder: JSONEncoder = {

@@ -34,11 +34,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var hasDeferredMenuUpdate = false
     private var usageRefreshPending = false
     private var poolLabels: [String: String] = [:]
+    private let defaults: UserDefaults
+    private var usageShareServer: UsageShareServer?
 
     var renderedMenu: NSMenu { menu }
 
-    init(store: ComradexStore) {
+    init(store: ComradexStore, defaults: UserDefaults = .standard) {
         self.store = store
+        self.defaults = defaults
         super.init()
         menu.autoenablesItems = false
     }
@@ -58,6 +61,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusItem.button?.toolTip = "Comradex"
         menu.delegate = self
         statusItem.menu = menu
+        if defaults.bool(forKey: UsageShareServer.enabledDefaultsKey) { startUsageSharing() }
         rebuildMenu()
         startPolling()
     }
@@ -142,6 +146,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if store.snapshot?.accounts.contains(where: \.isClaude) == true {
             menu.addItem(claudeUsageItem())
         }
+        menu.addItem(usageSharingItem())
         menu.addItem(actionItem(
             title: store.isRefreshing ? "Refreshing…" : "Refresh",
             icon: "arrow.clockwise",
@@ -317,6 +322,44 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         return item
     }
 
+    /// Serves the widget's usage to the iPhone app; `tailscale serve` exposes it to the tailnet.
+    private func usageSharingItem() -> NSMenuItem {
+        let item = actionItem(title: "Share Usage with iPhone", icon: "iphone", action: #selector(usageSharingSelected(_:)))
+        let state = usageShareServer?.state ?? .stopped
+        item.state = state == .stopped ? .off : .on
+        let detail: String?
+        switch state {
+        case .stopped, .starting: detail = nil
+        case let .listening(port): detail = "127.0.0.1:\(port)"
+        case let .failed(error):
+            detail = "Port \(usageSharePort) unavailable"
+            item.toolTip = error
+        }
+        if let detail {
+            if #available(macOS 14.4, *) {
+                item.subtitle = detail
+            } else {
+                item.title = "Share Usage with iPhone · \(detail)"
+            }
+        }
+        return item
+    }
+
+    private var usageSharePort: UInt16 {
+        let port = defaults.integer(forKey: UsageShareServer.portDefaultsKey)
+        return (1...Int(UInt16.max)).contains(port) ? UInt16(port) : UsageShareServer.defaultPort
+    }
+
+    private func startUsageSharing() {
+        let server = UsageShareServer(port: usageSharePort) { [weak store] in store?.usageSnapshot }
+        server.onStateChange = { [weak self] _ in
+            guard let self else { return }
+            if isMenuOpen { hasDeferredMenuUpdate = true } else { rebuildMenu() }
+        }
+        usageShareServer = server
+        server.start()
+    }
+
     private func addInformationalItem(_ title: String, icon: String) {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
@@ -364,6 +407,18 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func claudeUsageSelected(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let window = ClaudeUsageWindow(rawValue: raw) else { return }
         store.setClaudeUsage(window)
+        rebuildMenu()
+    }
+
+    @objc private func usageSharingSelected(_ sender: NSMenuItem) {
+        if let server = usageShareServer {
+            server.stop()
+            usageShareServer = nil
+            defaults.set(false, forKey: UsageShareServer.enabledDefaultsKey)
+        } else {
+            defaults.set(true, forKey: UsageShareServer.enabledDefaultsKey)
+            startUsageSharing()
+        }
         rebuildMenu()
     }
 

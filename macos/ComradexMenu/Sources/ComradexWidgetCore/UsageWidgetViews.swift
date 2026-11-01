@@ -30,6 +30,15 @@ public struct UsageWidgetView: View {
 /// Data older than this is labeled with its age; the menu app republishes every few minutes.
 let staleInterval: TimeInterval = 30 * 60
 
+#if os(iOS)
+/// The iPhone widget fetches usage that the Mac's menu app serves over Tailscale.
+let appName = "Comradex"
+let emptyHint = "Open Comradex to connect to your Mac."
+#else
+let appName = "Comradex Menu"
+let emptyHint = "Open Comradex Menu to show usage."
+#endif
+
 // MARK: - Levels
 
 enum UsageLevel {
@@ -357,7 +366,7 @@ struct MoreAccountsNote: View {
 
     var body: some View {
         if count > 0 {
-            Text("\(count) more in Comradex Menu")
+            Text("\(count) more in \(appName)")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.top, 6)
@@ -567,7 +576,7 @@ struct EmptyUsageView: View {
                 .foregroundStyle(.secondary)
             Text(hasSnapshot ? "No Accounts" : "No Usage Yet")
                 .font(.system(size: 13, weight: .semibold))
-            Text(hasSnapshot ? "Add an account in Comradex." : "Open Comradex Menu to show usage.")
+            Text(hasSnapshot ? "Add an account in Comradex." : emptyHint)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
