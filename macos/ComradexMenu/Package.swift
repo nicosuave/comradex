@@ -8,10 +8,13 @@ let package = Package(
     name: "ComradexMenu",
     platforms: [
         .macOS(.v14),
+        // The iPhone app in ios/ComradexPhone uses only ComradexWidgetCore.
+        .iOS(.v17),
     ],
     products: [
         .executable(name: "ComradexMenu", targets: ["ComradexMenu"]),
         .executable(name: "ComradexWidgets", targets: ["ComradexWidgets"]),
+        .library(name: "ComradexWidgetCore", targets: ["ComradexWidgetCore"]),
     ],
     targets: [
         .executableTarget(

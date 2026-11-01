@@ -1,3 +1,4 @@
+import ComradexWidgetCore
 import Foundation
 import SwiftUI
 import OSLog
@@ -45,6 +46,13 @@ final class ComradexStore: ObservableObject {
         claudeUsage = window
         defaults.set(window.rawValue, forKey: ClaudeUsageWindow.defaultsKey)
         if let snapshot { widgetPublisher.publish(snapshot, claudeUsage: window, userInitiated: true) }
+    }
+
+    /// The widget's view of the latest status, dated by when the daemon was last read so
+    /// remote viewers can tell when the menu app lost its connection.
+    var usageSnapshot: UsageSnapshot? {
+        guard let snapshot, let lastSuccessfulRefresh else { return nil }
+        return UsageSnapshot(status: snapshot, publishedAt: lastSuccessfulRefresh, claudeUsage: claudeUsage)
     }
 
     deinit { loginTask?.cancel() }

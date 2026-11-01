@@ -61,6 +61,8 @@ open -a ComradexMenu
 
 See the [menu app instructions](macos/ComradexMenu/README.md#install-with-homebrew) for details, including adding the desktop widget.
 
+The same widget can run on your iPhone over Tailscale; see [iPhone widget](macos/ComradexMenu/README.md#iphone-widget).
+
 ## Claude Code
 
 Claude Code accounts use a separate pool and loopback listener. Add accounts through the official Claude Code login:
