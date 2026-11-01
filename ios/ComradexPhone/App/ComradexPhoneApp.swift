@@ -40,9 +40,10 @@ struct ContentView: View {
         NavigationStack {
             List {
                 Section {
-                    // The same layout as the large widget.
+                    // The same layout as the large widget, sized to its accounts rather than
+                    // the widget's fixed height.
                     UsageWidgetView(snapshot: model.snapshot, date: Date(), family: .systemLarge)
-                        .frame(height: 330)
+                        .fixedSize(horizontal: false, vertical: true)
                         .padding(.vertical, 8)
                 } footer: {
                     if let error = model.errorMessage {
