@@ -322,7 +322,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         return item
     }
 
-    /// Serves the widget's usage to the iPhone app; `tailscale serve` exposes it to the tailnet.
+    /// Serves the widget's usage to the iPhone app over Tailscale.
     /// The title names what a click does, so the item needs no checkmark beside its icon.
     private func usageSharingItem() -> NSMenuItem {
         let state = usageShareServer?.state ?? .stopped
@@ -332,7 +332,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         switch state {
         case .stopped: detail = nil
         case .starting: detail = "Starting…"
-        case let .listening(port): detail = "Sharing on 127.0.0.1:\(port)"
+        case let .listening(port): detail = "Sharing on port \(port)"
         case let .failed(error):
             detail = "Port \(usageSharePort) unavailable"
             item.toolTip = error

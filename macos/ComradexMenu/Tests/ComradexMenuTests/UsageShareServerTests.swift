@@ -48,4 +48,22 @@ final class UsageShareServerTests: XCTestCase {
         XCTAssertEqual((urlResponse as? HTTPURLResponse)?.statusCode, 200)
         XCTAssertEqual(try UsageSnapshotStore.decode(data), snapshot)
     }
+
+    func testAnswersOnlyThisMacAndTailnetPeers() {
+        func trusted(_ text: String) -> Bool {
+            var address = in6_addr()
+            XCTAssertEqual(inet_pton(AF_INET6, text, &address), 1, text)
+            return UsageShareServer.isTrustedPeer(address)
+        }
+        XCTAssertTrue(trusted("::ffff:127.0.0.1"))
+        XCTAssertTrue(trusted("::1"))
+        XCTAssertTrue(trusted("::ffff:100.64.0.1"))
+        XCTAssertTrue(trusted("::ffff:100.127.255.254"))
+        XCTAssertTrue(trusted("fd7a:115c:a1e0::1"))
+        XCTAssertFalse(trusted("::ffff:192.168.1.20"))
+        XCTAssertFalse(trusted("::ffff:100.128.0.1"))
+        XCTAssertFalse(trusted("::ffff:100.63.255.255"))
+        XCTAssertFalse(trusted("fe80::1"))
+        XCTAssertFalse(trusted("fd7a:115c:a1e1::1"))
+    }
 }

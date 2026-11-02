@@ -36,6 +36,12 @@ targets:
         CFBundleDisplayName: Comradex
         UILaunchScreen: {}
         ComradexUsageServer: $(COMRADEX_USAGE_SERVER)
+        # The Mac serves plain HTTP; Tailscale's tunnel encrypts it.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true
   ComradexPhoneWidgets:
     type: app-extension
     platform: iOS
@@ -56,3 +62,9 @@ targets:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
         ComradexUsageServer: $(COMRADEX_USAGE_SERVER)
+        # The Mac serves plain HTTP; Tailscale's tunnel encrypts it.
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true

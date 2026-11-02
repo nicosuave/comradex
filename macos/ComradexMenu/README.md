@@ -58,14 +58,8 @@ App groups require the signing team, so the packaging script derives the team ID
 
 The same widget runs on iPhone through the companion app in [`ios/ComradexPhone`](../../ios/ComradexPhone). The phone fetches usage from this menu app over your Tailscale tailnet:
 
-1. Choose **Share Usage with iPhone** in the menu. The app then serves the widget's usage snapshot as `GET /usage` on `127.0.0.1:4363`, loopback only. The item then reads **Stop Sharing Usage with iPhone**, and its subtitle shows the address or that the port is unavailable. Change the port with `defaults write com.nicosuave.comradex.menu UsageSharePort -int <port>`, then stop and restart sharing.
-2. Publish it to your tailnet. `serve` stays inside the tailnet; do not use `funnel`, which would make it public:
-
-   ```sh
-   tailscale serve --bg --https=4363 http://127.0.0.1:4363
-   ```
-
-3. With the phone unlocked nearby, run `ios/ComradexPhone/Scripts/install.sh` on the Mac. It bakes in the Mac's tailnet URL (`https://<mac>.<tailnet>.ts.net:4363`, from `tailscale status`; override with `COMRADEX_USAGE_SERVER`) and signs with automatic provisioning, authenticating as the account signed in to Xcode or, with `ASC_KEY_ID` and `ASC_ISSUER_ID` set, an App Store Connect API key. The phone must already be registered to the team if the key's role cannot register devices. Then add the **Account Usage** widget from the home screen's widget gallery.
+1. Choose **Share Usage with iPhone** in the menu. The app then serves the widget's usage snapshot as `GET /usage` on port 4363. It answers only this Mac and Tailscale addresses (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`) and closes every other connection, so the Mac must be on your tailnet. Tailscale's tunnel encrypts the traffic, so the phone uses plain HTTP and no `tailscale serve` is needed. The item then reads **Stop Sharing Usage with iPhone**, and its subtitle shows the port or that it is unavailable. Change the port with `defaults write com.nicosuave.comradex.menu UsageSharePort -int <port>`, then stop and restart sharing. With the macOS firewall on, allow the app's incoming connections when asked.
+2. With the phone unlocked nearby, run `ios/ComradexPhone/Scripts/install.sh` on the Mac. It bakes in the Mac's tailnet URL (`http://<mac>.<tailnet>.ts.net:4363`, from `tailscale status`; override with `COMRADEX_USAGE_SERVER`) and signs with automatic provisioning, authenticating as the account signed in to Xcode or, with `ASC_KEY_ID` and `ASC_ISSUER_ID` set, an App Store Connect API key. The phone must already be registered to the team if the key's role cannot register devices. Then add the **Account Usage** widget from the home screen's widget gallery.
 
 The snapshot holds account names, quota percentages, and reset times, and anyone who can reach that port on your tailnet can read it. Use Tailscale ACLs to restrict it further. The snapshot's date is the menu app's last successful daemon read, so the phone labels data older than 30 minutes with its age. The phone widget fetches about every 15 minutes, as iOS's widget budget allows, and keeps the last good snapshot when the Mac is unreachable. Opening the app fetches immediately and reloads the widget.
 

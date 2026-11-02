@@ -60,7 +60,7 @@ struct ContentView: View {
                 } header: {
                     Text("Mac")
                 } footer: {
-                    Text("Comradex Menu shares usage when Share Usage with iPhone is on, through `tailscale serve`. Add the Account Usage widget from the home screen.")
+                    Text("Comradex Menu shares usage when Share Usage with iPhone is on and both devices are on the same tailnet. Add the Account Usage widget from the home screen.")
                 }
             }
             .navigationTitle("Comradex")
