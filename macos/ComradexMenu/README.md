@@ -21,7 +21,7 @@ The cask includes the desktop widget described below. It requires macOS 14 (Sono
 
 ## Menu and accounts
 
-Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m`. Codex accounts show their primary quota window. Claude accounts show the limit chosen under **Claude Usage**: **5-Hour Limit** (the default) or **Weekly Limit**. The choice persists, applies to the desktop widget too, and does not affect routing. The menu offers it only when a Claude account is configured. Zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details.
+Each account occupies one line with its usage and reset countdown, including connected `app` accounts: `app · 17% left · 12h 15m`. Codex accounts show their primary quota window. Claude accounts show the limit chosen under **Claude Usage**: **5-Hour Limit** (the default) or **Weekly Limit**. The choice persists, applies to the desktop widget too, and does not affect routing. The menu offers it only when some Claude account has a 5-hour limit; plans without one, such as Ultra, show the weekly limit. Zero-duration windows are omitted. Quota-exhausted accounts retain `0% left` and the exhausted window's reset countdown (falling back to the retry deadline). Other authentication or availability errors replace stale usage details.
 
 Top-level account rows have no checkmarks, routing labels, or hover tooltips. The submenu identifies the account most recently used for an upstream request (`wired`). A single pool has no section header. Multiple pools get section headers named for their provider, Codex before Claude; when a provider has more than one pool, the header adds the pool name, such as `Codex · work`.
 
@@ -58,7 +58,7 @@ App groups require the signing team, so the packaging script derives the team ID
 
 The same widget runs on iPhone through the companion app in [`ios/ComradexPhone`](../../ios/ComradexPhone). The phone fetches usage from this menu app over your Tailscale tailnet:
 
-1. Choose **Share Usage with iPhone** in the menu. The app then serves the widget's usage snapshot as `GET /usage` on `127.0.0.1:4363`, loopback only. Its subtitle shows the address, or that the port is unavailable. Change the port with `defaults write com.nicosuave.comradex.menu UsageSharePort -int <port>` and toggle sharing off and on.
+1. Choose **Share Usage with iPhone** in the menu. The app then serves the widget's usage snapshot as `GET /usage` on `127.0.0.1:4363`, loopback only. The item then reads **Stop Sharing Usage with iPhone**, and its subtitle shows the address or that the port is unavailable. Change the port with `defaults write com.nicosuave.comradex.menu UsageSharePort -int <port>`, then stop and restart sharing.
 2. Publish it to your tailnet. `serve` stays inside the tailnet; do not use `funnel`, which would make it public:
 
    ```sh

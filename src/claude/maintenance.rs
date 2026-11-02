@@ -7,6 +7,13 @@ use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 pub fn parse_usage(bytes: &[u8], now: u64) -> Result<UsageSnapshot> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid Claude usage JSON"))?;
+    // Plans without a 5-hour limit, such as Ultra, list no session limit. That window is
+    // kept as a zero-length placeholder so routing and warming still see both shared windows.
+    let session_limit = value["limits"].as_array().is_none_or(|limits| {
+        limits
+            .iter()
+            .any(|limit| limit["group"] == "session" || limit["kind"] == "session")
+    });
     let mut windows = BTreeMap::new();
     for (field, name, seconds) in [("five_hour", "5h", 18000), ("seven_day", "7d", 604800)] {
         let value = value
@@ -35,7 +42,11 @@ pub fn parse_usage(bytes: &[u8], now: u64) -> Result<UsageSnapshot> {
             QuotaWindowStatus {
                 used_percent: Some(used),
                 reset_at_unix: reset,
-                limit_window_seconds: Some(seconds),
+                limit_window_seconds: Some(if name == "5h" && !session_limit {
+                    0
+                } else {
+                    seconds
+                }),
             },
         );
     }
@@ -303,6 +314,31 @@ mod tests {
             br#"{"five_hour":{"utilization":1000},"seven_day":null}"#,
         ] {
             assert!(parse_usage(bytes, 100).is_err());
+        }
+    }
+
+    #[test]
+    fn claude_usage_without_a_session_limit_marks_the_five_hour_window_as_a_placeholder() {
+        let weekly =
+            r#"{"kind":"weekly_all","group":"weekly","percent":33,"resets_at":null,"scope":null}"#;
+        let session =
+            r#"{"kind":"session","group":"session","percent":0,"resets_at":null,"scope":null}"#;
+        for (limits, five_hour_seconds) in [
+            (None, 18000),
+            (Some(format!("[{session},{weekly}]")), 18000),
+            (Some(format!("[{weekly}]")), 0),
+        ] {
+            let limits = limits.map_or(String::new(), |limits| format!(r#","limits":{limits}"#));
+            let bytes = format!(
+                r#"{{"five_hour":null,"seven_day":{{"utilization":33,"resets_at":null}}{limits}}}"#
+            );
+            let snapshot = parse_usage(bytes.as_bytes(), 100).unwrap();
+            assert_eq!(
+                snapshot.windows["5h"].limit_window_seconds,
+                Some(five_hour_seconds)
+            );
+            assert_eq!(snapshot.windows["7d"].limit_window_seconds, Some(604800));
+            assert_eq!(snapshot.windows["7d"].used_percent, Some(33));
         }
     }
 

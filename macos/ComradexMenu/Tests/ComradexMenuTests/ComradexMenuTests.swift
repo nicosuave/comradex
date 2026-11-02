@@ -1,3 +1,4 @@
+import ComradexWidgetCore
 import Darwin
 import XCTest
 @testable import ComradexMenu
@@ -193,6 +194,60 @@ final class ComradexMenuTests: XCTestCase {
         store.apply(status: UIStatusSnapshot(accounts: [codex]))
         controller.rebuildMenu()
         XCTAssertFalse(controller.renderedMenu.items.contains { $0.title == "Claude Usage" })
+    }
+
+    @MainActor
+    func testClaudeAccountsWithoutAFiveHourLimitHideTheUsageChoice() throws {
+        let now = Int64(Date().timeIntervalSince1970)
+        let ultra = try decodeAccount("""
+        {"name":"ultra","kind":"claude_home","signed_in":true,"auth_state":"signed_in","pools":["claude"],"usage_windows":{
+          "5h":{"used_percent":0,"limit_window_seconds":0},
+          "7d":{"used_percent":33,"reset_at_unix":\(now + 2 * 86_400 + 7_500),"limit_window_seconds":604800}
+        }}
+        """)
+        let max = try decodeAccount("""
+        {"name":"max","kind":"claude_home","signed_in":true,"auth_state":"signed_in","pools":["claude"],"usage_windows":{
+          "5h":{"used_percent":11,"reset_at_unix":\(now + 7_500),"limit_window_seconds":18000},
+          "7d":{"used_percent":40,"reset_at_unix":\(now + 5 * 86_400 + 7_500),"limit_window_seconds":604800}
+        }}
+        """)
+        let store = ComradexStore(client: StubClient())
+        XCTAssertEqual(store.claudeUsage, .fiveHour)
+        store.apply(status: UIStatusSnapshot(accounts: [ultra]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+
+        XCTAssertFalse(controller.renderedMenu.items.contains { $0.title == "Claude Usage" })
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("ultra · 67% left · 2d 2h") })
+        let widget = UsageAccount(account: ultra, claudeUsage: store.claudeUsage)
+        XCTAssertEqual(widget.windows.map(\.duration), [604_800])
+        XCTAssertEqual(widget.summaryWindowIndex, 0)
+
+        // One account with a 5-hour limit still makes the choice meaningful.
+        store.apply(status: UIStatusSnapshot(accounts: [ultra, max]))
+        controller.rebuildMenu()
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title == "Claude Usage" })
+    }
+
+    @MainActor
+    func testUsageSharingNamesItsActionInsteadOfShowingACheckmark() throws {
+        let suite = "ComradexMenuTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(Int.random(in: 49_152...65_000), forKey: UsageShareServer.portDefaultsKey)
+        let controller = MenuBarController(store: ComradexStore(client: StubClient()), defaults: defaults)
+        controller.rebuildMenu()
+
+        let share = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("Share Usage with iPhone") })
+        XCTAssertEqual(share.state, .off)
+        try XCTUnwrap(share.target as? NSObject).perform(try XCTUnwrap(share.action), with: share)
+        XCTAssertTrue(defaults.bool(forKey: UsageShareServer.enabledDefaultsKey))
+
+        let stop = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("Stop Sharing Usage with iPhone") })
+        XCTAssertEqual(stop.state, .off)
+        try XCTUnwrap(stop.target as? NSObject).perform(try XCTUnwrap(stop.action), with: stop)
+        XCTAssertFalse(defaults.bool(forKey: UsageShareServer.enabledDefaultsKey))
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("Share Usage with iPhone") })
     }
 
     @MainActor
