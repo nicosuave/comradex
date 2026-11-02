@@ -47,7 +47,7 @@ if [[ -z "${COMRADEX_USAGE_SERVER:-}" ]]; then
     echo "ERROR: Could not read this Mac's Tailscale name; set COMRADEX_USAGE_SERVER" >&2
     exit 1
   fi
-  COMRADEX_USAGE_SERVER="https://${MAC_NAME}:4363"
+  COMRADEX_USAGE_SERVER="http://${MAC_NAME}:4363"
 fi
 
 AUTH_ARGS=()

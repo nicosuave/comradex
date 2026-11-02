@@ -49,33 +49,21 @@ final class UsageShareServerTests: XCTestCase {
         XCTAssertEqual(try UsageSnapshotStore.decode(data), snapshot)
     }
 
-    /// `tailscale serve` listens on the same port at the tailnet address; loopback must still bind.
-    @MainActor
-    func testSharesAPortAnotherAddressAlreadyListensOn() async throws {
-        let other = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
-        defer { Darwin.close(other) }
-        var v6Only: Int32 = 1
-        setsockopt(other, IPPROTO_IPV6, IPV6_V6ONLY, &v6Only, socklen_t(MemoryLayout<Int32>.size))
-        var address = sockaddr_in6()
-        address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-        address.sin6_family = sa_family_t(AF_INET6)
-        address.sin6_addr = in6addr_loopback
-        var length = socklen_t(MemoryLayout<sockaddr_in6>.size)
-        withUnsafeMutablePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                XCTAssertEqual(Darwin.bind(other, socketAddress, length), 0)
-                XCTAssertEqual(Darwin.listen(other, 1), 0)
-                XCTAssertEqual(getsockname(other, socketAddress, &length), 0)
-            }
+    func testAnswersOnlyThisMacAndTailnetPeers() {
+        func trusted(_ text: String) -> Bool {
+            var address = in6_addr()
+            XCTAssertEqual(inet_pton(AF_INET6, text, &address), 1, text)
+            return UsageShareServer.isTrustedPeer(address)
         }
-        let port = UInt16(bigEndian: address.sin6_port)
-
-        let server = UsageShareServer(port: port) { snapshot }
-        server.start()
-        defer { server.stop() }
-        XCTAssertEqual(server.state, .listening(port: port))
-
-        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)/usage")!)
-        XCTAssertEqual(try UsageSnapshotStore.decode(data), snapshot)
+        XCTAssertTrue(trusted("::ffff:127.0.0.1"))
+        XCTAssertTrue(trusted("::1"))
+        XCTAssertTrue(trusted("::ffff:100.64.0.1"))
+        XCTAssertTrue(trusted("::ffff:100.127.255.254"))
+        XCTAssertTrue(trusted("fd7a:115c:a1e0::1"))
+        XCTAssertFalse(trusted("::ffff:192.168.1.20"))
+        XCTAssertFalse(trusted("::ffff:100.128.0.1"))
+        XCTAssertFalse(trusted("::ffff:100.63.255.255"))
+        XCTAssertFalse(trusted("fe80::1"))
+        XCTAssertFalse(trusted("fd7a:115c:a1e1::1"))
     }
 }

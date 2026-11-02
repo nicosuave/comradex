@@ -4,8 +4,9 @@ import OSLog
 
 /// Serves the widget's usage snapshot as `GET /usage` for the iPhone app.
 ///
-/// The listener binds only to loopback. Expose it to the tailnet with
-/// `tailscale serve`, which adds TLS and keeps it off the public internet.
+/// The iPhone reaches it directly over Tailscale, whose tunnel already encrypts the
+/// traffic. The socket listens on every interface so it follows Tailscale's address,
+/// but only this Mac and tailnet peers get an answer.
 @MainActor
 final class UsageShareServer {
     static let defaultPort: UInt16 = 4363
@@ -39,12 +40,12 @@ final class UsageShareServer {
 
     func start() {
         guard listener == nil else { return }
-        // A BSD socket, not NWListener: Network.framework refuses a port that any address
-        // already uses, so `tailscale serve` on the tailnet address would block loopback.
+        // A BSD socket, not NWListener, so each connection's peer address can be checked
+        // before anything is read from it.
         let descriptor: Int32
         let port: UInt16
         do {
-            (descriptor, port) = try Self.listenOnLoopback(port: requestedPort)
+            (descriptor, port) = try Self.listen(port: requestedPort)
         } catch {
             logger.error("Usage sharing listener failed: \(error.localizedDescription, privacy: .public)")
             state = .failed(error.localizedDescription)
@@ -66,19 +67,21 @@ final class UsageShareServer {
         state = .stopped
     }
 
-    /// Returns a nonblocking listening socket on 127.0.0.1 and the port it bound.
-    private static func listenOnLoopback(port: UInt16) throws -> (Int32, UInt16) {
-        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+    /// Returns a nonblocking dual-stack listening socket on every interface and the port it bound.
+    private static func listen(port: UInt16) throws -> (Int32, UInt16) {
+        let descriptor = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
         do {
-            var reuse: Int32 = 1
-            setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-            var address = sockaddr_in()
-            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            address.sin_family = sa_family_t(AF_INET)
-            address.sin_port = port.bigEndian
-            address.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
-            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            var on: Int32 = 1
+            var off: Int32 = 0
+            setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
+            setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
+            var address = sockaddr_in6()
+            address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            address.sin6_family = sa_family_t(AF_INET6)
+            address.sin6_port = port.bigEndian
+            address.sin6_addr = in6addr_any
+            var length = socklen_t(MemoryLayout<sockaddr_in6>.size)
             try withUnsafeMutablePointer(to: &address) { pointer in
                 try pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
                     guard Darwin.bind(descriptor, socketAddress, length) == 0,
@@ -88,7 +91,7 @@ final class UsageShareServer {
                 }
             }
             _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK)
-            return (descriptor, UInt16(bigEndian: address.sin_port))
+            return (descriptor, UInt16(bigEndian: address.sin6_port))
         } catch {
             Darwin.close(descriptor)
             throw error
@@ -97,12 +100,32 @@ final class UsageShareServer {
 
     private func acceptPending(on descriptor: Int32) {
         while true {
-            let client = Darwin.accept(descriptor, nil, nil)
+            var peer = sockaddr_in6()
+            var length = socklen_t(MemoryLayout<sockaddr_in6>.size)
+            let client = withUnsafeMutablePointer(to: &peer) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.accept(descriptor, $0, &length) }
+            }
             guard client >= 0 else { return }
+            guard Self.isTrustedPeer(peer.sin6_addr) else {
+                Darwin.close(client)
+                continue
+            }
             var noSignal: Int32 = 1
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
             serve(client)
         }
+    }
+
+    /// Loopback and Tailscale's address ranges: 100.64.0.0/10 and fd7a:115c:a1e0::/48.
+    /// IPv4 peers arrive as IPv4-mapped IPv6 addresses on the dual-stack socket.
+    nonisolated static func isTrustedPeer(_ address: in6_addr) -> Bool {
+        let bytes = withUnsafeBytes(of: address) { Array($0) }
+        let mappedPrefix: [UInt8] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF]
+        if Array(bytes[0..<12]) == mappedPrefix {
+            return bytes[12] == 127 || (bytes[12] == 100 && bytes[13] & 0xC0 == 64)
+        }
+        if bytes == Array(repeating: 0, count: 15) + [1] { return true }
+        return Array(bytes[0..<6]) == [0xFD, 0x7A, 0x11, 0x5C, 0xA1, 0xE0]
     }
 
     /// Reads one request from the nonblocking client socket, answers it, and closes it.
