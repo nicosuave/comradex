@@ -48,4 +48,34 @@ final class UsageShareServerTests: XCTestCase {
         XCTAssertEqual((urlResponse as? HTTPURLResponse)?.statusCode, 200)
         XCTAssertEqual(try UsageSnapshotStore.decode(data), snapshot)
     }
+
+    /// `tailscale serve` listens on the same port at the tailnet address; loopback must still bind.
+    @MainActor
+    func testSharesAPortAnotherAddressAlreadyListensOn() async throws {
+        let other = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
+        defer { Darwin.close(other) }
+        var v6Only: Int32 = 1
+        setsockopt(other, IPPROTO_IPV6, IPV6_V6ONLY, &v6Only, socklen_t(MemoryLayout<Int32>.size))
+        var address = sockaddr_in6()
+        address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        address.sin6_family = sa_family_t(AF_INET6)
+        address.sin6_addr = in6addr_loopback
+        var length = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                XCTAssertEqual(Darwin.bind(other, socketAddress, length), 0)
+                XCTAssertEqual(Darwin.listen(other, 1), 0)
+                XCTAssertEqual(getsockname(other, socketAddress, &length), 0)
+            }
+        }
+        let port = UInt16(bigEndian: address.sin6_port)
+
+        let server = UsageShareServer(port: port) { snapshot }
+        server.start()
+        defer { server.stop() }
+        XCTAssertEqual(server.state, .listening(port: port))
+
+        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:\(port)/usage")!)
+        XCTAssertEqual(try UsageSnapshotStore.decode(data), snapshot)
+    }
 }

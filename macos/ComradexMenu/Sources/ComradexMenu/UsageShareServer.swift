@@ -1,6 +1,5 @@
 import ComradexWidgetCore
 import Foundation
-import Network
 import OSLog
 
 /// Serves the widget's usage snapshot as `GET /usage` for the iPhone app.
@@ -29,7 +28,7 @@ final class UsageShareServer {
 
     private let requestedPort: UInt16
     private let snapshot: @MainActor () -> UsageSnapshot?
-    private var listener: NWListener?
+    private var listener: DispatchSourceRead?
     private let logger = Logger(subsystem: "com.nicosuave.comradex.menu", category: "usage-share")
 
     /// Port 0 picks an ephemeral port, for tests.
@@ -40,28 +39,25 @@ final class UsageShareServer {
 
     func start() {
         guard listener == nil else { return }
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-        parameters.requiredLocalEndpoint = .hostPort(
-            host: .ipv4(.loopback),
-            port: NWEndpoint.Port(rawValue: requestedPort) ?? .any
-        )
-        let listener: NWListener
+        // A BSD socket, not NWListener: Network.framework refuses a port that any address
+        // already uses, so `tailscale serve` on the tailnet address would block loopback.
+        let descriptor: Int32
+        let port: UInt16
         do {
-            listener = try NWListener(using: parameters)
+            (descriptor, port) = try Self.listenOnLoopback(port: requestedPort)
         } catch {
+            logger.error("Usage sharing listener failed: \(error.localizedDescription, privacy: .public)")
             state = .failed(error.localizedDescription)
             return
         }
-        self.listener = listener
-        state = .starting
-        listener.stateUpdateHandler = { [weak self] update in
-            MainActor.assumeIsolated { self?.listenerChanged(update) }
+        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: .main)
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.acceptPending(on: descriptor) }
         }
-        listener.newConnectionHandler = { [weak self] connection in
-            MainActor.assumeIsolated { self?.accept(connection) }
-        }
-        listener.start(queue: .main)
+        source.setCancelHandler { Darwin.close(descriptor) }
+        listener = source
+        source.resume()
+        state = .listening(port: port)
     }
 
     func stop() {
@@ -70,52 +66,90 @@ final class UsageShareServer {
         state = .stopped
     }
 
-    private func listenerChanged(_ update: NWListener.State) {
-        switch update {
-        case .ready:
-            state = .listening(port: listener?.port?.rawValue ?? requestedPort)
-        case let .failed(error), let .waiting(error):
-            logger.error("Usage sharing listener failed: \(error.localizedDescription, privacy: .public)")
-            listener?.cancel()
-            listener = nil
-            state = .failed(error.localizedDescription)
-        default:
-            break
+    /// Returns a nonblocking listening socket on 127.0.0.1 and the port it bound.
+    private static func listenOnLoopback(port: UInt16) throws -> (Int32, UInt16) {
+        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        do {
+            var reuse: Int32 = 1
+            setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = port.bigEndian
+            address.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            try withUnsafeMutablePointer(to: &address) { pointer in
+                try pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                    guard Darwin.bind(descriptor, socketAddress, length) == 0,
+                          Darwin.listen(descriptor, SOMAXCONN) == 0,
+                          getsockname(descriptor, socketAddress, &length) == 0
+                    else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+                }
+            }
+            _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL) | O_NONBLOCK)
+            return (descriptor, UInt16(bigEndian: address.sin_port))
+        } catch {
+            Darwin.close(descriptor)
+            throw error
         }
     }
 
-    private func accept(_ connection: NWConnection) {
-        connection.start(queue: .main)
-        // A client that never finishes its request must not hold the connection open.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { connection.cancel() }
-        receive(on: connection, buffered: Data())
+    private func acceptPending(on descriptor: Int32) {
+        while true {
+            let client = Darwin.accept(descriptor, nil, nil)
+            guard client >= 0 else { return }
+            var noSignal: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+            serve(client)
+        }
     }
 
-    private func receive(on connection: NWConnection, buffered: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maximumRequestSize) { [weak self] data, _, isComplete, error in
+    /// Reads one request from the nonblocking client socket, answers it, and closes it.
+    private func serve(_ client: Int32) {
+        _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK)
+        let source = DispatchSource.makeReadSource(fileDescriptor: client, queue: .main)
+        var request = Data()
+        var finished = false
+        let finish: (Data?) -> Void = { response in
+            guard !finished else { return }
+            finished = true
+            if let response { Self.writeAll(response, to: client) }
+            source.cancel()
+        }
+        source.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
-                guard let self else { return connection.cancel() }
-                var request = buffered
-                if let data { request.append(data) }
+                var buffer = [UInt8](repeating: 0, count: 4_096)
+                let count = Darwin.read(client, &buffer, buffer.count)
+                if count < 0, errno == EAGAIN { return }
+                guard count > 0, let self else { return finish(nil) }
+                request.append(contentsOf: buffer[0..<count])
                 if request.range(of: Data("\r\n\r\n".utf8)) != nil {
-                    self.respond(on: connection, to: request)
+                    finish(Self.response(to: request, snapshot: self.snapshot()))
                 } else if request.count > Self.maximumRequestSize {
-                    self.send(Self.response(status: "431 Request Header Fields Too Large"), on: connection)
-                } else if isComplete || error != nil {
-                    connection.cancel()
-                } else {
-                    self.receive(on: connection, buffered: request)
+                    finish(Self.response(status: "431 Request Header Fields Too Large"))
                 }
             }
         }
+        source.setCancelHandler { Darwin.close(client) }
+        source.resume()
+        // A client that never finishes its request must not hold the connection open.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { finish(nil) }
     }
 
-    private func respond(on connection: NWConnection, to request: Data) {
-        send(Self.response(to: request, snapshot: snapshot()), on: connection)
-    }
-
-    private func send(_ response: Data, on connection: NWConnection) {
-        connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
+    /// Responses are a few kilobytes, so a short blocking write is enough.
+    private static func writeAll(_ data: Data, to client: Int32) {
+        _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) & ~O_NONBLOCK)
+        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let written = Darwin.write(client, bytes.baseAddress! + offset, bytes.count - offset)
+                guard written > 0 else { return }
+                offset += written
+            }
+        }
     }
 
     /// Builds the HTTP response for a raw request. Only `GET /usage` succeeds.
