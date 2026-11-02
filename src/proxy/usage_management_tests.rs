@@ -298,6 +298,24 @@ async fn management_projects_all_reported_windows_without_changing_routing_or_po
             .load(Ordering::Relaxed),
         0
     );
+    // A plan without a 5-hour limit reports it as null, as Anthropic does.
+    fixture
+        .observe(
+            "anna",
+            &[
+                ("5h", Some(0), Some(0), None),
+                ("7d", Some(33), Some(604800), Some(4103049600)),
+            ],
+        )
+        .await;
+    let anna = usage_body(fixture.call("anna", "GET", CLAUDE_URL).await).await;
+    assert_eq!(
+        anna,
+        json!({
+            "five_hour": null,
+            "seven_day": { "utilization": 33, "resets_at": "2100-01-08T00:00:00Z" },
+        })
+    );
     fixture.app.shutdown_connections().await;
 }
 

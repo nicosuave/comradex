@@ -143,7 +143,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             menu.items.last?.toolTip = error
         }
         menu.addItem(.separator())
-        if store.snapshot?.accounts.contains(where: \.isClaude) == true {
+        if store.snapshot?.offersClaudeUsageChoice == true {
             menu.addItem(claudeUsageItem())
         }
         menu.addItem(usageSharingItem())
@@ -323,14 +323,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     /// Serves the widget's usage to the iPhone app; `tailscale serve` exposes it to the tailnet.
+    /// The title names what a click does, so the item needs no checkmark beside its icon.
     private func usageSharingItem() -> NSMenuItem {
-        let item = actionItem(title: "Share Usage with iPhone", icon: "iphone", action: #selector(usageSharingSelected(_:)))
         let state = usageShareServer?.state ?? .stopped
-        item.state = state == .stopped ? .off : .on
+        let title = state == .stopped ? "Share Usage with iPhone" : "Stop Sharing Usage with iPhone"
+        let item = actionItem(title: title, icon: "iphone", action: #selector(usageSharingSelected(_:)))
         let detail: String?
         switch state {
-        case .stopped, .starting: detail = nil
-        case let .listening(port): detail = "127.0.0.1:\(port)"
+        case .stopped: detail = nil
+        case .starting: detail = "Starting…"
+        case let .listening(port): detail = "Sharing on 127.0.0.1:\(port)"
         case let .failed(error):
             detail = "Port \(usageSharePort) unavailable"
             item.toolTip = error
@@ -339,7 +341,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             if #available(macOS 14.4, *) {
                 item.subtitle = detail
             } else {
-                item.title = "Share Usage with iPhone · \(detail)"
+                item.title = "\(title) · \(detail)"
             }
         }
         return item

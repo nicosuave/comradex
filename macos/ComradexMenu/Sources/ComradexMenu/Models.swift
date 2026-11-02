@@ -140,6 +140,10 @@ enum ClaudeUsageWindow: String, CaseIterable, Sendable {
 }
 
 extension AccountSnapshot {
+    /// Claude plans without a 5-hour limit, such as Ultra, report that window as a
+    /// zero-duration placeholder.
+    var lacksFiveHourLimit: Bool { isClaude && usageWindows["5h"]?.limitWindowSeconds == 0 }
+
     /// The usage window that summarizes this account: Claude's chosen limit, or
     /// the provider's primary window. Zero-duration placeholder windows are skipped.
     func summaryWindowKey(claudeUsage: ClaudeUsageWindow) -> String? {
@@ -193,6 +197,10 @@ struct PoolSnapshot: Codable, Equatable, Identifiable, Sendable {
 }
 
 struct UIStatusSnapshot: Codable, Equatable, Sendable {
+    /// Choosing between Claude's 5-hour and weekly limits only matters when some Claude
+    /// account has a 5-hour limit.
+    var offersClaudeUsageChoice: Bool { accounts.contains { $0.isClaude && !$0.lacksFiveHourLimit } }
+
     let daemonRunning: Bool?
     let codexRouted: Bool?
     let service: JSONValue?

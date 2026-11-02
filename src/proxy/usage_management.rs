@@ -226,6 +226,10 @@ impl App {
                 continue;
             };
             if window.limit_window_seconds == Some(0) {
+                // Anthropic reports a limit the plan does not have as null.
+                if claude {
+                    windows.insert((*field).into(), Value::Null);
+                }
                 continue;
             }
             let value = if claude {
@@ -246,7 +250,7 @@ impl App {
             };
             windows.insert((*field).into(), value);
         }
-        if windows.is_empty() {
+        if windows.values().all(Value::is_null) {
             return usage_unavailable();
         }
         let body = if claude {
