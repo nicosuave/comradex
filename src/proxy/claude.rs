@@ -307,6 +307,8 @@ impl App {
             && pinned.is_none()
             && session_route.assigned.is_none();
         let mut exact = session_route.assigned.clone().or(owner).or(pinned);
+        // An assignment, owner, or pin is a routing decision that must not silently fall back.
+        let freely_placed = exact.is_none();
         let mut moved_from = None;
         let mut remaining = pool.clone();
         let mut last_rejection = None;
@@ -550,10 +552,10 @@ impl App {
                 ClaudeBody::new(incoming, admission, None, None).boxed(),
             ));
         }
-        if !native.rewritable {
-            // Its own account is unavailable; the caller's credential may still work.
+        if freely_placed || !native.rewritable {
+            // No pooled account can take it; the caller's own credential still might.
             tracing::warn!(
-                "forwarding Claude inference without pooling: matching account unavailable"
+                "forwarding Claude inference without pooling: no eligible pooled account"
             );
             let request = Request::from_parts(parts, bytes_body(body));
             return self.claude_passthrough(request, admission).await;
@@ -1287,6 +1289,20 @@ kind="claude_inbound"
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0["authorization"], "Bearer sk-ant-oat01-caller");
         assert_eq!(seen[0].1, body);
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn freely_placed_inference_uses_the_caller_when_no_account_is_eligible() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        harness.app.router.reauth_required("grace").await;
+        harness.app.router.reauth_required("ada").await;
+        let response = harness.send(request_body(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0["authorization"], "Bearer sk-ant-oat01-caller");
+        assert_eq!(seen[0].1, request_body());
         harness.close().await;
     }
     #[tokio::test]
