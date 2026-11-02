@@ -1009,6 +1009,8 @@ fn usage_remaining_summary(status: &comradex::routing::AccountRoutingStatus) -> 
     let mut windows = status
         .usage_windows
         .iter()
+        // A zero-length window is a limit the plan does not have, such as Claude Ultra's 5-hour limit.
+        .filter(|(_, window)| window.limit_window_seconds != Some(0))
         .filter_map(|(name, window)| window.used_percent.map(|used| (name, window, used)))
         .collect::<Vec<_>>();
     windows.sort_by_key(|(name, window, _)| {
@@ -1880,6 +1882,14 @@ mod tests {
                     comradex::routing::QuotaWindowStatus {
                         used_percent: Some(81),
                         limit_window_seconds: Some(604_800),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "5h".to_owned(),
+                    comradex::routing::QuotaWindowStatus {
+                        used_percent: Some(0),
+                        limit_window_seconds: Some(0),
                         ..Default::default()
                     },
                 ),
