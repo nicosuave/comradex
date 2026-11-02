@@ -97,7 +97,7 @@ auto_activate_claude_usage = true
 
 The usage worker checks every five minutes; the menubar's Refresh requests an earlier check. An elapsed or newly full window is warmed by running the installed Claude Code once with a tiny Haiku prompt, no tools, and a temporary profile holding that account's access token but not its refresh grant. Warming stays on the selected account and skips active limits, concurrent traffic on the account, and windows already started by normal use. Attempts survive daemon restarts, and uncertain attempts wait an hour before retrying. Warming consumes a small amount of subscription quota.
 
-See [Claude Code requests](#claude-code-requests) for what the relay changes and its limits.
+See [Claude Code requests](#claude-code-requests) for what the relay pools, what it forwards unchanged, and its limits.
 
 ## Usage endpoint
 
@@ -558,7 +558,9 @@ Allocation instrumentation is disabled in normal builds. For a diagnostic daemon
 
 ### Claude Code requests
 
-The Claude listener accepts native Claude Code subscription requests for Messages, token counting, model listing, and the startup probe. Supported entry points are the CLI, VS Code, and Claude Code launched by the TypeScript or Python Agent SDK. Requests from other clients, API keys, and inconsistent native identity are rejected; Comradex does not translate foreign harnesses or manufacture Claude Code headers. These checks establish compatibility, not proof of the calling executable.
+Apart from relay capacity limits (concurrent requests and buffered body size), Comradex does not reject requests that Anthropic might accept, and does not add anything to them. It pools inference (Messages and token counting) whenever it can swap the account coherently: one subscription OAuth bearer, no API key, an uncompressed JSON body whose `metadata.user_id` carries a session, account, and device identity, and either no request checksum or one it knows how to re-sign. The client, entry point, and beta headers do not matter, so Claude Code launched by T3 Code or any other harness is pooled the same way.
+
+Everything else is forwarded upstream as sent, minus hop-by-hop headers, with the caller's own credential: other endpoints, API-key requests, compressed bodies, and inference whose identity or checksum cannot be rewritten. Inference forwarded this way is logged with the reason, never the request contents. Model listing uses the pool's `models_account` when one is configured and the caller is using subscription OAuth.
 
 Prompts, tools, thinking, cache controls, beta headers, and response bytes pass through unchanged. Routing changes only the OAuth bearer, the account and device identity in `metadata.user_id`, and an already-present request checksum. Claude Code sends an empty account ID when it has no cached account profile; routing fills it with the selected account's ID.
 
