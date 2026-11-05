@@ -1846,19 +1846,27 @@ kind = "inbound"
                 restarted.routing_snapshot().await.preserved_accounts,
                 live.preserved_accounts
             );
-            // Changing roles never moves the already-bound conversation.
+            // Changing roles keeps a bound conversation in place, except that the preserved
+            // account hands it to the preferred account.
+            let conversation = router.affinity.key("fresh");
+            router.bind(conversation.clone(), "b").await;
+            let expected = if preserved == Some("b") {
+                preferred.unwrap_or("b")
+            } else {
+                "b"
+            };
             assert_eq!(
                 router
                     .select(
                         "default",
                         &config.pools["default"],
-                        Some(router.affinity.key("fresh")),
+                        Some(conversation),
                         None
                     )
                     .await
                     .unwrap()
                     .account_id,
-                "b"
+                expected
             );
         }
         for (pool, account) in [("missing", "a"), ("default", "missing")] {
