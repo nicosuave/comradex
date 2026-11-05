@@ -11,6 +11,10 @@ use std::collections::BTreeSet;
 pub struct NativeRequest {
     pub session: String,
     pub account: String,
+    pub device: String,
+    /// False when the identity or checksum cannot be rewritten for a different account.
+    /// Such requests may still use an account whose identity matches, which needs no edit.
+    pub rewritable: bool,
     pub model: String,
     pub portability: Portability,
     pub conversation: String,
@@ -46,62 +50,41 @@ pub fn uuid(value: &str) -> bool {
         })
 }
 
-pub fn native_headers(headers: &HeaderMap) -> bool {
-    let ua = header(headers, "user-agent");
-    let Some(rest) = ua.strip_prefix("claude-cli/") else {
-        return false;
-    };
-    let Some((version, profile)) = rest.split_once(" (") else {
-        return false;
-    };
-    let Some(profile) = profile.strip_suffix(')') else {
-        return false;
-    };
-    // The native Agent SDK adds fields after the entry point, for example
-    // `(external, sdk-ts, agent-sdk/0.3.276)`. Match the field, not the suffix.
-    let mut fields = profile.split(", ");
-    let Some(_environment) = fields.next().filter(|v| !v.is_empty()) else {
-        return false;
-    };
-    let Some(entrypoint) = fields.next() else {
-        return false;
-    };
-    version.split('.').count() == 3
-        && version
-            .split('.')
-            .all(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-        && matches!(
-            entrypoint,
-            "cli" | "sdk-cli" | "sdk-ts" | "sdk-py" | "claude-vscode"
-        )
+/// Header preconditions for swapping a request onto a pooled subscription account.
+/// Any client may be pooled; these only establish that Comradex can replace the credential
+/// coherently. Returns why the request must instead be forwarded unchanged.
+pub fn unpoolable_headers(headers: &HeaderMap) -> Option<&'static str> {
+    let mut authorization = headers.get_all("authorization").iter();
+    let bearer = authorization.next().and_then(|v| v.to_str().ok());
+    if authorization.next().is_some() {
+        return Some("multiple authorization headers");
+    }
+    if !bearer.is_some_and(|v| v.starts_with("Bearer sk-ant-oat")) {
+        return Some("not a subscription OAuth request");
+    }
+    if headers.contains_key("x-api-key") {
+        return Some("API key present");
+    }
+    if headers
+        .get("content-encoding")
+        .is_some_and(|v| v.as_bytes() != b"identity")
+    {
+        return Some("encoded request body");
+    }
+    None
 }
 
 pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<NativeRequest> {
-    ensure!(
-        native_headers(headers) && header(headers, "x-app") == "cli",
-        "native Claude Code headers required"
-    );
-    ensure!(
-        header(headers, "authorization").starts_with("Bearer sk-ant-oat"),
-        "native subscription OAuth required"
-    );
-    ensure!(
-        !headers.contains_key("x-api-key"),
-        "API-key harnesses are not supported"
-    );
-    let betas: Vec<&str> = headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(',').map(str::trim))
-        .collect();
-    ensure!(betas.contains(&"oauth-2025-04-20"), "OAuth beta required");
+    if let Some(reason) = unpoolable_headers(headers) {
+        bail!(reason)
+    }
     let raw: &RawValue = serde_json::from_slice(body).context("invalid Claude request JSON")?;
     let fields = object(raw)?;
     let model = string(member(&fields, "model")?.context("model required")?)?;
     ensure!(!model.is_empty() && model.len() <= 512, "invalid model");
     let mut session = header(headers, "x-claude-code-session-id").to_owned();
     let mut account = String::new();
+    let mut device = String::new();
     if let Some(metadata) = member(&fields, "metadata")? {
         let metadata = object(metadata)?;
         let identity = string(member(&metadata, "user_id")?.context("native user_id required")?)?;
@@ -110,7 +93,7 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
         let identity_fields = object(raw)?;
         account =
             string(member(&identity_fields, "account_uuid")?.context("account_uuid required")?)?;
-        let device = string(member(&identity_fields, "device_id")?.context("device_id required")?)?;
+        device = string(member(&identity_fields, "device_id")?.context("device_id required")?)?;
         let body_session =
             string(member(&identity_fields, "session_id")?.context("session_id required")?)?;
         ensure!(
@@ -132,22 +115,28 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
         ensure!(count_tokens, "native metadata required");
     }
     ensure!(uuid(&session), "native session UUID required");
-    // Native helper requests can omit the main Claude Code beta. Their SDK, identity,
-    // and model signals must still agree; unknown callers never get a fabricated profile.
-    // Claude Code 2.1.288 (SDK 0.128.0) no longer sends `x-stainless-async`.
-    if !betas.contains(&"claude-code-20250219") {
-        ensure!(
-            !count_tokens
-                && model.starts_with("claude-haiku-")
-                && header(headers, "x-stainless-lang") == "js"
-                && header(headers, "x-stainless-runtime") == "node",
-            "unrecognized native helper profile"
-        );
-    }
+    // Check before routing whether the identity and checksum can be rewritten for another
+    // account. The probe identity differs from the request's so every edit is exercised.
+    let pick = |probe: [&'static str; 2], current: &str| {
+        if current == probe[0] {
+            probe[1]
+        } else {
+            probe[0]
+        }
+    };
+    let rewritable = device.is_empty()
+        || rewrite(
+            body,
+            pick(PROBE_ACCOUNT, &account),
+            pick(PROBE_DEVICE, &device),
+        )
+        .is_ok();
     let value: Value = serde_json::from_slice(body)?;
     Ok(NativeRequest {
         session,
         account,
+        device,
+        rewritable,
         model,
         conversation: conversation(&value),
         portability: if ["container", "container_id", "fallback_credit_token"]
@@ -167,6 +156,17 @@ pub fn inspect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Result<N
         },
     })
 }
+
+// Synthetic identities for the pre-routing rewrite check; the second is used when the
+// request already carries the first.
+const PROBE_ACCOUNT: [&str; 2] = [
+    "00000000-0000-4000-8000-000000000000",
+    "11111111-1111-4111-8111-111111111111",
+];
+const PROBE_DEVICE: [&str; 2] = [
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "1111111111111111111111111111111111111111111111111111111111111111",
+];
 
 /// Helper and subagent requests share their parent session but open with their own first
 /// message. Cache breakpoints move between turns and can turn text content into blocks.
@@ -533,29 +533,17 @@ fn normalize(
 mod tests {
     use super::*;
     #[test]
-    fn native_user_agent_recognizes_sdk_entrypoints_and_optional_attribution_fields() {
+    fn any_client_identity_can_be_pooled() {
         let mut headers = headers();
         for ua in [
+            "claude-cli/2.1.281 (external, t3-code, agent-sdk/0.3.276)",
             "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.3.276)",
-            "claude-cli/2.1.281 (external, sdk-py, agent-sdk/0.1.0)",
-            "claude-cli/2.1.281 (external, sdk-cli)",
             "claude-cli/2.1.281 (external, cli, client-app/example)",
-            "claude-cli/2.1.281 (external, claude-vscode)",
+            "claude-cli/9.0.0-beta (some-future-entrypoint)",
+            "OpenCode/1.0",
         ] {
             headers.insert("user-agent", ua.parse().unwrap());
-            assert!(native_headers(&headers), "{ua}");
             assert!(inspect(&headers, &body(), false).is_ok(), "{ua}");
-        }
-        for ua in [
-            "claude-cli/2.1.281 (external, foreign, sdk-cli)",
-            "claude-cli/2.1.281 (external, sdk-ts-foreign, agent-sdk/0.3.276)",
-            "claude-cli/2.1.281 (external, sdk-ts, agent-sdk/0.3.276",
-            "claude-cli/2.1 (external, sdk-ts)",
-            "claude-cli/2.1.281 (external)",
-            "anthropic-typescript/0.3.276 (external, sdk-ts)",
-        ] {
-            headers.insert("user-agent", ua.parse().unwrap());
-            assert!(!native_headers(&headers), "{ua}");
         }
     }
     pub const ACCOUNT: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -585,20 +573,38 @@ mod tests {
         })).unwrap()
     }
     #[test]
-    fn native_gate_rejects_foreign_and_inconsistent_requests() {
+    fn pooling_needs_only_a_coherent_credential_and_identity() {
         let bytes = body();
         let good = headers();
         assert_eq!(inspect(&good, &bytes, false).unwrap().session, SESSION);
-        for name in ["user-agent", "x-app", "authorization", "anthropic-beta"] {
-            let mut bad = good.clone();
-            bad.remove(name);
-            assert!(inspect(&bad, &bytes, false).is_err(), "{name}");
+        // Client attribution never decides pooling.
+        for name in ["user-agent", "x-app", "anthropic-beta"] {
+            let mut headers = good.clone();
+            headers.remove(name);
+            assert!(inspect(&headers, &bytes, false).is_ok(), "{name}");
         }
+        // Helper requests without the Claude Code beta or SDK headers are pooled too.
+        let mut helper = good.clone();
+        helper.insert("anthropic-beta", "oauth-2025-04-20".parse().unwrap());
+        assert!(inspect(&helper, &bytes, true).is_ok());
+
         let mut bad = good.clone();
-        bad.insert("user-agent", "OpenCode/1.0".parse().unwrap());
+        bad.remove("authorization");
+        assert!(inspect(&bad, &bytes, false).is_err());
+        let mut bad = good.clone();
+        bad.insert("authorization", "Bearer sk-ant-api03-key".parse().unwrap());
+        assert!(inspect(&bad, &bytes, false).is_err());
+        let mut bad = good.clone();
+        bad.append(
+            "authorization",
+            "Bearer sk-ant-oat01-other".parse().unwrap(),
+        );
         assert!(inspect(&bad, &bytes, false).is_err());
         let mut bad = good.clone();
         bad.insert("x-api-key", "synthetic".parse().unwrap());
+        assert!(inspect(&bad, &bytes, false).is_err());
+        let mut bad = good.clone();
+        bad.insert("content-encoding", "gzip".parse().unwrap());
         assert!(inspect(&bad, &bytes, false).is_err());
         let mut bad = good.clone();
         bad.insert("x-claude-code-session-id", ACCOUNT.parse().unwrap());
@@ -609,29 +615,27 @@ mod tests {
         assert!(inspect(&good, b"[]", false).is_err());
     }
     #[test]
-    fn helper_profile_matches_current_sdk_headers_and_rejects_other_shapes() {
-        // Shape captured from a Claude Code 2.1.288 Haiku helper request.
-        let mut helper = headers();
-        helper.insert(
-            "anthropic-beta",
-            "oauth-2025-04-20,structured-outputs-2025-12-15"
-                .parse()
-                .unwrap(),
-        );
-        helper.insert("x-stainless-lang", "js".parse().unwrap());
-        helper.insert("x-stainless-runtime", "node".parse().unwrap());
-        let haiku = String::from_utf8(body())
+    fn identities_that_cannot_be_rewritten_are_marked() {
+        let old_checksum = String::from_utf8(body())
             .unwrap()
-            .replace("claude-sonnet-5", "claude-haiku-4-5-20251001")
-            .into_bytes();
-        assert!(inspect(&helper, &haiku, false).is_ok());
-        assert!(inspect(&helper, &body(), false).is_err());
-        assert!(inspect(&helper, &haiku, true).is_err());
-        for name in ["x-stainless-lang", "x-stainless-runtime"] {
-            let mut bad = helper.clone();
-            bad.remove(name);
-            assert!(inspect(&bad, &haiku, false).is_err(), "{name}");
-        }
+            .replace("cc_entrypoint=sdk-cli;", "cc_version=2.1.100.1; cch=00000;")
+            .replace("cc_version=2.1.281.127; ", "");
+        assert!(
+            !inspect(&headers(), old_checksum.as_bytes(), false)
+                .unwrap()
+                .rewritable
+        );
+        assert!(inspect(&headers(), &body(), false).unwrap().rewritable);
+        // The probe identity differs from the request's even when it collides with a probe.
+        let probe = String::from_utf8(body())
+            .unwrap()
+            .replace(ACCOUNT, PROBE_ACCOUNT[0])
+            .replace(&"a".repeat(64), PROBE_DEVICE[0]);
+        assert!(
+            inspect(&headers(), probe.as_bytes(), false)
+                .unwrap()
+                .rewritable
+        );
     }
     #[test]
     fn identity_edits_preserve_all_other_serialized_bytes() {

@@ -138,42 +138,9 @@ impl App {
             ));
         };
         let path = format!("/{path}");
-        let count = path == "/v1/messages/count_tokens";
-        let message = path == "/v1/messages";
-        let ancillary = (path == "/v1/models"
-            && matches!(*request.method(), Method::GET | Method::HEAD))
-            || (path == "/api/hello" && *request.method() == Method::HEAD);
-        if (!message && !count && !ancillary)
-            || ((message || count) && *request.method() != Method::POST)
-        {
-            return Ok(error_response(
-                StatusCode::NOT_FOUND,
-                "unsupported_claude_endpoint",
-                "unsupported native Claude endpoint",
-            ));
-        }
-        if !wire::native_headers(request.headers())
-            || request.headers().get("x-app").and_then(|v| v.to_str().ok()) != Some("cli")
-            || request.headers().contains_key("x-api-key")
-            || request.headers().get_all("authorization").iter().count() != 1
-        {
-            return Ok(error_response(
-                StatusCode::FORBIDDEN,
-                "native_claude_required",
-                "only native Claude Code requests are supported",
-            ));
-        }
-        if request
-            .headers()
-            .get("content-encoding")
-            .is_some_and(|v| v.as_bytes() != b"identity")
-        {
-            return Ok(error_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported_encoding",
-                "native uncompressed Claude requests required",
-            ));
-        }
+        let post = *request.method() == Method::POST;
+        let count = post && path == "/v1/messages/count_tokens";
+        let message = post && path == "/v1/messages";
         let permit = match self.http_slots.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -185,6 +152,25 @@ impl App {
             }
         };
         let admission = Admission::new(self.stats.clone(), permit);
+        // Comradex never rejects a request Anthropic might accept. Inference it can place on a
+        // pooled account is routed; everything else goes upstream exactly as the client sent it.
+        if !message && !count {
+            if path == "/v1/models"
+                && matches!(*request.method(), Method::GET | Method::HEAD)
+                && wire::unpoolable_headers(request.headers()).is_none()
+                && let Some(account) = &self.config.pools[&listener.pool].models_account
+            {
+                return self
+                    .claude_models(request, admission, &listener.pool, account, &path)
+                    .await;
+            }
+            tracing::debug!(%path, "forwarding Claude request without pooling");
+            return self.claude_passthrough(request, admission).await;
+        }
+        if let Some(reason) = wire::unpoolable_headers(request.headers()) {
+            tracing::warn!(reason, "forwarding Claude inference without pooling");
+            return self.claude_passthrough(request, admission).await;
+        }
         let (parts, incoming) = request.into_parts();
         let mut replay = match ReplayBody::read_encoded(
             incoming,
@@ -207,73 +193,13 @@ impl App {
         };
         // Retain the reservation while materializing and forwarding the original request.
         let body = replay.body(0)?.collect().await?.to_bytes();
-        if ancillary {
-            // Discovery/probes retain the caller's credential unless model listing is
-            // explicitly pinned. They never cause inference-session placement.
-            let Some(_) = parts
-                .headers
-                .get("authorization")
-                .filter(|v| v.to_str().is_ok_and(|v| v.starts_with("Bearer sk-ant-oat")))
-            else {
-                return Ok(error_response(
-                    StatusCode::FORBIDDEN,
-                    "native_oauth_required",
-                    "native subscription OAuth required",
-                ));
-            };
-            let pool = &self.config.pools[&listener.pool];
-            let mut credentials = None;
-            let mut lease = None;
-            if path == "/v1/models"
-                && let Some(account) = &pool.models_account
-            {
-                let Some(selected) = self.router.select_exact(pool, account).await else {
-                    return Ok(error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "claude_account_unavailable",
-                        "model-listing account unavailable",
-                    ));
-                };
-                if let AccountConfig::ClaudeHome { path } = &self.config.accounts[account] {
-                    credentials = Some(self.claude.auth.resolve(path, None).await?);
-                }
-                self.router
-                    .validate_selection(&selected, &listener.pool, pool)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Claude model-listing selection changed"))?;
-                self.router.begin(account).await;
-                lease = Some(DirectAccountLease::new_for_selection(
-                    self.router.clone(),
-                    &selected,
-                ));
-            }
-            let response = self
-                .claude_send(
-                    &parts.method,
-                    &path,
-                    parts.uri.query(),
-                    &parts.headers,
-                    body,
-                    credentials.as_ref(),
-                )
-                .await?;
-            let (mut parts, incoming) = response.into_parts();
-            headers::strip_hop_by_hop(&mut parts.headers);
-            return Ok(Response::from_parts(
-                parts,
-                ClaudeBody::new(incoming, admission, None, lease).boxed(),
-            ));
-        }
         let native = match wire::inspect(&parts.headers, &body, count) {
             Ok(native) => native,
             Err(error) => {
-                // Check names only; the rejected request's headers and body are not logged.
-                tracing::warn!(%error, "rejected Claude request that failed native checks");
-                return Ok(error_response(
-                    StatusCode::FORBIDDEN,
-                    "native_claude_required",
-                    "unrecognized or inconsistent native Claude Code request",
-                ));
+                // Check names only; the request's headers and body are not logged.
+                tracing::warn!(%error, "forwarding Claude inference without pooling");
+                let request = Request::from_parts(parts, bytes_body(body));
+                return self.claude_passthrough(request, admission).await;
             }
         };
         let routing_id = format!("claude:{}:{}", listener.pool, native.session);
@@ -311,23 +237,40 @@ impl App {
             || (native.portability != wire::Portability::Portable && !session_route.overridden())
             || session.active.load(Ordering::Acquire) > 0;
         let pinned = pool.model_accounts.get(&native.model).cloned();
-        let owner = if hard {
+        let identity_owner = |device: bool| {
+            pool.members
+                .iter()
+                .find(|name| match &self.config.accounts[*name] {
+                    AccountConfig::ClaudeInbound => true,
+                    AccountConfig::ClaudeHome { path } => auth::read(path).is_ok_and(|c| {
+                        c.account_uuid == native.account
+                            && (!device || c.device_id == native.device)
+                    }),
+                    _ => false,
+                })
+                .cloned()
+        };
+        let owner = if !native.rewritable {
+            // Only an account whose identity already matches can serve this unchanged, and a
+            // model pin naming another account cannot.
+            // The same goes for an explicit session assignment to another account.
+            let Some(owner) = identity_owner(true).filter(|owner| {
+                pinned.as_ref().is_none_or(|pin| pin == owner)
+                    && session_route.assigned.as_ref().is_none_or(|a| a == owner)
+            }) else {
+                tracing::warn!(
+                    "forwarding Claude inference without pooling: identity cannot be rewritten"
+                );
+                let request = Request::from_parts(parts, bytes_body(body));
+                return self.claude_passthrough(request, admission).await;
+            };
+            Some(owner)
+        } else if hard {
             conversation
                 .clone()
                 .or(binding.clone())
                 .map(|b| b.account_id)
-                .or_else(|| {
-                    pool.members
-                        .iter()
-                        .find(|name| match &self.config.accounts[*name] {
-                            AccountConfig::ClaudeInbound => true,
-                            AccountConfig::ClaudeHome { path } => {
-                                auth::read(path).is_ok_and(|c| c.account_uuid == native.account)
-                            }
-                            _ => false,
-                        })
-                        .cloned()
-                })
+                .or_else(|| identity_owner(false))
         } else {
             None
         };
@@ -359,8 +302,13 @@ impl App {
         // Thinking, compaction, and overlapping generations stay with their owner until it
         // exhausts its included quota, then move instead of stopping. The new account becomes
         // the owner, so the conversation does not return when the old window resets.
-        let movable = !account_bound && pinned.is_none() && session_route.assigned.is_none();
+        let movable = native.rewritable
+            && !account_bound
+            && pinned.is_none()
+            && session_route.assigned.is_none();
         let mut exact = session_route.assigned.clone().or(owner).or(pinned);
+        // An assignment, owner, or pin is a routing decision that must not silently fall back.
+        let freely_placed = exact.is_none();
         let mut moved_from = None;
         let mut remaining = pool.clone();
         let mut last_rejection = None;
@@ -465,11 +413,12 @@ impl App {
                     match wire::rewrite(&body, &credentials.account_uuid, &credentials.device_id) {
                         Ok(body) => Bytes::from(body),
                         Err(_) => {
-                            return Ok(error_response(
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                "claude_identity_rewrite_unsupported",
-                                "cannot safely rewrite this native credential/checksum shape",
-                            ));
+                            // Normally caught by the pre-routing probe; still never block.
+                            tracing::warn!(
+                                "forwarding Claude inference without pooling: identity cannot be rewritten"
+                            );
+                            let request = Request::from_parts(parts, bytes_body(body));
+                            return self.claude_passthrough(request, admission).await;
                         }
                     }
                 }
@@ -603,10 +552,130 @@ impl App {
                 ClaudeBody::new(incoming, admission, None, None).boxed(),
             ));
         }
+        if freely_placed || !native.rewritable {
+            // No pooled account can take it; the caller's own credential still might.
+            tracing::warn!(
+                "forwarding Claude inference without pooling: no eligible pooled account"
+            );
+            let request = Request::from_parts(parts, bytes_body(body));
+            return self.claude_passthrough(request, admission).await;
+        }
         Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "claude_account_unavailable",
             "no eligible Claude account; check login or wait for quota reset",
+        ))
+    }
+
+    /// Model listing pinned to one account. The caller's own credential is replaced only
+    /// because the pool explicitly configured `models_account`.
+    async fn claude_models(
+        &self,
+        request: Request<Incoming>,
+        admission: Admission,
+        pool_name: &str,
+        account: &str,
+        path: &str,
+    ) -> Result<Response<ProxyBody>> {
+        let pool = &self.config.pools[pool_name];
+        let Some(selected) = self.router.select_exact(pool, account).await else {
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "claude_account_unavailable",
+                "model-listing account unavailable",
+            ));
+        };
+        let credentials = match &self.config.accounts[account] {
+            AccountConfig::ClaudeHome { path } => Some(self.claude.auth.resolve(path, None).await?),
+            _ => None,
+        };
+        self.router
+            .validate_selection(&selected, pool_name, pool)
+            .await
+            .map_err(|_| anyhow::anyhow!("Claude model-listing selection changed"))?;
+        self.router.begin(account).await;
+        let lease = DirectAccountLease::new_for_selection(self.router.clone(), &selected);
+        let (parts, incoming) = request.into_parts();
+        let Ok(mut replay) = ReplayBody::read_encoded(
+            incoming,
+            false,
+            self.config.proxy.replay_memory_bytes,
+            self.config.proxy.max_request_bytes,
+            self.config.proxy.max_spool_bytes,
+            self.stats.clone(),
+        )
+        .await
+        else {
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_body",
+                "request body unavailable or exceeds relay capacity",
+            ));
+        };
+        let body = replay.body(0)?.collect().await?.to_bytes();
+        let response = self
+            .claude_send(
+                &parts.method,
+                path,
+                parts.uri.query(),
+                &parts.headers,
+                body,
+                credentials.as_ref(),
+            )
+            .await?;
+        let (mut parts, incoming) = response.into_parts();
+        headers::strip_hop_by_hop(&mut parts.headers);
+        Ok(Response::from_parts(
+            parts,
+            ClaudeBody::new(incoming, admission, None, Some(lease)).boxed(),
+        ))
+    }
+
+    /// Forward a request without pooling: same method, path, headers, credential and body
+    /// bytes, streamed both ways. Only hop-by-hop headers and the listener secret change.
+    async fn claude_passthrough<B>(
+        &self,
+        request: Request<B>,
+        admission: Admission,
+    ) -> Result<Response<ProxyBody>>
+    where
+        B: Body<Data = Bytes> + Send + Sync + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let (mut parts, body) = request.into_parts();
+        let root = format!("/{}", self.config.proxy.installation_secret);
+        let path = parts.uri.path().strip_prefix(&root).unwrap_or_default();
+        let mut uri = format!("{}{path}", self.claude.upstream);
+        if let Some(query) = parts.uri.query() {
+            uri.push('?');
+            uri.push_str(query)
+        }
+        parts.uri = uri.parse()?;
+        // The upstream connection is HTTP/1.1 whatever the client used to reach the listener.
+        parts.version = hyper::Version::HTTP_11;
+        headers::strip_hop_by_hop(&mut parts.headers);
+        let (body, progress) =
+            super::progress_body(body.map_err(|e| std::io::Error::other(e.into())).boxed());
+        let request = Request::from_parts(parts, body);
+        // Uploads may take as long as they keep making progress.
+        let response = super::await_upstream_headers(
+            async {
+                self.claude
+                    .client
+                    .request(request)
+                    .await
+                    .context("Claude upstream request failed")
+            },
+            progress,
+            Duration::from_secs(30),
+            Duration::from_secs(120),
+        )
+        .await?;
+        let (mut parts, incoming) = response.into_parts();
+        headers::strip_hop_by_hop(&mut parts.headers);
+        Ok(Response::from_parts(
+            parts,
+            ClaudeBody::new(incoming, admission, None, None).boxed(),
         ))
     }
 
@@ -631,8 +700,8 @@ impl App {
         *request.headers_mut() = inbound.clone();
         headers::strip_hop_by_hop(request.headers_mut());
         request.headers_mut().remove("content-length");
-        request.headers_mut().remove("x-api-key");
         if let Some(credential) = credential {
+            request.headers_mut().remove("x-api-key");
             request.headers_mut().insert(
                 "authorization",
                 format!("Bearer {}", credential.access_token).parse()?,
@@ -779,6 +848,9 @@ mod tests {
     }
     impl Harness {
         async fn new(managed: bool, status: StatusCode) -> Self {
+            Self::with(managed, status, |_| {}).await
+        }
+        async fn with(managed: bool, status: StatusCode, tweak: impl FnOnce(&mut Config)) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
@@ -940,6 +1012,7 @@ kind="claude_inbound"
                         .insert(name.into(), AccountConfig::ClaudeHome { path });
                 }
             }
+            tweak(&mut config);
             let affinity = Arc::new(
                 AffinityStore::load(
                     directory.path().join("affinity.json"),
@@ -1034,19 +1107,225 @@ kind="claude_inbound"
         }
         harness.close().await;
     }
+    async fn forwarded(harness: &Harness) -> Vec<(HeaderMap, Bytes, String)> {
+        harness
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|r| !r.2.starts_with("/api/oauth/usage") && r.2 != "/token")
+            .cloned()
+            .collect()
+    }
     #[tokio::test]
-    async fn foreign_client_never_reaches_upstream() {
-        let harness = Harness::new(false, StatusCode::OK).await;
-        let mut headers = native_headers();
-        headers.insert("user-agent", "OpenCode/1.0".parse().unwrap());
+    async fn any_client_with_a_coherent_identity_is_pooled() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        for ua in [
+            "claude-cli/2.1.281 (external, t3-code, agent-sdk/0.3.276)",
+            "OpenCode/1.0",
+        ] {
+            let mut headers = native_headers();
+            headers.insert("user-agent", ua.parse().unwrap());
+            headers.remove("x-app");
+            // A helper without the Claude Code beta or SDK headers.
+            headers.insert("anthropic-beta", "oauth-2025-04-20".parse().unwrap());
+            let response = harness.send(request_body(), headers).await;
+            assert_eq!(response.status(), StatusCode::OK, "{ua}");
+            assert_eq!(response.bytes().await.unwrap(), STREAM);
+        }
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen.len(), 2);
+        for (headers, body, _) in &seen {
+            assert_eq!(headers["authorization"], "Bearer sk-ant-oat01-grace");
+            assert_eq!(body, &request_body());
+        }
         assert_eq!(
-            harness.send(request_body(), headers).await.status(),
-            StatusCode::FORBIDDEN
+            seen[0].0["user-agent"],
+            "claude-cli/2.1.281 (external, t3-code, agent-sdk/0.3.276)"
         );
-        assert!(harness.seen.lock().await.is_empty());
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn unpoolable_requests_are_forwarded_unchanged() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut api_key = native_headers();
+        api_key.remove("authorization");
+        api_key.insert("x-api-key", "sk-ant-api03-caller".parse().unwrap());
+        let mut api_bearer = native_headers();
+        api_bearer.insert(
+            "authorization",
+            "Bearer sk-ant-api03-caller".parse().unwrap(),
+        );
+        let mut encoded = native_headers();
+        encoded.insert("content-encoding", "gzip".parse().unwrap());
+        let odd_identity = serde_json::to_vec(
+            &json!({"model":"claude-sonnet-5","metadata":{"user_id":"opaque"},"messages":[]}),
+        )
+        .unwrap();
+        let cases: Vec<(Method, &str, HeaderMap, Vec<u8>)> = vec![
+            (
+                Method::POST,
+                "/v1/messages?beta=true",
+                api_key,
+                request_body(),
+            ),
+            (
+                Method::POST,
+                "/v1/messages?beta=true",
+                api_bearer,
+                request_body(),
+            ),
+            (
+                Method::POST,
+                "/v1/messages?beta=true",
+                encoded,
+                b"\x1f\x8bnot-json".to_vec(),
+            ),
+            (
+                Method::POST,
+                "/v1/messages?beta=true",
+                native_headers(),
+                odd_identity,
+            ),
+            (
+                Method::POST,
+                "/v1/files",
+                native_headers(),
+                b"file bytes".to_vec(),
+            ),
+            (Method::GET, "/v1/messages", native_headers(), Vec::new()),
+            (
+                Method::GET,
+                "/v1/models?limit=5",
+                native_headers(),
+                Vec::new(),
+            ),
+        ];
+        for (method, path, headers, body) in &cases {
+            let response = client
+                .request(method.clone(), format!("{}{path}", harness.url))
+                .headers(headers.clone())
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+            assert_eq!(response.bytes().await.unwrap(), STREAM);
+        }
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen.len(), cases.len());
+        for ((_, path, headers, body), (sent, received, uri)) in cases.iter().zip(&seen) {
+            assert_eq!(uri, path);
+            assert_eq!(received, body, "{path}");
+            for name in [
+                "authorization",
+                "x-api-key",
+                "content-encoding",
+                "user-agent",
+            ] {
+                assert_eq!(sent.get(name), headers.get(name), "{path} {name}");
+            }
+        }
         harness.close().await;
     }
 
+    #[tokio::test]
+    async fn unrewritable_identity_uses_only_its_own_account_or_passes_through() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let old = |device: &str| {
+            String::from_utf8(request_body())
+                .unwrap()
+                .replace("cc_entrypoint=sdk-cli;", "cch=00000;")
+                .replace("cc_version=2.1.281.127", "cc_version=2.1.100.1")
+                .replace(&"a".repeat(64), device)
+                .into_bytes()
+        };
+        // Matches grace exactly: served by grace with the body untouched.
+        let matching = old(&"a".repeat(64));
+        let response = harness.send(matching.clone(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        // Same account on another device matches no pooled identity: forwarded as sent.
+        let foreign = old(&"c".repeat(64));
+        let response = harness.send(foreign.clone(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        // The matching account needs login: the caller's own credential is used instead.
+        harness.app.router.reauth_required("grace").await;
+        let response = harness.send(matching.clone(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[2].0["authorization"], "Bearer sk-ant-oat01-caller");
+        assert_eq!(seen[2].1, matching);
+        assert_eq!(seen[0].0["authorization"], "Bearer sk-ant-oat01-grace");
+        assert_eq!(seen[0].1, matching);
+        assert_eq!(seen[1].0["authorization"], "Bearer sk-ant-oat01-caller");
+        assert_eq!(seen[1].1, foreign);
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn unrewritable_identity_pinned_elsewhere_passes_through() {
+        let harness = Harness::with(true, StatusCode::OK, |config| {
+            config
+                .pools
+                .get_mut("claude")
+                .unwrap()
+                .model_accounts
+                .insert("claude-sonnet-5".into(), "ada".into());
+        })
+        .await;
+        let body = String::from_utf8(request_body())
+            .unwrap()
+            .replace("cc_entrypoint=sdk-cli;", "cch=00000;")
+            .replace("cc_version=2.1.281.127", "cc_version=2.1.100.1")
+            .into_bytes();
+        let response = harness.send(body.clone(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0["authorization"], "Bearer sk-ant-oat01-caller");
+        assert_eq!(seen[0].1, body);
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn freely_placed_inference_uses_the_caller_when_no_account_is_eligible() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        harness.app.router.reauth_required("grace").await;
+        harness.app.router.reauth_required("ada").await;
+        let response = harness.send(request_body(), native_headers()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await;
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0["authorization"], "Bearer sk-ant-oat01-caller");
+        assert_eq!(seen[0].1, request_body());
+        harness.close().await;
+    }
+    #[tokio::test]
+    async fn http2_clients_are_forwarded_over_http1() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let mut headers = native_headers();
+        headers.insert("x-api-key", "sk-ant-api03-caller".parse().unwrap());
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap()
+            .post(format!("{}/v1/messages", harness.url))
+            .headers(headers)
+            .body(request_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), STREAM);
+        assert_eq!(forwarded(&harness).await[0].1, request_body());
+        harness.close().await;
+    }
     #[tokio::test]
     async fn native_typescript_sdk_request_keeps_its_original_attribution() {
         let harness = Harness::new(false, StatusCode::OK).await;
