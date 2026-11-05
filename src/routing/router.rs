@@ -1079,6 +1079,42 @@ impl Router {
         Ok(())
     }
 
+    /// How long until the first temporarily blocked pool account should take work again.
+    pub async fn soonest_retry(&self, pool: &PoolConfig) -> Option<Duration> {
+        let now = Instant::now();
+        let wall_now = Utc::now();
+        let accounts = self.account_runtimes().await;
+        pool.members
+            .iter()
+            .filter_map(|id| accounts.get(id))
+            .filter_map(|runtime| {
+                let status = account_routing_status(runtime, now, wall_now);
+                if !matches!(
+                    status.unavailable_reason.as_deref(),
+                    Some("quota" | "temporary_failure")
+                ) {
+                    return None;
+                }
+                let seconds = status
+                    .retry_at_unix?
+                    .saturating_sub(wall_now.timestamp())
+                    .max(1);
+                let mut wait = Duration::from_secs(seconds as u64);
+                // Status timestamps are rounded for display. Wait out every active cooldown
+                // and round up so the client does not retry before the account is eligible.
+                for deadline in [runtime.quota_until, runtime.avoid_until]
+                    .into_iter()
+                    .flatten()
+                {
+                    wait = wait.max(deadline.saturating_duration_since(now));
+                }
+                Some(Duration::from_secs(
+                    wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+                ))
+            })
+            .min()
+    }
+
     /// Accounts the router currently excludes because their credentials need repair.
     pub async fn accounts_needing_login(&self) -> BTreeSet<String> {
         self.account_runtimes()

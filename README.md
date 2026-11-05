@@ -331,7 +331,9 @@ models_account = "work"
 model_accounts = { "gpt-5.5" = "personal", "gpt-5.6-sol" = "work" }
 ```
 
-`model_accounts` matches the exact requested model ID. `models_account` selects the account for `GET /models` and `HEAD /models`, including query parameters, independently of model-specific pins. Both settings are optional; pinned accounts must exist and belong to the pool. These are strict assignments: an unavailable pinned account returns an error instead of falling back to another account. A conflicting account-owned continuation or file also returns an error. Unpinned requests keep the normal routing behavior. Removing an account clears its pins.
+`model_accounts` matches the exact requested model ID. `models_account` selects the account for `GET /models` and `HEAD /models`, including query parameters, independently of model-specific pins. Both settings are optional; pinned accounts must exist and belong to the pool. Model-specific pins are strict: an unavailable pinned account returns an error instead of falling back to another account. Model listings fall back to the pool when their pinned account is quota-blocked or rate-limited; authentication failures remain errors. A conflicting account-owned continuation or file also returns an error. Unpinned requests keep the normal routing behavior. Removing an account clears its pins.
+
+When an unpinned HTTP request or fresh WebSocket connection finds every pool account temporarily blocked, Comradex returns `429` with `Retry-After` for the earliest known recovery within ten minutes. Unknown or longer recovery times remain visible errors without a retry delay. Account-owned continuations keep their required account.
 
 For Daybreak, newer Codex clients send a base model with `access_programs.cyber` set to `"daybreak_blue"` or `"daybreak_red"`. These requests prefer the `gpt-daybreak-blue-latest` or `gpt-daybreak-red-latest` pin respectively, falling back to the base model's pin when the Daybreak pin is unset. Existing Daybreak pins therefore cover both request formats; standard requests keep their model-specific or normal pool routing. The request body is forwarded unchanged.
 
