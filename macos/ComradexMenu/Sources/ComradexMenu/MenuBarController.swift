@@ -525,9 +525,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if !account.available {
             switch account.unavailableReason?.lowercased() {
             case "quota":
-                // Show the exhausted window, even when a different primary window has quota.
-                let reset = account.usageWindows.values
+                let exhaustedWindows = account.usageWindows.values
                     .filter { ($0.usedPercent ?? 0) >= 100 && $0.limitWindowSeconds != 0 }
+                // A short upstream rate limit blocks the account without spending its quota.
+                if exhaustedWindows.isEmpty, let used = account.usagePercent, used < 100 {
+                    return ["\(100 - used)% left", "rate limited", retryDescription(account.retryAtUnix)]
+                        .compactMap { $0 }
+                        .joined(separator: " · ")
+                }
+                // Show the exhausted window, even when a different primary window has quota.
+                let reset = exhaustedWindows
                     .compactMap(\.resetAtUnix)
                     .filter { $0 > Int64(Date().timeIntervalSince1970) }
                     .max() ?? account.retryAtUnix

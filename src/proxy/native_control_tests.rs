@@ -400,10 +400,10 @@ async fn interruption_pins_socket_after_terminal_even_without_acknowledgement() 
                 ))
                 .await
                 .unwrap();
-            assert_eq!(
-                event(&mut socket).await["error"]["type"],
-                "continuity_owner_conflict"
-            );
+            let rejection = event(&mut socket).await;
+            assert_eq!(rejection["error"]["type"], "continuity_owner_conflict");
+            // Codex ignores a status-less error frame and hangs until its idle timeout.
+            assert_eq!(rejection["status"], 503);
             assert!(backend.received.try_recv().is_err());
         }
         backend.send.send(Message::Close(None)).unwrap();

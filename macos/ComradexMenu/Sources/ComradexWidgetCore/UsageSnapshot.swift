@@ -86,7 +86,10 @@ public struct UsageAccount: Codable, Equatable, Identifiable, Sendable {
 
     /// Remaining quota shown for the account as a whole, or nil while usage is unknown.
     public var remainingPercent: Int? {
-        if status == .limited { return 0 }
+        // A short rate limit also reports as limited, but it leaves the quota intact.
+        if status == .limited, windows.isEmpty || windows.contains(where: { $0.remainingPercent == 0 }) {
+            return 0
+        }
         return summaryWindow?.remainingPercent
     }
 

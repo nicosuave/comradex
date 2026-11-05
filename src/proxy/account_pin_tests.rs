@@ -342,6 +342,96 @@ async fn listing_pin_applies_to_get_and_head_with_query_parameters() {
 }
 
 #[tokio::test]
+async fn listing_pin_yields_to_the_pool_while_its_account_is_out_of_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = fixture(dir.path(), None).await;
+    fixture
+        .app
+        .router
+        .quota_failure("b", &hyper::HeaderMap::new())
+        .await;
+    for method in [Method::GET, Method::HEAD] {
+        assert_eq!(
+            request(
+                &fixture,
+                method,
+                "/v1/models?client_version=1.2.3",
+                "",
+                None
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+    let seen = fixture.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen.iter().all(|(auth, path)| auth == "Bearer token-a"
+            && path.ends_with("/models?client_version=1.2.3"))
+    );
+}
+
+#[tokio::test]
+async fn no_eligible_account_tells_the_client_when_to_return() {
+    fn retry_after(seconds: &'static str) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            hyper::header::HeaderValue::from_static(seconds),
+        );
+        headers
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = fixture(dir.path(), None).await;
+    let router = &fixture.app.router;
+    router.quota_failure("a", &retry_after("90")).await;
+    router.quota_failure("b", &retry_after("30")).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("http://{}/{SECRET}/v1/responses", fixture.address))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"unpinned-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let wait: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(wait, 30);
+    let body: serde_json::Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "no_eligible_account");
+
+    // Sleeping silently for hours is worse than a visible failure.
+    router.quota_failure("a", &retry_after("7200")).await;
+    router.quota_failure("b", &retry_after("7200")).await;
+    let response = client
+        .post(format!("http://{}/{SECRET}/v1/responses", fixture.address))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"unpinned-model","input":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get("retry-after").is_none());
+    // A scheduled quota recovery cannot repair unusable credentials.
+    router.auth_failure("a").await;
+    router.auth_failure("b").await;
+    assert!(
+        router
+            .soonest_retry(&fixture.app.config.pools["default"])
+            .await
+            .is_none()
+    );
+    assert!(fixture.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn http_pin_rejects_conflicting_owner_and_unavailable_account_before_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = fixture(dir.path(), None).await;

@@ -58,6 +58,38 @@ async fn direct_capacity_event(socket: &mut WebSocketStream<TcpStream>) -> serde
 }
 
 #[tokio::test]
+async fn direct_handshake_returns_retry_after_for_a_temporarily_blocked_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (address, app, proxy, server) = direct_capacity_proxy(dir.path(), 1).await;
+    for (account, seconds) in [("a", "90"), ("b", "30")] {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("retry-after", seconds.parse().unwrap());
+        app.router.quota_failure(account, &headers).await;
+    }
+    let mut request = format!("ws://{address}/0123456789abcdef/v1/responses")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(AUTHORIZATION, "Bearer caller-token".parse().unwrap());
+    let error = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio_tungstenite::client_async(request, TcpStream::connect(address).await.unwrap()).await
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+        panic!("unexpected error: {error}");
+    };
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["retry-after"], "30");
+    assert_eq!(app.upgrade_slots.available_permits(), 1);
+    assert_eq!(app.stats.open_upgrades.load(Ordering::Relaxed), 0);
+    proxy.abort();
+    server.abort();
+}
+
+#[tokio::test]
 async fn direct_capacity_reclaims_completed_socket_and_reconnects_repeatedly() {
     let dir = tempfile::tempdir().unwrap();
     let (address, app, proxy, server) = direct_capacity_proxy(dir.path(), 1).await;

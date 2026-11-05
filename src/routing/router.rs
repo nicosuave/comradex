@@ -10,7 +10,7 @@ use std::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     auth::{ManagedAuthHealth, ManagedAuthStatus, QuotaOwner, managed_quota_owner},
@@ -639,8 +639,24 @@ impl Router {
             }
             reconcile_expired_quota(runtime, now, wall_now);
         }
+        let (configured_preferred, preserved) = self.account_order(pool_name).await;
         if let Some(binding) = binding {
-            let eligible = exclude != Some(binding.account_id.as_str())
+            // The preserved account is a last resort. A thread that fell back to it returns to
+            // the preferred account once that can take work, rather than draining the reserve.
+            let preferred_reclaims = preserved.as_deref() == Some(binding.account_id.as_str())
+                && configured_preferred.as_deref().is_some_and(|id| {
+                    id != binding.account_id
+                        && exclude != Some(id)
+                        && pool.members.iter().any(|member| member == id)
+                        && accounts.get(id).is_some_and(|a| {
+                            a.dispatch_block(false, now, wall_now).is_none()
+                                && !a.capacity.active(now)
+                                && a.usage_at(wall_now)
+                                    .is_none_or(|usage| usage < self.switch_at)
+                        })
+                });
+            let eligible = !preferred_reclaims
+                && exclude != Some(binding.account_id.as_str())
                 && pool.members.contains(&binding.account_id)
                 && accounts.get(&binding.account_id).is_some_and(|a| {
                     // Keep warm cohorts past the soft switch threshold and through a
@@ -661,7 +677,6 @@ impl Router {
                 });
             }
         }
-        let (configured_preferred, preserved) = self.account_order(pool_name).await;
         let is_preserved = |id: &str| preserved.as_deref() == Some(id);
         let eligible = |id: &str| {
             exclude != Some(id)
@@ -1064,6 +1079,42 @@ impl Router {
         Ok(())
     }
 
+    /// How long until the first temporarily blocked pool account should take work again.
+    pub async fn soonest_retry(&self, pool: &PoolConfig) -> Option<Duration> {
+        let now = Instant::now();
+        let wall_now = Utc::now();
+        let accounts = self.account_runtimes().await;
+        pool.members
+            .iter()
+            .filter_map(|id| accounts.get(id))
+            .filter_map(|runtime| {
+                let status = account_routing_status(runtime, now, wall_now);
+                if !matches!(
+                    status.unavailable_reason.as_deref(),
+                    Some("quota" | "temporary_failure")
+                ) {
+                    return None;
+                }
+                let seconds = status
+                    .retry_at_unix?
+                    .saturating_sub(wall_now.timestamp())
+                    .max(1);
+                let mut wait = Duration::from_secs(seconds as u64);
+                // Status timestamps are rounded for display. Wait out every active cooldown
+                // and round up so the client does not retry before the account is eligible.
+                for deadline in [runtime.quota_until, runtime.avoid_until]
+                    .into_iter()
+                    .flatten()
+                {
+                    wait = wait.max(deadline.saturating_duration_since(now));
+                }
+                Some(Duration::from_secs(
+                    wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+                ))
+            })
+            .min()
+    }
+
     /// Accounts the router currently excludes because their credentials need repair.
     pub async fn accounts_needing_login(&self) -> BTreeSet<String> {
         self.account_runtimes()
@@ -1171,6 +1222,12 @@ impl Router {
             );
             a.quota_evidence = (!evidence.is_empty()).then_some(evidence);
             a.quota_failure_generation = a.quota_failure_generation.wrapping_add(1);
+            warn!(
+                account,
+                blocked_seconds = delay.as_secs(),
+                usage_percent = a.usage_at(now),
+                "account blocked by upstream quota or rate limit"
+            );
         }
     }
     pub async fn soft_failure(&self, account: &str) {
@@ -1915,6 +1972,74 @@ mod tests {
                 .preserved_accounts
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn preserved_binding_returns_to_preferred_once_it_can_take_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cfg, affinity, _, _) = stale_test_router(dir.path());
+        let pool = cfg.pools.get_mut("default").unwrap();
+        pool.preferred = Some("b".into());
+        pool.preserved = Some("a".into());
+        let router = Router::new(&cfg, affinity.clone());
+        let pool = &cfg.pools["default"];
+        let key = affinity.key("fell-back");
+
+        // A rate-limited preferred account leaves only the reserve for a new thread.
+        router.quota_failure("b", &HeaderMap::new()).await;
+        let fallback = router
+            .select("default", pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(fallback.account_id, "a");
+        let held = router
+            .select("default", pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(held.account_id, "a");
+        assert!(held.bound);
+
+        router
+            .accounts
+            .lock()
+            .await
+            .get_mut("b")
+            .unwrap()
+            .quota_until = None;
+        let reclaimed = router
+            .select("default", pool, Some(key.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.account_id, "b");
+        assert!(!reclaimed.bound);
+        let settled = router
+            .select("default", pool, Some(key), None)
+            .await
+            .unwrap();
+        assert_eq!(settled.account_id, "b");
+        assert!(settled.bound);
+    }
+
+    #[tokio::test]
+    async fn preserved_binding_stays_while_preferred_is_at_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cfg, affinity, _, _) = stale_test_router(dir.path());
+        let pool = cfg.pools.get_mut("default").unwrap();
+        pool.preferred = Some("b".into());
+        pool.preserved = Some("a".into());
+        let router = Router::new(&cfg, affinity.clone());
+        let pool = &cfg.pools["default"];
+        let key = affinity.key("warm");
+        router.bind(key.clone(), "a").await;
+        for _ in 0..CAPACITY_REJECTION_THRESHOLD {
+            router.capacity_failure("b").await;
+        }
+        let selected = router
+            .select("default", pool, Some(key), None)
+            .await
+            .unwrap();
+        assert_eq!(selected.account_id, "a");
+        assert!(selected.bound);
     }
 
     #[tokio::test]

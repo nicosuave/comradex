@@ -116,6 +116,9 @@ const MAX_QUEUED_DIRECT_CREATES: usize = 64;
 pub(super) const RESPONSES_MISSING_CREATED_TIMEOUT: Duration = Duration::from_secs(240);
 pub(super) const RESPONSES_UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const RESPONSES_DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest wait a client is told to sleep through. Past this, a visible failure beats a turn
+/// that silently sits for hours.
+const NO_ELIGIBLE_RETRY_LIMIT: Duration = Duration::from_secs(600);
 const HTTP_BRIDGE_MAX_MATERIALIZED_ITEMS: usize = 4_096;
 // Do not make clients wait for their own created watchdog while the upstream
 // spends a long time before its first output. A delayed rejection simply loses
@@ -1817,8 +1820,17 @@ impl App {
                 .excluded_account
                 .clone()
         });
-        let pinned_account =
+        let mut pinned_account =
             request_account_pin(pool, &method, &path, inspect_model.then_some(&replay));
+        // Listing models spends no quota, so an exhausted pin must not fail every refresh. A
+        // credential failure stays visible: the pin exists to list that account's models.
+        if is_models_listing(&method, &path)
+            && let Some(account) = pinned_account
+            && self.router.validate_account_wirable(account, None).await
+                == Err(SelectionStaleReason::Quota)
+        {
+            pinned_account = None;
+        }
         if let Some(account) = pinned_account {
             if bound_account
                 .as_deref()
@@ -1913,15 +1925,22 @@ impl App {
                 }
             }
         } else {
-            self.router
+            let selection = self
+                .router
                 .select(
                     &listener.pool,
                     pool,
                     soft_routing_key,
                     excluded_account.as_deref(),
                 )
-                .await
-                .context("no eligible account")?
+                .await;
+            match selection {
+                Some(selection) => selection,
+                None if excluded_account.is_none() => {
+                    return Ok(self.no_eligible_response(pool).await);
+                }
+                None => anyhow::bail!("no eligible account"),
+            }
         };
         if excluded_account.as_deref() == Some(first.account_id.as_str()) {
             anyhow::bail!("no alternate account for accepted capacity retry")
@@ -4548,6 +4567,34 @@ impl App {
         }
     }
 
+    /// Tell the client when to return if an account is due back soon. A bare failure makes Codex
+    /// spend its whole retry budget within seconds and abandon the turn.
+    async fn no_eligible_response(&self, pool: &PoolConfig) -> Response<ProxyBody> {
+        let wait = self
+            .router
+            .soonest_retry(pool)
+            .await
+            .filter(|wait| *wait <= NO_ELIGIBLE_RETRY_LIMIT);
+        let Some(wait) = wait else {
+            return internal_error(anyhow::anyhow!("no eligible account"));
+        };
+        warn!(
+            retry_after_seconds = wait.as_secs(),
+            "every account is temporarily blocked"
+        );
+        Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(CONTENT_TYPE, "application/json")
+            .header("retry-after", wait.as_secs().to_string())
+            .body(json_body(serde_json::json!({
+                "error": {
+                    "type": "no_eligible_account",
+                    "message": "every account is temporarily blocked; retry later"
+                }
+            })))
+            .expect("static no eligible account response")
+    }
+
     async fn acquire_upgrade_slot(
         &self,
         reclaim_idle: bool,
@@ -4696,15 +4743,23 @@ impl App {
             };
             selection
         } else if let Some(account) = &bound_account {
-            self.router
+            let Some(selection) = self
+                .router
                 .select_preferred(&listener.pool, pool, account)
                 .await
-                .context("no eligible account for fresh direct WebSocket")?
+            else {
+                return Ok(self.no_eligible_response(pool).await);
+            };
+            selection
         } else {
-            self.router
+            let Some(selection) = self
+                .router
                 .select(&listener.pool, pool, key.clone(), None)
                 .await
-                .context("no eligible account")?
+            else {
+                return Ok(self.no_eligible_response(pool).await);
+            };
+            selection
         };
         let attempts = 2;
         for attempt in 0..attempts {
@@ -5194,13 +5249,17 @@ fn is_native_responses(path: &str) -> bool {
     )
 }
 
+fn is_models_listing(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && path.split('?').next() == Some("/models")
+}
+
 fn request_account_pin<'a>(
     pool: &'a PoolConfig,
     method: &Method,
     path: &str,
     replay: Option<&ReplayBody>,
 ) -> Option<&'a str> {
-    if matches!(*method, Method::GET | Method::HEAD) && path.split('?').next() == Some("/models") {
+    if is_models_listing(method, path) {
         pool.models_account.as_deref()
     } else {
         replay.and_then(|replay| model_account_pin(pool, replay))
@@ -6195,19 +6254,41 @@ async fn send_ws_nonretryable_liveness_error(
         .await;
 }
 
+/// Status for errors that end a `response.create`. Codex only fails a stream on an `error` frame
+/// that carries `status`; without one it waits out its 300s stream idle timeout. Native control
+/// errors answer a side request while a turn may still be running, so they stay status-less.
+fn direct_error_status(kind: &str) -> Option<StatusCode> {
+    match kind {
+        "server_busy" | "continuity_error" | "continuity_owner_conflict" | "upstream_error" => {
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        "invalid_request_error" | "context_result_invalid" | "upstream_rejected_input" => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        _ => None,
+    }
+}
+
+fn direct_error_payload(kind: &str, message: &str) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "type": "error",
+        "error": {"type": kind, "message": message}
+    });
+    if let Some(status) = direct_error_status(kind) {
+        payload["status"] = status.as_u16().into();
+    }
+    payload
+}
+
 async fn send_direct_error(
     websocket: &mut UpgradedWebSocket,
     kind: &str,
     message: &str,
 ) -> Result<()> {
+    warn!(kind, message, "direct Responses request failed in Comradex");
     websocket
         .send(Message::Text(
-            serde_json::json!({
-                "type": "error",
-                "error": {"type": kind, "message": message}
-            })
-            .to_string()
-            .into(),
+            direct_error_payload(kind, message).to_string().into(),
         ))
         .await?;
     Ok(())
@@ -8145,6 +8226,31 @@ mod tests {
             };
             assert!(format!("{error:#}").contains("proxy.upstream must be exactly"));
         }
+    }
+
+    #[test]
+    fn direct_create_errors_carry_the_status_codex_requires() {
+        for kind in [
+            "server_busy",
+            "continuity_error",
+            "continuity_owner_conflict",
+            "upstream_error",
+        ] {
+            assert_eq!(direct_error_payload(kind, "failed")["status"], 503);
+        }
+        for kind in [
+            "invalid_request_error",
+            "context_result_invalid",
+            "upstream_rejected_input",
+        ] {
+            assert_eq!(direct_error_payload(kind, "failed")["status"], 400);
+        }
+        // A rejected side request must not fail the turn still running on this socket.
+        assert!(
+            direct_error_payload("native_control_invalid", "failed")
+                .get("status")
+                .is_none()
+        );
     }
 
     #[tokio::test]
