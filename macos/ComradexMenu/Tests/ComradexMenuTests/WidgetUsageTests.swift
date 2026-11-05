@@ -89,6 +89,7 @@ final class WidgetUsageTests: XCTestCase {
         limited.status = .limited
         limited.retryAt = now.addingTimeInterval(3_600)
         XCTAssertEqual(accountCaption(limited, at: now, compact: true), "Back in 1h 0m")
+        XCTAssertEqual(limited.remainingPercent, 75)
         let pending = UsageAccount(name: "a", provider: .codex, status: .available, windows: [])
         XCTAssertEqual(accountCaption(pending, at: now), "Usage pending")
         XCTAssertNil(pending.remainingPercent)

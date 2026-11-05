@@ -118,6 +118,8 @@ final class ComradexMenuTests: XCTestCase {
             (#""usage_percent":31"#, "69% left"),
             (#""usage_windows":{}"#, "Usage pending"),
             (#""available":false,"unavailable_reason":"quota""#, "0% left"),
+            (#""available":false,"unavailable_reason":"quota","usage_percent":43"#, "57% left · rate limited"),
+            (#""available":false,"unavailable_reason":"quota","usage_percent":100"#, "0% left"),
             (#""available":false,"unavailable_reason":"temporary_failure""#, "Temporarily unavailable"),
             (#""auth_state":"login_in_progress""#, "Login in progress"),
             (#""auth_state":"signed_out","signed_in":false"#, "Sign-in required"),
