@@ -6195,19 +6195,41 @@ async fn send_ws_nonretryable_liveness_error(
         .await;
 }
 
+/// Status for errors that end a `response.create`. Codex only fails a stream on an `error` frame
+/// that carries `status`; without one it waits out its 300s stream idle timeout. Native control
+/// errors answer a side request while a turn may still be running, so they stay status-less.
+fn direct_error_status(kind: &str) -> Option<StatusCode> {
+    match kind {
+        "server_busy" | "continuity_error" | "continuity_owner_conflict" | "upstream_error" => {
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        "invalid_request_error" | "context_result_invalid" | "upstream_rejected_input" => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        _ => None,
+    }
+}
+
+fn direct_error_payload(kind: &str, message: &str) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "type": "error",
+        "error": {"type": kind, "message": message}
+    });
+    if let Some(status) = direct_error_status(kind) {
+        payload["status"] = status.as_u16().into();
+    }
+    payload
+}
+
 async fn send_direct_error(
     websocket: &mut UpgradedWebSocket,
     kind: &str,
     message: &str,
 ) -> Result<()> {
+    warn!(kind, message, "direct Responses request failed in Comradex");
     websocket
         .send(Message::Text(
-            serde_json::json!({
-                "type": "error",
-                "error": {"type": kind, "message": message}
-            })
-            .to_string()
-            .into(),
+            direct_error_payload(kind, message).to_string().into(),
         ))
         .await?;
     Ok(())
@@ -8145,6 +8167,31 @@ mod tests {
             };
             assert!(format!("{error:#}").contains("proxy.upstream must be exactly"));
         }
+    }
+
+    #[test]
+    fn direct_create_errors_carry_the_status_codex_requires() {
+        for kind in [
+            "server_busy",
+            "continuity_error",
+            "continuity_owner_conflict",
+            "upstream_error",
+        ] {
+            assert_eq!(direct_error_payload(kind, "failed")["status"], 503);
+        }
+        for kind in [
+            "invalid_request_error",
+            "context_result_invalid",
+            "upstream_rejected_input",
+        ] {
+            assert_eq!(direct_error_payload(kind, "failed")["status"], 400);
+        }
+        // A rejected side request must not fail the turn still running on this socket.
+        assert!(
+            direct_error_payload("native_control_invalid", "failed")
+                .get("status")
+                .is_none()
+        );
     }
 
     #[tokio::test]
