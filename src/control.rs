@@ -174,6 +174,9 @@ pub struct UiAccountStatus {
     pub usage_updated_at_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usage_windows: BTreeMap<String, crate::routing::QuotaWindowStatus>,
+    /// Provider reporting metadata, kept separate from account-wide routing limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporting_usage: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
 }
@@ -980,7 +983,16 @@ async fn process(
     }
     .await;
     match result {
-        Ok(response) => response,
+        Ok(mut response) => {
+            if let (Some(status), Some(app)) = (&mut response.status, &changes.app) {
+                for account in &mut status.accounts {
+                    if matches!(account.kind, UiAccountKind::ClaudeHome) && account.signed_in {
+                        account.reporting_usage = app.claude_reporting_usage(&account.name).await;
+                    }
+                }
+            }
+            response
+        }
         Err(error) => Response::error(format!("{error:#}")),
     }
 }
@@ -1275,6 +1287,7 @@ async fn build_ui_status(
                     .get(name)
                     .map(|state| state.usage_windows.clone())
                     .unwrap_or_default(),
+                reporting_usage: None,
             }
         })
         .collect();

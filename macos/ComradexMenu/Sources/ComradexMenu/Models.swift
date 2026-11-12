@@ -60,6 +60,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     let usagePercent: Int?
     let usageUpdatedAtUnix: Int64?
     let usageWindows: [String: UsageWindowSnapshot]
+    let reportingUsage: [String: JSONValue]?
     let resetCredits: ResetCreditsSnapshot?
 
     var id: String { name }
@@ -92,6 +93,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         case usagePercent = "usage_percent"
         case usageUpdatedAtUnix = "usage_updated_at_unix"
         case usageWindows = "usage_windows"
+        case reportingUsage = "reporting_usage"
         case resetCredits = "reset_credits"
     }
 
@@ -109,6 +111,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         usagePercent = try container.decodeIfPresent(Int.self, forKey: .usagePercent)
         usageUpdatedAtUnix = try container.decodeIfPresent(Int64.self, forKey: .usageUpdatedAtUnix)
         usageWindows = try container.decodeIfPresent([String: UsageWindowSnapshot].self, forKey: .usageWindows) ?? [:]
+        reportingUsage = try container.decodeIfPresent([String: JSONValue].self, forKey: .reportingUsage)
         resetCredits = try container.decodeIfPresent(ResetCreditsSnapshot.self, forKey: .resetCredits)
     }
 }

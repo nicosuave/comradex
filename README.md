@@ -4,11 +4,11 @@
 
 Comradex is a small Rust relay that gives native Codex and Claude Code sticky, quota-aware account pools.
 
-The [macOS menu app](macos/ComradexMenu/README.md) and desktop widget show remaining quota and reset times for your Codex and Claude accounts.
+The [macOS menu app](macos/ComradexMenu/README.md) and desktop widget show remaining quota for your Codex and Claude accounts. The menu also shows reset times.
 
 <p>
   <img src="docs/screenshots/menu-bar.png" alt="Comradex menu showing Codex and Claude account usage and reset times" height="320">
-  <img src="docs/screenshots/account-usage-widget.png" alt="Comradex desktop widget showing remaining quota and reset countdowns for Codex and Claude accounts" height="320">
+  <img src="docs/screenshots/account-usage-widget.png" alt="Comradex desktop widget showing remaining quota for Codex and Claude accounts" height="320">
 </p>
 
 ## Quick start
@@ -691,4 +691,4 @@ Automatic redemption is **opt-in**. Set `auto_redeem_resets = true` under `[prox
 
 The menu app communicates directly with the daemon through a local socket accessible only to your macOS user. It reads status, changes account settings, and starts the official Codex device-login flow. The app displays the login URL, authorization code, and progress without handling account credentials.
 
-The menu app also includes a desktop widget that shows each account's remaining quota and reset times. Add **Account Usage** from the macOS widget gallery in small, medium, large, or extra-large sizes; see the [menu app README](macos/ComradexMenu/README.md#desktop-widget).
+The menu app also includes a desktop widget that shows each account's remaining quota. Add **Account Usage** from the macOS widget gallery in small, medium, large, or extra-large sizes; see the [menu app README](macos/ComradexMenu/README.md#desktop-widget).

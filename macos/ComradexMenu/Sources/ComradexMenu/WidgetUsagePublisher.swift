@@ -68,8 +68,47 @@ extension UsageAccount {
             status: status,
             windows: windows,
             retryAt: account.retryAtUnix.map { Date(timeIntervalSince1970: TimeInterval($0)) },
-            summaryWindowIndex: sortedWindows.firstIndex { $0.key == summaryKey }
+            summaryWindowIndex: sortedWindows.firstIndex { $0.key == summaryKey },
+            fableWindow: account.isClaude ? account.fableWindow : nil
         )
+    }
+}
+
+extension AccountSnapshot {
+    /// Accept both Claude reporting formats without mixing model limits into shared quota.
+    var fableWindow: UsageWindow? {
+        if case .object(let window) = reportingUsage?["seven_day_fable"],
+           let parsed = fableWindow(window, percentKey: "utilization") {
+            return parsed
+        }
+        guard case .array(let limits) = reportingUsage?["limits"] else { return nil }
+        for case .object(let limit) in limits {
+            guard limit["kind"] == .string("weekly_scoped"),
+                  limit["group"] == .string("weekly"),
+                  case .object(let scope) = limit["scope"],
+                  scope["surface"] == nil || scope["surface"] == .null,
+                  case .object(let model) = scope["model"],
+                  case .string(let name) = model["display_name"],
+                  name.caseInsensitiveCompare("Fable") == .orderedSame
+            else { continue }
+            if let parsed = fableWindow(limit, percentKey: "percent") { return parsed }
+        }
+        return nil
+    }
+
+    private func fableWindow(_ fields: [String: JSONValue], percentKey: String) -> UsageWindow? {
+        guard case .number(let percent) = fields[percentKey], percent.isFinite, (0...100).contains(percent) else { return nil }
+        let reset: Date?
+        switch fields["resets_at"] {
+        case .string(let timestamp):
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            guard let date = formatter.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) else { return nil }
+            reset = date
+        case nil, .null: reset = nil
+        default: return nil
+        }
+        return UsageWindow(duration: 7 * 86_400, usedPercent: Int(percent.rounded(.down)), resetsAt: reset)
     }
 }
 
@@ -149,13 +188,16 @@ final class WidgetUsagePublisher {
         var change = Change.none
         for (before, after) in zip(old.accounts, new.accounts) {
             guard before.name == after.name, before.provider == after.provider, before.status == after.status,
-                  before.windows.count == after.windows.count, before.summaryWindowIndex == after.summaryWindowIndex
+                  before.windows.count == after.windows.count, before.summaryWindowIndex == after.summaryWindowIndex,
+                  (before.fableWindow == nil) == (after.fableWindow == nil)
             else { return .structural }
             let sameUsage = zip(before.windows, after.windows).allSatisfy { previous, current in
                 previous.duration == current.duration
                     && previous.usedPercent == current.usedPercent
                     && closeEnough(previous.resetsAt, current.resetsAt)
             } && closeEnough(before.retryAt, after.retryAt)
+                && before.fableWindow?.usedPercent == after.fableWindow?.usedPercent
+                && closeEnough(before.fableWindow?.resetsAt, after.fableWindow?.resetsAt)
             if !sameUsage { change = .usage }
         }
         return change
