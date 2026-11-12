@@ -27,7 +27,7 @@ struct UsageTimelineProvider: TimelineProvider {
             // An unreachable Mac falls back to the cached snapshot, which the views label
             // with its age once it is stale.
             let snapshot = (try? await RemoteUsage.fetch()) ?? RemoteUsage.cache.load()
-            // Minute entries keep stale-data age labels current between fetches.
+            // Minute entries keep countdowns and stale-data age labels current between fetches.
             let minute = Date(timeIntervalSince1970: (now.timeIntervalSince1970 / 60).rounded(.down) * 60)
             let entries = [UsageEntry(date: now, snapshot: snapshot)] + (1..<30).map {
                 UsageEntry(date: minute.addingTimeInterval(TimeInterval($0 * 60)), snapshot: snapshot)

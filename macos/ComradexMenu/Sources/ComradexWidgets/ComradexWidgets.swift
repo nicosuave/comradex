@@ -27,7 +27,7 @@ struct UsageTimelineProvider: TimelineProvider {
             completion(Timeline(entries: [UsageEntry(date: now, snapshot: nil)], policy: .after(now.addingTimeInterval(15 * 60))))
             return
         }
-        // Minute entries keep stale-data age labels current between reloads. The menu app
+        // Minute entries keep countdowns and stale-data age labels current. The menu app
         // requests a reload when usage changes; the timeline's end re-reads the file.
         let minute = Date(timeIntervalSince1970: (now.timeIntervalSince1970 / 60).rounded(.down) * 60)
         let entries = [UsageEntry(date: now, snapshot: snapshot)] + (1..<30).map {
