@@ -46,6 +46,8 @@ public struct UsageAccount: Codable, Equatable, Identifiable, Sendable {
     /// Index in `windows` of the window the menu shows for this account, so the widget
     /// matches it. Snapshots without one fall back to the most constrained window.
     public var summaryWindowIndex: Int?
+    /// Model-specific quota, never part of the account-wide limiting window.
+    public var fableWindow: UsageWindow?
 
     public var id: String { name }
 
@@ -55,7 +57,8 @@ public struct UsageAccount: Codable, Equatable, Identifiable, Sendable {
         status: Status,
         windows: [UsageWindow],
         retryAt: Date? = nil,
-        summaryWindowIndex: Int? = nil
+        summaryWindowIndex: Int? = nil,
+        fableWindow: UsageWindow? = nil
     ) {
         self.name = name
         self.provider = provider
@@ -63,6 +66,7 @@ public struct UsageAccount: Codable, Equatable, Identifiable, Sendable {
         self.windows = windows
         self.retryAt = retryAt
         self.summaryWindowIndex = summaryWindowIndex
+        self.fableWindow = fableWindow
     }
 
     /// The window that limits the account first: the least remaining quota, preferring the
@@ -162,7 +166,7 @@ extension UsageSnapshot {
             UsageAccount(name: "claude", provider: .claude, status: .available, windows: [
                 UsageWindow(duration: fiveHours, usedPercent: 11, resetsAt: date.addingTimeInterval(47 * 60)),
                 UsageWindow(duration: week, usedPercent: 7, resetsAt: date.addingTimeInterval(5 * 86_400 + 3 * 3_600)),
-            ]),
+            ], fableWindow: UsageWindow(duration: week, usedPercent: 42, resetsAt: date.addingTimeInterval(5 * 86_400 + 3 * 3_600))),
         ])
     }
 }

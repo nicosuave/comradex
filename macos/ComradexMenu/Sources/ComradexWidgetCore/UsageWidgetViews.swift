@@ -16,7 +16,7 @@ public struct UsageWidgetView: View {
     public var body: some View {
         if let snapshot, !snapshot.accounts.isEmpty {
             switch family {
-            case .systemSmall: SmallUsageView(accounts: snapshot.accounts, date: date)
+            case .systemSmall: SmallUsageView(accounts: snapshot.accounts)
             case .systemMedium: MediumUsageView(snapshot: snapshot, date: date)
             case .systemExtraLarge: ExtraLargeUsageView(snapshot: snapshot, date: date)
             default: LargeUsageView(snapshot: snapshot, date: date)
@@ -141,6 +141,7 @@ struct PercentText: View {
                 .foregroundStyle(.secondary)
         }
         .monospacedDigit()
+        .foregroundStyle(percent == 0 ? Color.red : Color.primary)
         .lineLimit(1)
         .minimumScaleFactor(0.5)
     }
@@ -179,32 +180,54 @@ struct AccountRing: View {
     let diameter: CGFloat
 
     var body: some View {
-        UsageRing(
-            fraction: account.remainingPercent.map { Double($0) / 100 },
-            tint: UsageLevel(account: account).tint,
-            lineWidth: max(3.5, diameter * 0.1)
-        ) {
-            AccountRingCenter(account: account, size: diameter * 0.27)
+        let fable = account.visibleFableWindow
+        let lineWidth = fable == nil ? max(3.5, diameter * 0.1) : max(3, diameter * 0.055)
+        let ringInset = lineWidth + max(2.5, diameter * 0.035)
+        ZStack {
+            UsageRing(
+                fraction: account.remainingPercent.map { Double($0) / 100 },
+                tint: UsageLevel(account: account).tint,
+                lineWidth: lineWidth
+            ) {
+                if fable == nil {
+                    AccountRingCenter(account: account, size: diameter * 0.27)
+                }
+            }
+            if let fable {
+                UsageRing(
+                    fraction: Double(fable.remainingPercent) / 100,
+                    tint: UsageLevel(remaining: fable.remainingPercent).tint,
+                    lineWidth: lineWidth
+                ) {
+                    VStack(spacing: 1) {
+                        AccountRingCenter(account: account, size: diameter * 0.23)
+                        PercentText(percent: fable.remainingPercent, size: diameter * 0.17)
+                    }
+                }
+                .padding(ringInset)
+            }
         }
         .frame(width: diameter, height: diameter)
     }
 }
 
-/// The status line under an account: when its quota returns, or why usage is missing.
-/// The compact form drops "Resets in" so narrow columns keep a readable size.
-func accountCaption(_ account: UsageAccount, at date: Date, compact: Bool = false) -> String {
+extension UsageAccount {
+    /// Authentication failures show the existing status symbol instead of stale model usage.
+    var visibleFableWindow: UsageWindow? {
+        guard provider == .claude, status == .available || status == .limited else { return nil }
+        return fableWindow
+    }
+}
+
+/// The status line under an account when usage needs attention or is missing.
+func accountCaption(_ account: UsageAccount, compact: Bool = false) -> String {
     switch account.status {
     case .needsSignIn: return compact ? "Sign in" : "Sign-in required"
     case .signingIn: return "Signing in…"
     case .unavailable: return "Unavailable"
     case .available where account.windows.isEmpty: return compact ? "Pending" : "Usage pending"
-    case .available, .limited:
-        guard let reset = account.resetDate(at: date) else {
-            return account.status == .limited ? "Limit reached" : account.summaryWindow?.title ?? ""
-        }
-        let countdown = compactCountdown(until: reset, from: date)
-        if account.status == .limited { return "Back in \(countdown)" }
-        return compact ? countdown : "Resets in \(countdown)"
+    case .limited: return "Limit reached"
+    case .available: return ""
     }
 }
 
@@ -213,10 +236,12 @@ func updatedCaption(_ snapshot: UsageSnapshot, at date: Date) -> String? {
     return "Updated \(compactCountdown(until: date, from: snapshot.publishedAt)) ago"
 }
 
-func accessibilityDescription(_ account: UsageAccount, at date: Date) -> String {
+func accessibilityDescription(_ account: UsageAccount) -> String {
     let usage = account.remainingPercent.map { "\($0) percent left" }
-    return [account.name, account.provider.title, usage, accountCaption(account, at: date)]
+    let fable = account.visibleFableWindow.map { "Fable \($0.remainingPercent) percent left" }
+    return [account.name, account.provider.title, usage, fable, accountCaption(account)]
         .compactMap { $0 }
+        .filter { !$0.isEmpty }
         .joined(separator: ", ")
 }
 
@@ -225,18 +250,18 @@ struct AccountRingCell: View {
     enum Caption { case none, compact, full }
 
     let account: UsageAccount
-    let date: Date
     let diameter: CGFloat
     var caption = Caption.full
 
     var body: some View {
-        VStack(spacing: 5) {
+        VStack(spacing: diameter <= 54 ? 2 : 5) {
             AccountRing(account: account, diameter: diameter)
             VStack(spacing: 1) {
                 Text(account.name)
-                    .font(.system(size: 11, weight: .semibold))
-                if caption != .none {
-                    captionText
+                    .font(.system(size: diameter <= 54 ? 10 : 11, weight: .semibold))
+                let status = accountCaption(account, compact: caption == .compact)
+                if caption != .none, !status.isEmpty {
+                    Text(status)
                         .font(.system(size: 10, weight: .medium))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
@@ -246,29 +271,19 @@ struct AccountRingCell: View {
             .minimumScaleFactor(0.85)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityDescription(account, at: date))
-    }
-
-    private var captionText: Text {
-        let text = accountCaption(account, at: date, compact: caption == .compact)
-        // A bare countdown gets the reset glyph so it still reads as "resets in".
-        if caption == .compact, account.status == .available, account.resetDate(at: date) != nil {
-            return Text("\(Image(systemName: "arrow.clockwise")) \(text)")
-        }
-        return Text(text)
+        .accessibilityLabel(accessibilityDescription(account))
     }
 }
 
-/// Each quota window as a labeled meter with its remaining share and reset countdown.
+/// Each quota window as a labeled meter with its remaining share.
 /// Fixed column widths keep meters aligned across accounts.
 struct WindowList: View {
     let account: UsageAccount
-    let date: Date
     let compact: Bool
 
     var body: some View {
         if account.windows.isEmpty || !(account.status == .available || account.status == .limited) {
-            Text(accountCaption(account, at: date))
+            Text(accountCaption(account))
                 .font(.system(size: compact ? 10 : 11, weight: .medium))
                 .foregroundStyle(account.status == .needsSignIn ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
         } else {
@@ -284,10 +299,8 @@ struct WindowList: View {
                             height: compact ? 5 : 6
                         )
                         Text("\(window.remainingPercent)%")
+                            .foregroundStyle(window.remainingPercent == 0 ? Color.red : Color.primary)
                             .frame(width: compact ? 30 : 34, alignment: .trailing)
-                        Text(window.resetsAt.flatMap { $0 > date ? compactCountdown(until: $0, from: date) : nil } ?? "")
-                            .foregroundStyle(.secondary)
-                            .frame(width: compact ? 42 : 48, alignment: .trailing)
                     }
                 }
             }
@@ -345,16 +358,19 @@ func providerSections(_ accounts: [UsageAccount]) -> [ProviderSection] {
     return sections
 }
 
-/// Detail lines an account occupies: its name plus one per window.
-func detailLines(_ account: UsageAccount) -> Int { 1 + max(1, account.windows.count) }
+/// Detail lines an account occupies: its name plus one per window, allowing for taller dual rings.
+func detailLines(_ account: UsageAccount, showsRing: Bool = false) -> Int {
+    let lines = 1 + max(1, account.windows.count)
+    return showsRing && account.visibleFableWindow != nil ? max(3, lines) : lines
+}
 
 /// The leading accounts whose details, including provider headings, fit in `lines`.
-func accountsFitting(_ accounts: [UsageAccount], lines: Int) -> [UsageAccount] {
+func accountsFitting(_ accounts: [UsageAccount], lines: Int, showsRings: Bool = false) -> [UsageAccount] {
     var used = 0
     var fitting: [UsageAccount] = []
     for account in accounts {
         let heading = fitting.last?.provider == account.provider ? 0 : 1
-        used += heading + detailLines(account)
+        used += heading + detailLines(account, showsRing: showsRings)
         guard used <= lines else { break }
         fitting.append(account)
     }
@@ -378,24 +394,23 @@ struct MoreAccountsNote: View {
 
 struct SmallUsageView: View {
     let accounts: [UsageAccount]
-    let date: Date
 
     var body: some View {
         Group {
             switch accounts.count {
             case 1:
-                AccountRingCell(account: accounts[0], date: date, diameter: 88)
+                AccountRingCell(account: accounts[0], diameter: 96)
             case 2:
-                HStack(spacing: 12) {
-                    ForEach(accounts) { AccountRingCell(account: $0, date: date, diameter: 56, caption: .compact) }
+                HStack(spacing: 10) {
+                    ForEach(accounts) { AccountRingCell(account: $0, diameter: 62, caption: .compact) }
                 }
             default:
                 // Two rows of two, like the Batteries widget. Larger sizes list every account.
                 let shown = Array(accounts.prefix(4))
-                VStack(spacing: 10) {
+                VStack(spacing: 2) {
                     ForEach([Array(shown.prefix(2)), Array(shown.dropFirst(2))], id: \.first?.id) { row in
-                        HStack(spacing: 16) {
-                            ForEach(row) { AccountRingCell(account: $0, date: date, diameter: 46, caption: .none) }
+                        HStack(spacing: 14) {
+                            ForEach(row) { AccountRingCell(account: $0, diameter: 54, caption: .none) }
                         }
                     }
                 }
@@ -416,16 +431,15 @@ struct MediumUsageView: View {
         VStack(spacing: 0) {
             if accounts.count == 1 {
                 HStack(spacing: 20) {
-                    AccountRingCell(account: accounts[0], date: date, diameter: 80, caption: .none)
-                    WindowList(account: accounts[0], date: date, compact: false)
+                    AccountRingCell(account: accounts[0], diameter: 88, caption: .none)
+                    WindowList(account: accounts[0], compact: false)
                 }
             } else {
                 HStack(spacing: 0) {
                     ForEach(accounts) { account in
                         AccountRingCell(
                             account: account,
-                            date: date,
-                            diameter: accounts.count > 3 ? 60 : 66,
+                            diameter: accounts.count > 3 ? 68 : 76,
                             caption: accounts.count > 3 ? .compact : .full
                         )
                         .frame(maxWidth: .infinity)
@@ -448,13 +462,13 @@ struct LargeUsageView: View {
     let date: Date
 
     var body: some View {
-        let shown = accountsFitting(snapshot.accounts, lines: 15)
+        let shown = accountsFitting(snapshot.accounts, lines: 15, showsRings: true)
         // Few accounts get roomier rows so the widget does not look empty.
-        let roomy = shown.reduce(0) { $0 + detailLines($1) } <= 8
+        let roomy = shown.reduce(0) { $0 + detailLines($1, showsRing: true) } <= 8
         VStack(alignment: .leading, spacing: 0) {
             UsageHeader(snapshot: snapshot, date: date)
                 .padding(.bottom, roomy ? 16 : 10)
-            AccountSections(accounts: shown, date: date, roomy: roomy, showsRings: true)
+            AccountSections(accounts: shown, roomy: roomy, showsRings: true)
             Spacer(minLength: 0)
             MoreAccountsNote(count: snapshot.accounts.count - shown.count)
         }
@@ -465,7 +479,6 @@ struct LargeUsageView: View {
 /// Accounts grouped under provider headings.
 struct AccountSections: View {
     let accounts: [UsageAccount]
-    let date: Date
     let roomy: Bool
     let showsRings: Bool
 
@@ -476,7 +489,7 @@ struct AccountSections: View {
                     Text(section.provider.title)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.secondary)
-                    ForEach(section.accounts) { AccountRow(account: $0, date: date, roomy: roomy, showsRing: showsRings) }
+                    ForEach(section.accounts) { AccountRow(account: $0, roomy: roomy, showsRing: showsRings) }
                 }
             }
         }
@@ -485,24 +498,23 @@ struct AccountSections: View {
 
 struct AccountRow: View {
     let account: UsageAccount
-    let date: Date
     let roomy: Bool
     let showsRing: Bool
 
     var body: some View {
         HStack(alignment: .center, spacing: roomy ? 14 : 12) {
             if showsRing {
-                AccountRing(account: account, diameter: roomy ? 48 : 36)
+                AccountRing(account: account, diameter: account.visibleFableWindow == nil ? (roomy ? 48 : 36) : 56)
             }
             VStack(alignment: .leading, spacing: roomy ? 6 : 4) {
                 Text(account.name)
                     .font(.system(size: roomy ? 13 : 12, weight: .semibold))
                     .lineLimit(1)
-                WindowList(account: account, date: date, compact: !roomy)
+                WindowList(account: account, compact: !roomy)
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityDescription(account, at: date))
+        .accessibilityLabel(accessibilityDescription(account))
     }
 }
 
@@ -523,8 +535,7 @@ struct ExtraLargeUsageView: View {
                 ForEach(rings) { account in
                     AccountRingCell(
                         account: account,
-                        date: date,
-                        diameter: rings.count > 6 ? 54 : 62,
+                        diameter: rings.count > 6 ? 60 : 70,
                         caption: rings.count > 6 ? .compact : .full
                     )
                     .frame(maxWidth: .infinity)
@@ -535,7 +546,7 @@ struct ExtraLargeUsageView: View {
                 .padding(.vertical, 14)
             HStack(alignment: .top, spacing: 32) {
                 ForEach(Array(columns.enumerated()), id: \.offset) { _, column in
-                    AccountSections(accounts: column, date: date, roomy: false, showsRings: false)
+                    AccountSections(accounts: column, roomy: false, showsRings: false)
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
             }

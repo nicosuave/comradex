@@ -103,7 +103,7 @@ impl App {
         }
     }
 
-    pub(super) async fn claude_reporting_usage(
+    pub(crate) async fn claude_reporting_usage(
         &self,
         account: &str,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -2155,6 +2155,49 @@ kind="claude_inbound"
         }
         assert_eq!(before, harness.app.router.routing_snapshot().await);
         assert_eq!(harness.seen.lock().await.len(), 2);
+        // The menu's control response carries the same identity-checked reporting data
+        // without adding model-specific limits to account-wide routing windows.
+        let state_dir = harness._directory.path();
+        let control = crate::control::ControlServer::bind(
+            state_dir,
+            state_dir.join("comradex.toml"),
+            harness.app.config.clone(),
+            harness.app.router.clone(),
+            harness.app.stats.clone(),
+        )
+        .unwrap()
+        .with_app(harness.app.clone());
+        let control_task = tokio::spawn(control.run());
+        {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let mut stream =
+                tokio::net::UnixStream::connect(crate::control::socket_path(state_dir))
+                    .await
+                    .unwrap();
+            stream
+                .write_all(b"{\"command\":\"ui_status\"}\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            tokio::io::BufReader::new(stream)
+                .read_line(&mut response)
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["ok"], true);
+            let accounts = response["status"]["accounts"].as_array().unwrap();
+            for account in accounts {
+                let name = account["name"].as_str().unwrap();
+                assert_eq!(
+                    account["reporting_usage"],
+                    serde_json::to_value(harness.app.claude_reporting_usage(name).await.unwrap())
+                        .unwrap()
+                );
+                assert_eq!(account["usage_windows"].as_object().unwrap().len(), 2);
+            }
+            assert_eq!(accounts.len(), 2);
+        }
+        control_task.abort();
         let selection = harness
             .app
             .router
