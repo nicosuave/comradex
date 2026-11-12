@@ -44,13 +44,13 @@ Status refreshes automatically every five seconds and when the menu opens. Only 
 The app embeds a WidgetKit extension, **Account Usage**, for the desktop and Notification Center. Add it from the widget gallery (right-click the desktop and choose **Edit Widgets…**). Each ring shows the remaining quota of the same window as the account's menu row, colored green, then orange below 25%, and red below 10% or while the account is rate-limited:
 
 - **Small** shows up to four account gauges; a single account gets one large gauge.
-- **Medium** shows up to four account gauges with names.
+- **Medium** shows up to four account gauges with names and plain reset countdowns, without reset icons.
 - **Large** lists accounts under Codex and Claude headings with a meter and remaining percentage for every quota window.
 - **Extra large** combines a ring overview of up to eight accounts with two columns of window details.
 
 Inbound accounts are omitted because Comradex has no usage for them. Accounts that need sign-in or are unavailable show their state instead of usage. Clicking the widget opens the status menu.
 
-Claude accounts with Fable usage add a concentric inner ring. The shared center stacks the current quota above Fable's quota, with percentages in the standard text color and red only at zero. Widgets do not show reset captions, icons, or countdowns.
+Claude accounts with Fable usage add a concentric inner ring. The shared center stacks the current quota above Fable's quota, with percentages in the standard text color and red only at zero. The medium widget shows the selected quota's time remaining below each account name; other sizes omit reset countdowns. Widgets do not show reset icons.
 
 The widget is sandboxed and cannot reach the daemon's control socket. After each status poll, the menu app writes a compact usage snapshot to the shared app group container `<team-id>.com.nicosuave.comradex`, then asks WidgetKit to reload. State changes reload within 30 seconds; percentage changes reload at most every five minutes to stay within WidgetKit's reload budget. Stale-data age labels advance every minute between reloads. Unchanged usage is rewritten every five minutes, so if the menu app stops running, the widget labels data older than 30 minutes with its age.
 

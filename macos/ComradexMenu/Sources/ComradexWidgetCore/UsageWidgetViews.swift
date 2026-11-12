@@ -231,6 +231,13 @@ func accountCaption(_ account: UsageAccount, compact: Bool = false) -> String {
     }
 }
 
+/// The medium widget keeps the reset time as a plain countdown below the account name.
+func accountResetCountdown(_ account: UsageAccount, at date: Date) -> String? {
+    guard account.status == .available || account.status == .limited,
+          let reset = account.resetDate(at: date) else { return nil }
+    return compactCountdown(until: reset, from: date)
+}
+
 func updatedCaption(_ snapshot: UsageSnapshot, at date: Date) -> String? {
     guard date.timeIntervalSince(snapshot.publishedAt) > staleInterval else { return nil }
     return "Updated \(compactCountdown(until: date, from: snapshot.publishedAt)) ago"
@@ -252,6 +259,7 @@ struct AccountRingCell: View {
     let account: UsageAccount
     let diameter: CGFloat
     var caption = Caption.full
+    var resetCountdown: String? = nil
 
     var body: some View {
         VStack(spacing: diameter <= 54 ? 2 : 5) {
@@ -259,8 +267,8 @@ struct AccountRingCell: View {
             VStack(spacing: 1) {
                 Text(account.name)
                     .font(.system(size: diameter <= 54 ? 10 : 11, weight: .semibold))
-                let status = accountCaption(account, compact: caption == .compact)
-                if caption != .none, !status.isEmpty {
+                let status = resetCountdown ?? (caption == .none ? "" : accountCaption(account, compact: caption == .compact))
+                if !status.isEmpty {
                     Text(status)
                         .font(.system(size: 10, weight: .medium))
                         .monospacedDigit()
@@ -271,7 +279,7 @@ struct AccountRingCell: View {
             .minimumScaleFactor(0.85)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityDescription(account))
+        .accessibilityLabel(accessibilityDescription(account) + (resetCountdown.map { ", resets in \($0)" } ?? ""))
     }
 }
 
@@ -431,7 +439,10 @@ struct MediumUsageView: View {
         VStack(spacing: 0) {
             if accounts.count == 1 {
                 HStack(spacing: 20) {
-                    AccountRingCell(account: accounts[0], diameter: 88, caption: .none)
+                    AccountRingCell(
+                        account: accounts[0], diameter: 88, caption: .none,
+                        resetCountdown: accountResetCountdown(accounts[0], at: date)
+                    )
                     WindowList(account: accounts[0], compact: false)
                 }
             } else {
@@ -440,7 +451,8 @@ struct MediumUsageView: View {
                         AccountRingCell(
                             account: account,
                             diameter: accounts.count > 3 ? 68 : 76,
-                            caption: accounts.count > 3 ? .compact : .full
+                            caption: accounts.count > 3 ? .compact : .full,
+                            resetCountdown: accountResetCountdown(account, at: date)
                         )
                         .frame(maxWidth: .infinity)
                     }

@@ -181,6 +181,28 @@ final class WidgetUsageTests: XCTestCase {
         XCTAssertNil(pending.remainingPercent)
     }
 
+    func testMediumCountdownUsesSelectedQuotaAndHidesStaleAuthenticationData() {
+        let now = Date(timeIntervalSince1970: 0)
+        var account = UsageAccount(name: "claude", provider: .claude, status: .available, windows: [
+            UsageWindow(duration: 604_800, usedPercent: 25, resetsAt: now.addingTimeInterval(3_600)),
+        ], fableWindow: UsageWindow(duration: 604_800, usedPercent: 50, resetsAt: now.addingTimeInterval(7_200)))
+        XCTAssertEqual(accountResetCountdown(account, at: now), "1h 0m")
+        XCTAssertNil(accountResetCountdown(account, at: now.addingTimeInterval(3_600)))
+        account.status = .limited
+        account.windows[0].usedPercent = 100
+        XCTAssertEqual(accountResetCountdown(account, at: now), "1h 0m")
+        account.windows = []
+        account.retryAt = now.addingTimeInterval(45 * 60)
+        XCTAssertEqual(accountResetCountdown(account, at: now), "45m")
+        for status in [UsageAccount.Status.needsSignIn, .signingIn, .unavailable] {
+            account.status = status
+            XCTAssertNil(accountResetCountdown(account, at: now))
+        }
+        account.status = .available
+        account.retryAt = nil
+        XCTAssertNil(accountResetCountdown(account, at: now))
+    }
+
     func testDetailLayoutsKeepWholeAccountsWithinTheirLineBudget() {
         func account(_ name: String, _ provider: UsageProvider, windows: Int) -> UsageAccount {
             UsageAccount(name: name, provider: provider, status: .available, windows: Array(
