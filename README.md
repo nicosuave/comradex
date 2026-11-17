@@ -662,10 +662,18 @@ GitHub Actions builds and publishes the Linux artifacts after a version tag is p
 After the tagged Linux release workflow succeeds, publish both signed and notarized macOS architectures and update the Homebrew tap with:
 
 ```sh
-scripts/release_macos_local.sh 0.9.3
+scripts/release_macos_local.sh
 ```
 
-The script requires the tag to point at `HEAD`, refuses uncommitted Rust source changes, uses the first local Developer ID Application identity, and uses the `sidequery-notarization` Keychain profile by default. Override those with `CODESIGN_IDENTITY` or `NOTARY_PROFILE` when necessary. It replaces the matching macOS GitHub release assets, waits for the Homebrew update workflow, and retries that update once if GitHub's asset CDN has not settled.
+The script requires the tag to point at `HEAD`, refuses uncommitted source and packaging changes, uses the first local Developer ID Application identity, and uses the `sidequery-notarization` Keychain profile by default. Override those with `CODESIGN_IDENTITY` or `NOTARY_PROFILE` when necessary. It replaces the matching macOS GitHub release assets, waits for the Homebrew update workflow, and retries that update once if GitHub's asset CDN has not settled.
+
+For a private installation from a clean, committed branch, build only the current Mac's architecture without publishing a release:
+
+```sh
+NOTARY_PROFILE=your-notary-profile scripts/release_macos_local.sh --local
+```
+
+Local mode builds an immutable Git snapshot, signs and notarizes the executable, and writes the archive under `target/local-release/local-<version>-<commit>/`. It does not upload GitHub assets, build the menu app, or update Homebrew. `CARGO_TARGET_DIR` selects the build cache. Packaging replaces the Nix libiconv reference with macOS's system library and rejects other non-system runtime dependencies. Only an `Accepted` notarization result produces an installable archive.
 
 ## Status and statistics
 
