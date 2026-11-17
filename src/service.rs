@@ -711,39 +711,89 @@ impl Default for Service {
 
 /// Resolve symlinks so alternate spellings of one configuration target the same service.
 pub fn for_config(config_path: &Path) -> Result<Service> {
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .context("HOME is not set")?;
-    for_config_home(config_path, Path::new(&home))
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config_path;
+        Ok(Service::default())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .context("HOME is not set")?;
+        for_config_home(config_path, Path::new(&home))
+    }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn for_config_home(config_path: &Path, home: &Path) -> Result<Service> {
-    let default = home.join(".config/comradex/comradex.toml");
-    let normalize = |path: &Path| -> Result<PathBuf> {
-        Ok(fs::canonicalize(path).unwrap_or(std::path::absolute(path)?))
-    };
-    let config = normalize(config_path)?;
-    let mut label = label_for_paths(&config, &normalize(&default)?);
-    let legacy_plist = home
-        .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist"));
-    if label != LABEL
-        && let Ok(plist) = fs::read_to_string(legacy_plist)
-        && let Some(installed) = plist_program_config(&plist)
-        && normalize(&installed)? == config
+    use crate::config::resolve_config_path;
+
+    let config = resolve_config_path(config_path)?;
+    let default = lookup_path(&home.join(".config/comradex/comradex.toml"))?;
+    let alternate = alternate_label(&config);
+    let agents = home.join("Library/LaunchAgents");
+    let alternate_owner = recorded_config(&agents.join(format!("{alternate}.plist")))?;
+    let legacy_owner = recorded_config(&agents.join(format!("{LABEL}.plist")))?;
+    if alternate_owner
+        .as_ref()
+        .is_some_and(|owner| owner != &config)
     {
-        label = LABEL.into();
+        bail!("the configuration's service label is already owned by another configuration")
     }
+    if alternate_owner.is_some() && legacy_owner.as_ref() == Some(&config) {
+        bail!(
+            "the configuration is registered under two service labels; remove the duplicate before maintenance"
+        )
+    }
+    let label = if alternate_owner.is_some() {
+        alternate
+    } else if legacy_owner.as_ref() == Some(&config) {
+        LABEL.into()
+    } else if legacy_owner.is_none() {
+        label_for_paths(&config, &default)
+    } else {
+        alternate
+    };
     Ok(Service { label })
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn recorded_config(plist_path: &Path) -> Result<Option<PathBuf>> {
+    let plist = match fs::read_to_string(plist_path) {
+        Ok(plist) => plist,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
+    };
+    let config = plist_program_config(&plist)
+        .with_context(|| format!("no --config recorded in {}", plist_path.display()))?;
+    Ok(Some(lookup_path(&config)?))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn lookup_path(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::path::absolute(path)?)
+        }
+        Err(error) => Err(error).with_context(|| format!("resolve {}", path.display())),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn label_for_paths(config: &Path, default: &Path) -> String {
     if config == default {
         LABEL.into()
     } else {
-        let digest = blake3::hash(config.as_os_str().as_encoded_bytes());
-        format!("{LABEL}.{}", &digest.to_hex()[..12])
+        alternate_label(config)
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn alternate_label(config: &Path) -> String {
+    let digest = blake3::hash(config.as_os_str().as_encoded_bytes());
+    format!("{LABEL}.{}", &digest.to_hex()[..12])
 }
 
 impl Service {
@@ -1153,6 +1203,76 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn register_owner(home: &Path, label: &str, config: &Path) -> PathBuf {
+        let agents = home.join("Library/LaunchAgents");
+        fs::create_dir_all(&agents).unwrap();
+        let plist = render_plist(
+            Path::new("/usr/local/bin/comradex"),
+            config,
+            home,
+            Path::new("/tmp/out"),
+            Path::new("/tmp/err"),
+            "nonce",
+            label,
+        );
+        let path = agents.join(format!("{label}.plist"));
+        fs::write(&path, plist).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_dangling_aliases_do_not_block_a_valid_service() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("valid.toml");
+        fs::write(&config, "").unwrap();
+        let label = for_config_home(&config, home.path()).unwrap().label;
+        register_owner(home.path(), &label, &config);
+        let default = home.path().join(".config/comradex/comradex.toml");
+        fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(home.path().join("missing-default"), &default).unwrap();
+        assert_eq!(for_config_home(&config, home.path()).unwrap().label, label);
+        fs::remove_file(default).unwrap();
+        let other = home.path().join("dangling-legacy.toml");
+        std::os::unix::fs::symlink(home.path().join("missing-legacy"), &other).unwrap();
+        register_owner(home.path(), LABEL, &other);
+        assert_eq!(for_config_home(&config, home.path()).unwrap().label, label);
+        assert!(for_config_home(&other, home.path()).is_err());
+    }
+
+    #[test]
+    fn named_default_ownership_survives_removal_of_the_legacy_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let default = home.path().join(".config/comradex/comradex.toml");
+        fs::create_dir_all(default.parent().unwrap()).unwrap();
+        fs::write(&default, "").unwrap();
+        let custom = home.path().join("custom.toml");
+        fs::write(&custom, "").unwrap();
+        let legacy = register_owner(home.path(), LABEL, &custom);
+        assert_eq!(for_config_home(&custom, home.path()).unwrap().label, LABEL);
+        let named = for_config_home(&default, home.path()).unwrap().label;
+        assert_ne!(named, LABEL);
+        register_owner(home.path(), &named, &default);
+        fs::remove_file(legacy).unwrap();
+        assert_eq!(for_config_home(&default, home.path()).unwrap().label, named);
+    }
+
+    #[test]
+    fn ambiguous_and_conflicting_registered_owners_are_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("custom.toml");
+        let other = home.path().join("other.toml");
+        fs::write(&config, "").unwrap();
+        fs::write(&other, "").unwrap();
+        let label = for_config_home(&config, home.path()).unwrap().label;
+        let named = register_owner(home.path(), &label, &other);
+        assert!(for_config_home(&config, home.path()).is_err());
+        fs::remove_file(named).unwrap();
+        register_owner(home.path(), &label, &config);
+        register_owner(home.path(), LABEL, &config);
+        assert!(for_config_home(&config, home.path()).is_err());
+    }
 
     #[test]
     fn alternate_configurations_have_distinct_service_labels() {

@@ -22,9 +22,10 @@ the affected relay as required by this session. A second Mac can use the same
 relay.
 
 On macOS, `--config` selects the configuration's LaunchAgent for service and
-account-maintenance commands. The default configuration uses
-`com.nicosuave.comradex`; alternate configurations use a label derived from their
-canonical path, except when retaining an existing legacy singleton installation.
+account-maintenance commands. The default configuration normally uses
+`com.nicosuave.comradex`; other configurations use a label derived from their
+canonical path. An existing legacy singleton stays with its recorded configuration;
+another configuration, including the default, receives its own named service.
 Inspect the actual installed definition before a lifecycle change. `service start`
 and `service restart` read readiness and configuration paths from that definition.
 

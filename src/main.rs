@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => default_config_path(std::env::var_os("HOME"))?,
     };
+    let config_path = comradex::config::resolve_config_path(&config_path)?;
     match cli.command {
         CommandName::Init => init(&config_path),
         CommandName::Check => {
@@ -706,7 +707,8 @@ fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
     match command {
         ServiceCommand::Install => {
             let config = load_config(config_path)?;
-            let plist = service::for_config(config_path)?.install(config_path, &state_dir(&config))?;
+            let plist =
+                service::for_config(config_path)?.install(config_path, &state_dir(&config))?;
             println!("installed and started {}", plist.display());
         }
         ServiceCommand::Start => {
@@ -787,26 +789,28 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         config.accounts.len()
     );
 
-    let selected_service = service::for_config(config_path)?;
-    let service = match (selected_service.installed(), selected_service.status()) {
-        (Ok(true), Ok(true)) => "running".to_owned(),
-        (Ok(true), Ok(false)) => {
-            let suffix = selected_service
-                .last_stderr_line()
-                .ok()
-                .flatten()
-                .map(|stderr| {
-                    format!(
-                        "; last stderr line{}: {}",
-                        stderr_timestamp_suffix(stderr.log_modified_at_unix),
-                        stderr.line
-                    )
-                })
-                .unwrap_or_default();
-            format!("installed but not running{suffix} (run `comradex service start`)")
-        }
-        (Ok(false), _) => "not installed (run `comradex service install`)".to_owned(),
-        (Err(error), _) | (_, Err(error)) => format!("unknown ({error})"),
+    let service = match service::for_config(config_path) {
+        Err(error) => format!("unknown ({error})"),
+        Ok(selected_service) => match (selected_service.installed(), selected_service.status()) {
+            (Ok(true), Ok(true)) => "running".to_owned(),
+            (Ok(true), Ok(false)) => {
+                let suffix = selected_service
+                    .last_stderr_line()
+                    .ok()
+                    .flatten()
+                    .map(|stderr| {
+                        format!(
+                            "; last stderr line{}: {}",
+                            stderr_timestamp_suffix(stderr.log_modified_at_unix),
+                            stderr.line
+                        )
+                    })
+                    .unwrap_or_default();
+                format!("installed but not running{suffix} (run `comradex service start`)")
+            }
+            (Ok(false), _) => "not installed (run `comradex service install`)".to_owned(),
+            (Err(error), _) | (_, Err(error)) => format!("unknown ({error})"),
+        },
     };
     println!("service  {service}");
 
@@ -1456,7 +1460,9 @@ fn write_config_validated(config_path: &Path, text: &str) -> Result<()> {
 /// otherwise leave a reminder. Login is not needed before the restart because
 /// the daemon re-reads each account's auth.json per request.
 fn reload_daemon(config_path: &Path) -> Result<()> {
-    let service = service::for_config(config_path)?;
+    let service = service::for_config(config_path).context(
+        "configuration saved, but its service could not be selected; the daemon was not restarted",
+    )?;
     if service.installed().unwrap_or(false) {
         service.restart()?;
         println!("service restarted");

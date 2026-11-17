@@ -438,7 +438,7 @@ comradex service restart
 comradex service uninstall
 ```
 
-Each configuration owns a separate LaunchAgent. Pass `--config /path/to/comradex.toml` to service and account commands to select that configuration's daemon. Configuration symlinks resolve to the same service. The default configuration keeps `com.nicosuave.comradex`; new alternate configurations receive a stable label derived from their canonical path. An alternate configuration already installed under the legacy singleton label keeps that label during upgrade.
+Each configuration owns a separate LaunchAgent. Pass `--config /path/to/comradex.toml` to service and account commands to select that configuration's daemon. Configuration symlinks resolve to the same service and remain symlinks after account edits. The default configuration normally uses `com.nicosuave.comradex`; other configurations receive a stable label derived from their canonical path. A configuration already installed under the legacy singleton label keeps it during upgrade. If that singleton belongs to another configuration, the default receives its own path-derived label and keeps that label after the legacy service is removed.
 
 `service start` is idempotent: it loads an installed but unloaded LaunchAgent, revives a stopped job, and leaves an already-running or starting job uninterrupted while waiting for its listeners. `service restart` validates the edited configuration before stopping anything, then restarts the selected LaunchAgent and waits for every listener to answer a health probe. A broken edit fails validation and leaves the running daemon untouched. Once the service is selected, both commands read its configuration path from the installed plist.
 
