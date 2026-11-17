@@ -170,7 +170,7 @@ impl App {
             if exhausted {
                 return true;
             }
-            if observed_at >= dispatched_at {
+            if observed_at >= dispatched_at || observed_at.elapsed() < Duration::from_secs(60) {
                 return false;
             }
         }

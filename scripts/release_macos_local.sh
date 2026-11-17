@@ -18,6 +18,10 @@ version="${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)}"
 tag="v${version}"
 notary_profile="${NOTARY_PROFILE:-sidequery-notarization}"
 cargo_target_root="${CARGO_TARGET_DIR:-$root/target}"
+case "$cargo_target_root" in
+  /*) ;;
+  *) cargo_target_root="$root/$cargo_target_root" ;;
+esac
 build_root="$root"
 head_sha="$(git rev-parse HEAD)"
 if [[ "$local_only" == true ]]; then
@@ -69,7 +73,8 @@ if [[ "$local_only" == true ]]; then
   case "$build_root/" in
     "$root/"*) echo "Temporary source directory must be outside the checkout" >&2; exit 1 ;;
   esac
-  git archive "$head_sha" | tar -x -C "$build_root"
+  # Commit mtimes can predate a different cached build of this same package.
+  git archive "$head_sha" | tar -x -m -C "$build_root"
 fi
 
 normalize_runtime_dependencies() {

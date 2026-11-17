@@ -9,7 +9,7 @@ import unittest
 
 
 MOCK_TOOL = r'''#!/usr/bin/env python3
-import io, json, os, sys, tarfile
+import io, json, os, shutil, subprocess, sys, tarfile
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -23,7 +23,12 @@ if name == 'git':
     elif args[:1] == ['archive']:
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode='w') as archive:
-            archive.add('Cargo.toml', arcname='Cargo.toml')
+            for name in ['Cargo.toml', 'Cargo.lock', 'src/main.rs']:
+                if Path(name).exists():
+                    info = archive.gettarinfo(name, arcname=name)
+                    info.mtime = int(os.environ.get('MOCK_COMMIT_TIME', '1609459200'))
+                    with open(name, 'rb') as source:
+                        archive.addfile(info, source)
         sys.stdout.buffer.write(output.getvalue())
     else:
         sys.exit(96)
@@ -40,6 +45,16 @@ elif name == 'cargo':
         log.write(json.dumps({'manifest': str(manifest), 'contents': manifest.read_text(), 'cwd': str(Path.cwd())}) + '\n')
     target = args[args.index('--target') + 1]
     binary = Path(os.environ['CARGO_TARGET_DIR']) / target / 'release/comradex'
+    if os.environ.get('MOCK_REAL_CARGO'):
+        native = os.environ['MOCK_NATIVE_TARGET']
+        native_args = list(args)
+        native_args[native_args.index('--target') + 1] = native
+        subprocess.run([os.environ['MOCK_REAL_CARGO'], *native_args], check=True)
+        built = Path(os.environ['CARGO_TARGET_DIR']) / native / 'release/comradex'
+        if built != binary:
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(built, binary)
+        sys.exit(0)
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.with_suffix('.patched').unlink(missing_ok=True)
     binary.write_bytes(b'local-release-test-executable')
@@ -111,7 +126,7 @@ class LocalReleaseTest(unittest.TestCase):
             env={**self.environment, **environment},
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=120 if environment.get('MOCK_REAL_CARGO') else 20,
         )
 
     def commands(self):
@@ -190,6 +205,33 @@ class LocalReleaseTest(unittest.TestCase):
         configuration.write_text("untracked working-copy compiler overrides")
         result = self.run_release()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_relative_target_directory_packages_the_new_binary(self):
+        binary = self.root / 'build/aarch64-apple-darwin/release/comradex'
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b'stale-checkout-binary')
+        result = self.run_release(CARGO_TARGET_DIR='build')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        archive_path, = self.root.glob('target/local-release/*/*.tar.gz')
+        with tarfile.open(archive_path) as archive:
+            self.assertEqual(archive.extractfile('comradex').read(), b'local-release-test-executable')
+
+    @unittest.skipUnless(shutil.which('cargo') and shutil.which('rustc'), 'requires a Rust toolchain')
+    def test_older_snapshot_rebuilds_real_cargo_output_in_a_shared_cache(self):
+        (self.root / 'Cargo.toml').write_text('[package]\nname="comradex"\nversion="0.19.6"\nedition="2024"\n')
+        (self.root / 'Cargo.lock').write_text('version = 4\n[[package]]\nname = "comradex"\nversion = "0.19.6"\n')
+        source = self.root / 'src/main.rs'
+        source.parent.mkdir()
+        native = subprocess.check_output(['rustc', '-vV'], text=True).split('host: ')[1].splitlines()[0]
+        for marker, commit_time in [('NEWER', '1609459200'), ('OLDER', '1577836800')]:
+            source.write_text('fn main(){println!("' + marker + '");}\n')
+            result = self.run_release(MOCK_REAL_CARGO=shutil.which('cargo'), MOCK_NATIVE_TARGET=native, MOCK_COMMIT_TIME=commit_time)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive_path, = self.root.glob('target/local-release/*/*.tar.gz')
+            with tarfile.open(archive_path) as archive:
+                archive.extractall(self.root / 'unpacked', filter='data')
+            actual = subprocess.check_output([str(self.root / 'unpacked/comradex')], text=True).strip()
+            self.assertEqual(actual, marker)
 
 
 if __name__ == "__main__":

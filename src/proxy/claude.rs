@@ -2362,6 +2362,40 @@ kind="claude_inbound"
     }
 
     #[tokio::test]
+    async fn successive_ambiguous_fable_rejections_respect_a_minimum_usage_interval() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        server_fable_usage(&harness, 25).await;
+        for index in 1..=4 {
+            let session = format!("{index:08x}-cccc-4ccc-8ccc-cccccccccccc");
+            let (body, headers) = rejected_fable_request(&session);
+            let response = harness.send(body, headers).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            response.bytes().await.unwrap();
+        }
+        assert_eq!(usage_requests(&harness).await, 1);
+        // This interval must not impose provider backoff on normal shared-quota polling.
+        assert!(harness.app.refresh_claude_usage_at(auth::now(), true).await);
+        assert_eq!(usage_requests(&harness).await, 3);
+        // After the interval, stale non-exhausted metadata must permit a new check.
+        harness
+            .app
+            .claude
+            .reporting_usage
+            .lock()
+            .await
+            .get_mut("grace")
+            .unwrap()
+            .observed_at = Instant::now() - Duration::from_secs(61);
+        server_fable_usage(&harness, 100).await;
+        let (body, headers) = rejected_fable_request("dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        let response = harness.send(body, headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(usage_requests(&harness).await, 4);
+        harness.close().await;
+    }
+
+    #[tokio::test]
     async fn failed_fable_usage_refresh_backs_off_without_poisoning_shared_quota() {
         let harness = Harness::new(true, StatusCode::OK).await;
         harness.usage.status.store(503, Ordering::Release);
@@ -2443,7 +2477,7 @@ kind="claude_inbound"
                 .push("alias".into());
         })
         .await;
-        let earlier = Instant::now();
+        let earlier = Instant::now() - Duration::from_secs(10);
         fable_usage(&harness, 100, earlier).await;
         let AccountConfig::ClaudeHome { path } = &harness.app.config.accounts["alias"] else {
             unreachable!()
@@ -2465,6 +2499,18 @@ kind="claude_inbound"
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         response.bytes().await.unwrap();
+        assert!(
+            !harness
+                .app
+                .refresh_fable_quota_after_rejection(
+                    "grace",
+                    &owner,
+                    "claude-fable-5-2",
+                    Instant::now()
+                )
+                .await
+        );
+        assert_eq!(usage_requests(&harness).await, 0);
         harness
             .app
             .observe_claude_reporting_usage(

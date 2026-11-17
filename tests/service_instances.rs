@@ -44,10 +44,8 @@ impl Instance {
         fs::create_dir_all(&home).unwrap();
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = socket.local_addr().unwrap();
-        drop(socket);
-        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
-        let codex_address = socket.local_addr().unwrap();
-        drop(socket);
+        let codex_socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let codex_address = codex_socket.local_addr().unwrap();
         let config = directory.join("comradex.toml");
         fs::write(
             &config,
@@ -83,6 +81,7 @@ path="{}/code"
             home,
             label: None,
         };
+        drop((socket, codex_socket));
         let output = instance.run(&["service", "install"]);
         let plist = output
             .trim()
@@ -285,9 +284,11 @@ fn default_service_cannot_take_over_a_legacy_custom_service() {
     let config = default_dir.join("comradex.toml");
     let mut contents: toml::Value =
         toml::from_str(&fs::read_to_string(&custom.config).unwrap()).unwrap();
+    let mut sockets = Vec::new();
     for (_, listener) in contents["listeners"].as_table_mut().unwrap().iter_mut() {
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         listener["address"] = socket.local_addr().unwrap().to_string().into();
+        sockets.push(socket);
     }
     contents["proxy"]["state_dir"] = default_dir.join("state").to_str().unwrap().into();
     contents["accounts"]["code"]["path"] = default_dir.join("code").to_str().unwrap().into();
@@ -310,6 +311,7 @@ fn default_service_cannot_take_over_a_legacy_custom_service() {
             .run(&["service", "status"])
             .contains("not installed")
     );
+    drop(sockets);
     let output = default.run(&["service", "install"]);
     let plist = output
         .trim()
