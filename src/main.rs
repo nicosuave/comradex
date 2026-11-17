@@ -706,25 +706,28 @@ fn service_command(config_path: &Path, command: ServiceCommand) -> Result<()> {
     match command {
         ServiceCommand::Install => {
             let config = load_config(config_path)?;
-            let plist = service::install(config_path, &state_dir(&config))?;
+            let plist = service::for_config(config_path)?.install(config_path, &state_dir(&config))?;
             println!("installed and started {}", plist.display());
         }
         ServiceCommand::Start => {
-            service::start()?;
+            service::for_config(config_path)?.start()?;
             println!("service is running");
         }
-        ServiceCommand::Uninstall => match service::uninstall()? {
+        ServiceCommand::Uninstall => match service::for_config(config_path)?.uninstall()? {
             Some(path) => println!("stopped service and removed {}", path.display()),
             None => println!("service is not installed"),
         },
         ServiceCommand::Status => {
-            println!("{}", service::status_description()?);
+            println!(
+                "{}",
+                service::for_config(config_path)?.status_description()?
+            );
         }
         ServiceCommand::Logs => {
-            println!("{}", service::logs()?);
+            println!("{}", service::for_config(config_path)?.logs()?);
         }
         ServiceCommand::Restart => {
-            service::restart()?;
+            service::for_config(config_path)?.restart()?;
             println!("service restarted");
         }
     }
@@ -784,10 +787,12 @@ fn status(config_path: &Path, json: bool) -> Result<()> {
         config.accounts.len()
     );
 
-    let service = match (service::installed(), service::status()) {
+    let selected_service = service::for_config(config_path)?;
+    let service = match (selected_service.installed(), selected_service.status()) {
         (Ok(true), Ok(true)) => "running".to_owned(),
         (Ok(true), Ok(false)) => {
-            let suffix = service::last_stderr_line()
+            let suffix = selected_service
+                .last_stderr_line()
                 .ok()
                 .flatten()
                 .map(|stderr| {
@@ -1156,7 +1161,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
                 };
             write_config_validated(config_path, &updated)?;
             println!("added account {name} to pool {pool}");
-            reload_daemon()?;
+            reload_daemon(config_path)?;
             if no_login {
                 println!("run `comradex account login {name}` to sign the account in");
             } else {
@@ -1245,7 +1250,8 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             let text = fs::read_to_string(config_path)
                 .with_context(|| format!("read {}", config_path.display()))?;
             let updated = comradex::accounts::connect_existing_account(&text, &name, &home)?;
-            service::while_daemon_stopped(|| write_config_validated(config_path, &updated))?;
+            service::for_config(config_path)?
+                .while_daemon_stopped(|| write_config_validated(config_path, &updated))?;
             println!("connected account {name} to the existing Codex login");
             println!(
                 "if the daemon is running outside the macOS service, restart it to apply the change"
@@ -1397,7 +1403,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             let (updated, _) = comradex::accounts::remove_account(&text, &name)?;
             write_config_validated(config_path, &updated)?;
             println!("removed account {name}");
-            reload_daemon()?;
+            reload_daemon(config_path)?;
             if let Some(profile) = browser_profile {
                 fs::remove_dir_all(&profile)?;
                 println!("deleted browser profile {}", profile.display());
@@ -1449,9 +1455,10 @@ fn write_config_validated(config_path: &Path, text: &str) -> Result<()> {
 /// Bounce the daemon after a config change when it is installed as a service;
 /// otherwise leave a reminder. Login is not needed before the restart because
 /// the daemon re-reads each account's auth.json per request.
-fn reload_daemon() -> Result<()> {
-    if service::installed().unwrap_or(false) {
-        service::restart()?;
+fn reload_daemon(config_path: &Path) -> Result<()> {
+    let service = service::for_config(config_path)?;
+    if service.installed().unwrap_or(false) {
+        service.restart()?;
         println!("service restarted");
     } else {
         println!("restart the comradex daemon to pick up the configuration change");
@@ -1586,7 +1593,7 @@ fn new_account(
     println!(
         "added account {name} to pool {pool}; resume with `comradex account login {name}` if login is interrupted"
     );
-    reload_daemon()?;
+    reload_daemon(config_path)?;
     login(config_path, &name, Some(&browser))?;
     println!("account {name} is ready in pool {pool}");
     Ok(())
@@ -1614,7 +1621,7 @@ fn login(
     if let comradex::config::AccountConfig::ClaudeHome { path } = account {
         let launcher = browser.map(|browser| browser.launcher()).transpose()?;
         let launcher_path = launcher.as_ref().map(|dir| dir.path().join("browser"));
-        return service::while_daemon_stopped(|| {
+        return service::for_config(config_path)?.while_daemon_stopped(|| {
             comradex::claude::auth::login_with_browser(path, launcher_path.as_deref())
         });
     }
@@ -1627,7 +1634,7 @@ fn login(
         browser.open(comradex::browser::CODEX_DEVICE_URL)?;
         println!("Enter the device code below in this account's browser window.");
     }
-    service::while_daemon_stopped(|| {
+    service::for_config(config_path)?.while_daemon_stopped(|| {
         login_managed_home_with(path, |path| {
             let status = Command::new("codex")
                 .args(comradex::accounts::CODEX_DEVICE_LOGIN_ARGS)

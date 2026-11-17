@@ -21,9 +21,12 @@ not establish an independent inference route. If the route is uncertain, treat
 the affected relay as required by this session. A second Mac can use the same
 relay.
 
-On macOS, service commands target the singleton `com.nicosuave.comradex`
-LaunchAgent. `service start` and `service restart` use its recorded configuration,
-regardless of the CLI's `--config` argument.
+On macOS, `--config` selects the configuration's LaunchAgent for service and
+account-maintenance commands. The default configuration uses
+`com.nicosuave.comradex`; alternate configurations use a label derived from their
+canonical path, except when retaining an existing legacy singleton installation.
+Inspect the actual installed definition before a lifecycle change. `service start`
+and `service restart` read readiness and configuration paths from that definition.
 
 ## Test separately by default
 
@@ -34,10 +37,10 @@ regardless of the CLI's `--config` argument.
   normal client settings on the serving relay.
 - Use inbound accounts when they cover the behavior. Managed-account tests need
   their own native login grant; do not clone or share rotating credentials.
-- Do not use `account add`, `account login`, or `account connect` as isolated
-  setup commands just because `--config` names a test file. They can restart or
-  unload the installed LaunchAgent. Prepare the test config separately; use the
-  test daemon's control protocol for managed login when needed.
+- Account commands can restart or unload the service belonging to their
+  configuration. Keep test configuration and credential paths separate from
+  live paths, including symlink targets. Use the test daemon's control protocol
+  for managed login when needed.
 - Test launchd behavior with a distinct dummy label and isolated paths.
 - Clean up only the exact test processes, jobs, and files created by this task.
 
