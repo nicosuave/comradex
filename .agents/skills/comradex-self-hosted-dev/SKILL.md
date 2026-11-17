@@ -21,8 +21,13 @@ not establish an independent inference route. If the route is uncertain, treat
 the affected relay as required by this session. A second Mac can use the same
 relay.
 
-On macOS, `--config` selects the configuration's LaunchAgent for service and
-account-maintenance commands. The default configuration normally uses
+The service rules below describe this checkout. Confirm the installed executable's
+source revision or pinned build receipt before assuming it has configuration-scoped
+service support. Stock v0.19.6 and earlier target the singleton regardless of
+`--config`; an installed binary can lag this checkout even when package versions match.
+
+On macOS builds with scoped service support, `--config` selects the configuration's
+LaunchAgent for service and account-maintenance commands. The default configuration normally uses
 `com.nicosuave.comradex`; other configurations use a label derived from their
 canonical path. An existing legacy singleton stays with its recorded configuration;
 another configuration, including the default, receives its own named service.

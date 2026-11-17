@@ -145,10 +145,10 @@ time as Unix seconds. Accounts awaiting usage or sign-in return an unavailable
 result. Token credentials are never returned.
 
 Claude responses also retain provider quota entries in `limits`, including
-Fable's `weekly_scoped` entry, from the latest successful background poll.
+Fable's `weekly_scoped` entry, from the latest successful usage check.
 The literal `seven_day_fable` format is also retained when reported. These
-model-specific windows are reporting data only; they do not affect shared-quota
-routing, failover, or reset warming. Missing, null, or malformed quota entries
+Fable windows guide Fable inference admission and failover without changing the
+subscription's shared quota, other models, or reset warming. Missing, null, or malformed quota entries
 are omitted without discarding valid shared usage. Unknown reset times remain
 unknown. Cached reporting data stays tied to the managed account identity.
 
@@ -569,6 +569,8 @@ Everything else is forwarded upstream as sent, minus hop-by-hop headers, with th
 Prompts, tools, thinking, cache controls, beta headers, and response bytes pass through unchanged. Routing changes only the OAuth bearer, the account and device identity in `metadata.user_id`, and an already-present request checksum. Claude Code sends an empty account ID when it has no cached account profile; routing fills it with the selected account's ID.
 
 New sessions go first to included quota that would otherwise expire unused, shared among the sessions active on each account in the last 30 minutes; see [Quotas, retries, and streaming](#quotas-retries-and-streaming). Accounts past `switch_at` take new sessions only when every other eligible account is past it too. A preferred account still takes new sessions first while below `switch_at`, and a preserved account takes them only from its surplus over an even pace, or when nothing else is eligible. Once placed, a session stays on its account so its prompt cache stays warm. An explicit shared 5-hour or 7-day quota rejection can move a request to another account before its response is forwarded.
+
+Fable inference also skips an account with confirmed exhausted Fable allowance. A Fable rejection without shared-quota evidence refreshes that account's usage before deciding whether portable history can move. Concurrent rejection checks share one refresh, and failed or throttled checks back off. When usage does not confirm exhaustion, the original error is forwarded. Token counting remains independent of the Fable counter; account-owned state, explicit session assignments and model pins retain their required account.
 
 Signed thinking, compaction summaries (including their signatures), and a session with another stream in flight stay with their account until its included 5-hour or 7-day quota is exhausted, then move to another account. Compaction summaries remain usable across accounts. Anthropic drops thinking signed by another organization rather than rejecting the request, so the moved request can lose that earlier reasoning and miss the prompt cache. The new account becomes the conversation and session owner, including when compaction replaces the beginning of the history; later compactions do not move it back when the old window resets. Files, containers, fallback-credit tokens, server-side thread continuations (`thread.type: continue`), encrypted search results, other opaque server state, and configured model pins never move; those requests wait for their account or return an error. Permission errors, ambiguous limits, login problems, and interrupted streams never move a conversation.
 

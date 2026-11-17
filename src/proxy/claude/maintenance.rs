@@ -82,7 +82,7 @@ impl App {
                 .await
                 .get(account)
                 // An explicit refresh skips the normal cadence but never provider throttling.
-                .is_some_and(|(until, delay)| *until > now && (!forced || *delay > 0))
+                .is_some_and(|state| state.retry_at > now && (!forced || state.enforced_delay > 0))
             {
                 continue;
             }
@@ -116,8 +116,11 @@ impl App {
                         .lock()
                         .await
                         .entry(account.clone())
-                        .and_modify(|(until, _)| *until = (*until).max(now + 60))
-                        .or_insert((now + 60, 0));
+                        .and_modify(|state| state.retry_at = state.retry_at.max(now + 60))
+                        .or_insert(UsageBackoff {
+                            retry_at: now + 60,
+                            enforced_delay: 0,
+                        });
                     if self.claude.auth.needs_login(path).await {
                         self.router.reauth_required(account).await;
                     }
@@ -134,8 +137,114 @@ impl App {
         home: &Path,
         now: u64,
     ) -> Result<(UsageSnapshot, auth::Credential)> {
+        let gate = self
+            .claude
+            .usage_locks
+            .get(account)
+            .context("unknown Claude usage account")?;
+        let _guard = gate.lock().await;
+        self.fetch_claude_usage_locked(account, home, now).await
+    }
+
+    pub(super) async fn refresh_fable_quota_after_rejection(
+        &self,
+        account: &str,
+        owner: &crate::auth::QuotaOwner,
+        model: &str,
+        dispatched_at: Instant,
+    ) -> bool {
+        let AccountConfig::ClaudeHome { path } = &self.config.accounts[account] else {
+            return false;
+        };
+        let Some(gate) = self.claude.usage_locks.get(account) else {
+            return false;
+        };
+        let _guard = gate.lock().await;
+        let now = auth::now();
+        if self.router.quota_exhausted(account).await {
+            return true;
+        }
+        if let Some((observed_at, exhausted)) =
+            self.claude_fable_observation(owner, model, now).await
+        {
+            if exhausted {
+                return true;
+            }
+            if observed_at >= dispatched_at {
+                return false;
+            }
+        }
+        if self
+            .claude
+            .usage_backoff
+            .lock()
+            .await
+            .get(account)
+            .is_some_and(|state| state.retry_at > now && state.enforced_delay > 0)
+        {
+            return false;
+        }
+        self.stats
+            .usage_fetch_accounts_checked
+            .fetch_add(1, Ordering::Relaxed);
+        match self.fetch_claude_usage_locked(account, path, now).await {
+            Ok(_) => {
+                self.stats
+                    .usage_fetch_successes
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .usage_fetch_last_success_unix
+                    .store(auth::now(), Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.stats
+                    .usage_fetch_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                let now = auth::now();
+                let mut backoff = self.claude.usage_backoff.lock().await;
+                let previous = backoff.get(account).copied();
+                if previous.is_none_or(|state| state.retry_at <= now || state.enforced_delay == 0) {
+                    backoff.insert(
+                        account.into(),
+                        UsageBackoff {
+                            retry_at: now.saturating_add(60),
+                            enforced_delay: 60,
+                        },
+                    );
+                }
+                drop(backoff);
+                if self.claude.auth.needs_login(path).await {
+                    self.router.reauth_required(account).await;
+                }
+                tracing::debug!(account, %error, "could not confirm quota after Fable rejection");
+            }
+        }
+        self.router.quota_exhausted(account).await
+            || self
+                .claude_fable_observation(owner, model, auth::now())
+                .await
+                .is_some_and(|(_, exhausted)| exhausted)
+    }
+
+    async fn fetch_claude_usage_locked(
+        &self,
+        account: &str,
+        home: &Path,
+        now: u64,
+    ) -> Result<(UsageSnapshot, auth::Credential)> {
+        ensure!(
+            !self
+                .claude
+                .usage_backoff
+                .lock()
+                .await
+                .get(account)
+                .is_some_and(|state| state.retry_at > now && state.enforced_delay > 0),
+            "Claude usage refresh is backed off"
+        );
         let mut credential = self.claude.auth.resolve(home, None).await?;
         for attempt in 0..2 {
+            let observed_at = Instant::now();
             let request = Request::get(format!(
                 "{}?cedar_ember=1&skip_spend=1",
                 self.claude.usage_url
@@ -188,9 +297,15 @@ impl App {
                         })
                     });
                 let mut backoff = self.claude.usage_backoff.lock().await;
-                let previous = backoff.get(account).map_or(0, |(_, delay)| *delay);
+                let previous = backoff.get(account).map_or(0, |state| state.enforced_delay);
                 let delay = usage_throttle_delay(retry, previous);
-                backoff.insert(account.into(), (now.saturating_add(delay), delay));
+                backoff.insert(
+                    account.into(),
+                    UsageBackoff {
+                        retry_at: now.saturating_add(delay),
+                        enforced_delay: delay,
+                    },
+                );
             }
             ensure!(
                 status.is_success(),
@@ -198,7 +313,7 @@ impl App {
                 status.as_u16()
             );
             let snapshot = parse_usage(&bytes, now)?;
-            self.observe_claude_reporting_usage(account, credential.owner(), &bytes)
+            self.observe_claude_reporting_usage(account, credential.owner(), &bytes, observed_at)
                 .await;
             self.observe_claude_reset_credits(account, credential.owner(), &bytes)
                 .await;
@@ -210,7 +325,10 @@ impl App {
             // Keep this account on the normal cadence regardless.
             self.claude.usage_backoff.lock().await.insert(
                 account.into(),
-                (now + crate::usage::REFRESH_INTERVAL_SECONDS, 0),
+                UsageBackoff {
+                    retry_at: now + crate::usage::REFRESH_INTERVAL_SECONDS,
+                    enforced_delay: 0,
+                },
             );
             return Ok((snapshot, credential));
         }
