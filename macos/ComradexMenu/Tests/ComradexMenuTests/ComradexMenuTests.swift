@@ -85,7 +85,7 @@ final class ComradexMenuTests: XCTestCase {
         XCTAssertNil(app.image)
         XCTAssertNil(app.subtitle)
         XCTAssertNil(app.toolTip)
-        let sq = try XCTUnwrap(items.first(where: { $0.title.hasPrefix("sq · 81% left · ") }))
+        let sq = try XCTUnwrap(items.first(where: { $0.title.hasPrefix("sq · 5h 81% left · ") }))
         XCTAssertFalse(sq.title.contains("resets in"))
         XCTAssertFalse(sq.title.contains("19%"))
         XCTAssertNotNil(sq.submenu)
@@ -112,13 +112,14 @@ final class ComradexMenuTests: XCTestCase {
     @available(macOS 14.4, *)
     func testAccountRowsStayCompactAcrossUsageAndAvailabilityStates() throws {
         let cases: [(String, String)] = [
-            (#""usage_windows":{"primary":{"used_percent":0,"reset_at_unix":0,"limit_window_seconds":0},"secondary":{"used_percent":31,"limit_window_seconds":604800}}"#, "69% left"),
-            (#""usage_windows":{"primary":{"used_percent":32,"limit_window_seconds":604800},"secondary":{"used_percent":0,"limit_window_seconds":0}}"#, "68% left"),
+            (#""usage_windows":{"primary":{"used_percent":0,"reset_at_unix":0,"limit_window_seconds":0},"secondary":{"used_percent":31,"limit_window_seconds":604800}}"#, "7d 69% left"),
+            (#""usage_windows":{"primary":{"used_percent":32,"limit_window_seconds":604800},"secondary":{"used_percent":0,"limit_window_seconds":0}}"#, "7d 68% left"),
             (#""usage_windows":{"primary":{"used_percent":32},"secondary":{"used_percent":10,"limit_window_seconds":604800}}"#, "68% left"),
             (#""usage_percent":31"#, "69% left"),
             (#""usage_windows":{}"#, "Usage pending"),
             (#""available":false,"unavailable_reason":"quota""#, "0% left"),
             (#""available":false,"unavailable_reason":"quota","usage_percent":43"#, "57% left · rate limited"),
+            (#""available":false,"unavailable_reason":"quota","usage_windows":{"primary":{"used_percent":43,"limit_window_seconds":18000},"secondary":{"used_percent":70,"limit_window_seconds":604800}}"#, "5h 57% left · rate limited"),
             (#""available":false,"unavailable_reason":"quota","usage_percent":100"#, "0% left"),
             (#""available":false,"unavailable_reason":"temporary_failure""#, "Temporarily unavailable"),
             (#""auth_state":"login_in_progress""#, "Login in progress"),
@@ -155,7 +156,7 @@ final class ComradexMenuTests: XCTestCase {
         let controller = MenuBarController(store: store)
         controller.rebuildMenu()
         XCTAssertTrue(controller.renderedMenu.items.contains {
-            $0.title == "sq · 68% left · 6d 4h"
+            $0.title == "sq · 7d 68% left · 6d 4h"
         })
     }
 
@@ -176,7 +177,7 @@ final class ComradexMenuTests: XCTestCase {
         let controller = MenuBarController(store: store)
         controller.rebuildMenu()
 
-        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("claude · 89% left · 2h") })
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("claude · 5h 89% left · 2h") })
         let usage = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "Claude Usage" })
         let choices = try XCTUnwrap(usage.submenu).items
         XCTAssertEqual(choices.map(\.title), ["5-Hour Limit", "Weekly Limit"])
@@ -186,7 +187,7 @@ final class ComradexMenuTests: XCTestCase {
         let weekly = choices[1]
         try XCTUnwrap(weekly.target as? NSObject).perform(try XCTUnwrap(weekly.action), with: weekly)
 
-        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("claude · 60% left · 5d 2h") })
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("claude · 7d 60% left · 5d 2h") })
         let updated = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "Claude Usage" }?.submenu)
         XCTAssertEqual(updated.items.map(\.state), [.off, .on])
         XCTAssertEqual(ComradexStore(client: StubClient(), defaults: defaults).claudeUsage, .weekly)
@@ -220,7 +221,7 @@ final class ComradexMenuTests: XCTestCase {
         controller.rebuildMenu()
 
         XCTAssertFalse(controller.renderedMenu.items.contains { $0.title == "Claude Usage" })
-        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("ultra · 67% left · 2d 2h") })
+        XCTAssertTrue(controller.renderedMenu.items.contains { $0.title.hasPrefix("ultra · 7d 67% left · 2d 2h") })
         let widget = UsageAccount(account: ultra, claudeUsage: store.claudeUsage)
         XCTAssertEqual(widget.windows.map(\.duration), [604_800])
         XCTAssertEqual(widget.summaryWindowIndex, 0)
@@ -229,6 +230,48 @@ final class ComradexMenuTests: XCTestCase {
         store.apply(status: UIStatusSnapshot(accounts: [ultra, max]))
         controller.rebuildMenu()
         XCTAssertTrue(controller.renderedMenu.items.contains { $0.title == "Claude Usage" })
+    }
+
+    @MainActor
+    func testEveryClaudeLimitIsItsOwnLabeledBucket() throws {
+        let now = Int64(Date().timeIntervalSince1970)
+        let claude = try decodeAccount("""
+        {"name":"claude","kind":"claude_home","signed_in":true,"auth_state":"signed_in","pools":["claude"],"usage_windows":{
+          "5h":{"used_percent":18,"reset_at_unix":\(now + 7_500),"limit_window_seconds":18000},
+          "7d":{"used_percent":40,"reset_at_unix":\(now + 5 * 86_400 + 7_500),"limit_window_seconds":604800}
+        },"usage_limits":[
+          {"id":"5h","label":"5-hour","short_label":"5h","scope":{"kind":"account"},"window_seconds":18000,
+           "used_percent":18,"resets_at_unix":\(now + 7_500),"affects_routing":true},
+          {"id":"7d","label":"Weekly","short_label":"7d","scope":{"kind":"account"},"window_seconds":604800,
+           "used_percent":40,"resets_at_unix":\(now + 5 * 86_400 + 7_500),"affects_routing":true},
+          {"id":"7d:model:fable","label":"Fable weekly","short_label":"Fable","scope":{"kind":"model","name":"Fable"},
+           "window_seconds":604800,"used_percent":100,"affects_routing":false}
+        ]}
+        """)
+        let store = ComradexStore(client: StubClient())
+        store.apply(status: UIStatusSnapshot(accounts: [claude], pools: [
+            PoolSnapshot(name: "claude", members: ["claude"], preferred: nil, active: nil)
+        ]))
+        let controller = MenuBarController(store: store)
+        controller.rebuildMenu()
+
+        // An exhausted Fable limit neither shows as the account's usage nor blocks the row.
+        let row = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("claude · 5h 82% left · 2h") })
+        let submenu = try XCTUnwrap(row.submenu).items
+        XCTAssertEqual(submenu.first?.title, "Usage Limits")
+        let limits = Array(submenu.dropFirst().prefix { !$0.isSeparatorItem })
+        XCTAssertEqual(limits.count, 3)
+        XCTAssertTrue(limits[0].title.hasPrefix("5-hour · 82% left · resets in 2h"))
+        XCTAssertTrue(limits[1].title.hasPrefix("Weekly · 60% left · resets in 5d"))
+        XCTAssertEqual(limits[2].title, "Fable weekly · 0% left")
+        XCTAssertNotNil(limits[2].toolTip)
+        XCTAssertTrue(limits.allSatisfy { !$0.isEnabled })
+        XCTAssertTrue(submenu.contains { $0.title == "Routing in Claude" })
+
+        let widget = UsageAccount(account: claude)
+        XCTAssertEqual(widget.windows.map(\.shortTitle), ["5h", "7d"])
+        XCTAssertEqual(widget.scopedWindows.map(\.title), ["Fable weekly"])
+        XCTAssertEqual(widget.remainingPercent, 82)
     }
 
     @MainActor
@@ -255,19 +298,20 @@ final class ComradexMenuTests: XCTestCase {
     @MainActor
     func testExhaustedQuotaKeepsPercentageAndResetCountdown() throws {
         let reset = Int64(Date().timeIntervalSince1970) + 5 * 86_400 + 12 * 3_600 + 120
+        // The row names the exhausted limit, even when the summary limit still has quota.
         let cases = [
-            "\"usage_windows\":{\"primary\":{\"used_percent\":100,\"reset_at_unix\":\(reset),\"limit_window_seconds\":604800}}",
-            "\"usage_windows\":{\"primary\":{\"used_percent\":30,\"limit_window_seconds\":18000},\"secondary\":{\"used_percent\":100,\"reset_at_unix\":\(reset),\"limit_window_seconds\":604800}}",
-            "\"retry_at_unix\":\(reset)",
-            "\"usage_windows\":{\"primary\":{\"used_percent\":100,\"reset_at_unix\":1}},\"retry_at_unix\":\(reset)",
+            ("\"usage_windows\":{\"primary\":{\"used_percent\":100,\"reset_at_unix\":\(reset),\"limit_window_seconds\":604800}}", "7d 0% left"),
+            ("\"usage_windows\":{\"primary\":{\"used_percent\":30,\"limit_window_seconds\":18000},\"secondary\":{\"used_percent\":100,\"reset_at_unix\":\(reset),\"limit_window_seconds\":604800}}", "7d 0% left"),
+            ("\"retry_at_unix\":\(reset)", "0% left"),
+            ("\"usage_windows\":{\"primary\":{\"used_percent\":100,\"reset_at_unix\":1}},\"retry_at_unix\":\(reset)", "0% left"),
         ]
-        for fields in cases {
+        for (fields, left) in cases {
             let account = try decodeAccount("{\"name\":\"pm\",\"available\":false,\"unavailable_reason\":\"quota\",\(fields)}")
             let store = ComradexStore(client: StubClient())
             store.apply(status: UIStatusSnapshot(accounts: [account]))
             let controller = MenuBarController(store: store)
             controller.rebuildMenu()
-            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "pm · 0% left · 5d 12h" })
+            let item = try XCTUnwrap(controller.renderedMenu.items.first { $0.title == "pm · \(left) · 5d 12h" })
             XCTAssertNil(item.toolTip)
         }
     }
@@ -779,7 +823,7 @@ final class ComradexMenuTests: XCTestCase {
         store.apply(status: snapshot)
         let controller = MenuBarController(store: store)
         controller.rebuildMenu()
-        let app = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("app · 17% left · ") })
+        let app = try XCTUnwrap(controller.renderedMenu.items.first { $0.title.hasPrefix("app · 5h 17% left · ") })
         XCTAssertFalse(app.title.contains("Preserved"))
         XCTAssertNil(app.toolTip)
         XCTAssertEqual(app.state, .off)

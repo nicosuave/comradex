@@ -1,3 +1,4 @@
+import ComradexWidgetCore
 import Foundation
 
 enum JSONValue: Codable, Equatable, Sendable {
@@ -59,8 +60,10 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
     let retryAtUnix: Int64?
     let usagePercent: Int?
     let usageUpdatedAtUnix: Int64?
+    /// Shared account-wide windows, keyed as routing sees them.
     let usageWindows: [String: UsageWindowSnapshot]
-    let reportingUsage: [String: JSONValue]?
+    /// Every limit as its own labeled bucket, including model-scoped ones such as Fable.
+    let usageLimits: [UsageLimitSnapshot]
     let resetCredits: ResetCreditsSnapshot?
 
     var id: String { name }
@@ -93,7 +96,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         case usagePercent = "usage_percent"
         case usageUpdatedAtUnix = "usage_updated_at_unix"
         case usageWindows = "usage_windows"
-        case reportingUsage = "reporting_usage"
+        case usageLimits = "usage_limits"
         case resetCredits = "reset_credits"
     }
 
@@ -111,7 +114,7 @@ struct AccountSnapshot: Codable, Equatable, Identifiable, Sendable {
         usagePercent = try container.decodeIfPresent(Int.self, forKey: .usagePercent)
         usageUpdatedAtUnix = try container.decodeIfPresent(Int64.self, forKey: .usageUpdatedAtUnix)
         usageWindows = try container.decodeIfPresent([String: UsageWindowSnapshot].self, forKey: .usageWindows) ?? [:]
-        reportingUsage = try container.decodeIfPresent([String: JSONValue].self, forKey: .reportingUsage)
+        usageLimits = try container.decodeIfPresent([UsageLimitSnapshot].self, forKey: .usageLimits) ?? []
         resetCredits = try container.decodeIfPresent(ResetCreditsSnapshot.self, forKey: .resetCredits)
     }
 }
@@ -125,6 +128,61 @@ struct UsageWindowSnapshot: Codable, Equatable, Sendable {
         case usedPercent = "used_percent"
         case resetAtUnix = "reset_at_unix"
         case limitWindowSeconds = "limit_window_seconds"
+    }
+}
+
+/// One usage limit as the daemon labels it: the 5-hour session, the weekly limit across
+/// all models, or a weekly limit scoped to one model or surface.
+struct UsageLimitSnapshot: Codable, Equatable, Sendable {
+    struct Scope: Codable, Equatable, Sendable {
+        /// `account`, `model`, or `surface`.
+        let kind: String
+        let name: String?
+    }
+
+    let id: String
+    let label: String
+    let shortLabel: String
+    let scope: Scope
+    let windowSeconds: UInt64?
+    let usedPercent: Int
+    let resetsAtUnix: Int64?
+    /// Only account-wide limits block the account; scoped limits are informational.
+    let affectsRouting: Bool
+
+    var remainingPercent: Int { min(100, max(0, 100 - usedPercent)) }
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, scope
+        case shortLabel = "short_label"
+        case windowSeconds = "window_seconds"
+        case usedPercent = "used_percent"
+        case resetsAtUnix = "resets_at_unix"
+        case affectsRouting = "affects_routing"
+    }
+
+    init(
+        id: String, label: String, shortLabel: String, scope: Scope, windowSeconds: UInt64?,
+        usedPercent: Int, resetsAtUnix: Int64?, affectsRouting: Bool
+    ) {
+        self.id = id
+        self.label = label
+        self.shortLabel = shortLabel
+        self.scope = scope
+        self.windowSeconds = windowSeconds
+        self.usedPercent = usedPercent
+        self.resetsAtUnix = resetsAtUnix
+        self.affectsRouting = affectsRouting
+    }
+
+    var widgetWindow: UsageWindow {
+        UsageWindow(
+            duration: windowSeconds.map { TimeInterval($0) },
+            usedPercent: usedPercent,
+            resetsAt: resetsAtUnix.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+            label: label,
+            shortLabel: shortLabel
+        )
     }
 }
 
@@ -146,6 +204,44 @@ extension AccountSnapshot {
     /// Claude plans without a 5-hour limit, such as Ultra, report that window as a
     /// zero-duration placeholder.
     var lacksFiveHourLimit: Bool { isClaude && usageWindows["5h"]?.limitWindowSeconds == 0 }
+
+    /// Every limit, labeled. Daemons that predate `usage_limits` report only shared
+    /// windows, so those are labeled here by their length.
+    var limits: [UsageLimitSnapshot] {
+        if !usageLimits.isEmpty { return usageLimits }
+        return usageWindows
+            .filter { $0.value.usedPercent != nil && $0.value.limitWindowSeconds != 0 }
+            .sorted { left, right in
+                let leftDuration = left.value.limitWindowSeconds ?? .max
+                let rightDuration = right.value.limitWindowSeconds ?? .max
+                return leftDuration != rightDuration ? leftDuration < rightDuration : left.key < right.key
+            }
+            .map { key, window in
+                let duration = window.limitWindowSeconds.map { TimeInterval($0) }
+                return UsageLimitSnapshot(
+                    id: key,
+                    label: UsageWindow.durationTitle(duration),
+                    shortLabel: UsageWindow.durationShortTitle(duration),
+                    scope: .init(kind: "account", name: nil),
+                    windowSeconds: window.limitWindowSeconds,
+                    usedPercent: window.usedPercent!,
+                    resetsAtUnix: window.resetAtUnix,
+                    affectsRouting: true
+                )
+            }
+    }
+
+    /// Account-wide limits, shortest first. These decide availability and the summary.
+    var sharedLimits: [UsageLimitSnapshot] { limits.filter(\.affectsRouting) }
+
+    /// Limits scoped to a model or surface, such as Fable's weekly limit.
+    var scopedLimits: [UsageLimitSnapshot] { limits.filter { !$0.affectsRouting } }
+
+    /// The limit that summarizes this account in the menu row and widget ring.
+    func summaryLimit(claudeUsage: ClaudeUsageWindow) -> UsageLimitSnapshot? {
+        guard let key = summaryWindowKey(claudeUsage: claudeUsage) else { return nil }
+        return sharedLimits.first { $0.id == key }
+    }
 
     /// The usage window that summarizes this account: Claude's chosen limit, or
     /// the provider's primary window. Zero-duration placeholder windows are skipped.
