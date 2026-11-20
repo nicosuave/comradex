@@ -177,6 +177,9 @@ pub struct UiAccountStatus {
     /// Provider reporting metadata, kept separate from account-wide routing limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reporting_usage: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Every limit, labeled and scoped, for display. Routing uses `usage_windows` only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_limits: Vec<crate::usage_limits::UsageLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_credits: Option<crate::reset_credits::ResetCreditsSnapshot>,
 }
@@ -991,6 +994,14 @@ async fn process(
                     }
                 }
             }
+            if let Some(status) = &mut response.status {
+                for account in &mut status.accounts {
+                    account.usage_limits = crate::usage_limits::build(
+                        &account.usage_windows,
+                        account.reporting_usage.as_ref(),
+                    );
+                }
+            }
             response
         }
         Err(error) => Response::error(format!("{error:#}")),
@@ -1288,6 +1299,7 @@ async fn build_ui_status(
                     .map(|state| state.usage_windows.clone())
                     .unwrap_or_default(),
                 reporting_usage: None,
+                usage_limits: Vec::new(),
             }
         })
         .collect();

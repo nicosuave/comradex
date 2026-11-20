@@ -152,6 +152,13 @@ routing, failover, or reset warming. Missing, null, or malformed quota entries
 are omitted without discarding valid shared usage. Unknown reset times remain
 unknown. Cached reporting data stays tied to the managed account identity.
 
+For display, `ui_status` also reports each account's `usage_limits`: one typed,
+labeled entry per limit (`id`, `label`, `short_label`, `scope`, `window_seconds`,
+`used_percent`, `resets_at_unix`, `affects_routing`). Shared windows have
+`account` scope and `affects_routing: true`; model- or surface-scoped limits such as
+Fable's weekly limit have `affects_routing: false`. Clients read this list instead
+of parsing provider reporting formats.
+
 Codex reset-credit reads fetch the selected account's current provider data.
 To redeem a reset, a client POSTs to the consume URL with `credit_id` and a UUID
 `redeem_request_id` in `data`. Keep the same request ID when retrying an

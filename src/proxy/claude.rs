@@ -2194,6 +2194,27 @@ kind="claude_inbound"
                         .unwrap()
                 );
                 assert_eq!(account["usage_windows"].as_object().unwrap().len(), 2);
+                // Display clients get each limit as its own labeled bucket; Fable never
+                // counts toward routing.
+                let limits: Vec<_> = account["usage_limits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|limit| {
+                        (
+                            limit["id"].as_str().unwrap().to_owned(),
+                            limit["affects_routing"].as_bool().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    limits,
+                    [
+                        ("5h".to_owned(), true),
+                        ("7d".to_owned(), true),
+                        ("7d:model:fable".to_owned(), false),
+                    ]
+                );
             }
             assert_eq!(accounts.len(), 2);
         }

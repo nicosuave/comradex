@@ -1,4 +1,5 @@
 import AppKit
+import ComradexWidgetCore
 import SwiftUI
 
 private final class AccountRoleAction: NSObject {
@@ -224,7 +225,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         )
         let submenu = NSMenu()
         submenu.autoenablesItems = false
+        addUsageLimits(account, to: submenu)
         if let pool {
+            if !submenu.items.isEmpty { submenu.addItem(.separator()) }
             submenu.addItem(.sectionHeader(title: "Routing in \(poolLabels[pool.name] ?? pool.name)"))
             let current: AccountRole = isPreferred ? .preferred : isPreserved ? .preserved : .normal
             for role in AccountRole.allCases {
@@ -525,20 +528,23 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         if !account.available {
             switch account.unavailableReason?.lowercased() {
             case "quota":
-                let exhaustedWindows = account.usageWindows.values
-                    .filter { ($0.usedPercent ?? 0) >= 100 && $0.limitWindowSeconds != 0 }
+                let exhausted = account.sharedLimits.filter { $0.remainingPercent == 0 }
                 // A short upstream rate limit blocks the account without spending its quota.
-                if exhaustedWindows.isEmpty, let used = account.usagePercent, used < 100 {
-                    return ["\(100 - used)% left", "rate limited", retryDescription(account.retryAtUnix)]
-                        .compactMap { $0 }
-                        .joined(separator: " · ")
+                if exhausted.isEmpty {
+                    let left = account.summaryLimit(claudeUsage: store.claudeUsage).map(Self.limitSummary)
+                        ?? account.usagePercent.flatMap { $0 < 100 ? "\(100 - $0)% left" : nil }
+                    if let left {
+                        return [left, "rate limited", retryDescription(account.retryAtUnix)]
+                            .compactMap { $0 }
+                            .joined(separator: " · ")
+                    }
                 }
-                // Show the exhausted window, even when a different primary window has quota.
-                let reset = exhaustedWindows
-                    .compactMap(\.resetAtUnix)
-                    .filter { $0 > Int64(Date().timeIntervalSince1970) }
-                    .max() ?? account.retryAtUnix
-                return retryDescription(reset).map { "0% left · \($0)" } ?? "0% left"
+                // Name the exhausted limit that returns last, even when the summary limit has quota.
+                let now = Int64(Date().timeIntervalSince1970)
+                let blocking = exhausted.max { ($0.resetsAtUnix ?? 0) < ($1.resetsAtUnix ?? 0) }
+                let reset = blocking?.resetsAtUnix.flatMap { $0 > now ? $0 : nil } ?? account.retryAtUnix
+                let left = blocking.map(Self.limitSummary) ?? "0% left"
+                return retryDescription(reset).map { "\(left) · \($0)" } ?? left
             case "temporary_failure": return "Temporarily unavailable"
             case "login_in_progress": return "Login in progress"
             case "needs_login": return "Sign-in required"
@@ -568,14 +574,40 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     private func usageDescription(_ account: AccountSnapshot) -> String? {
-        guard let window = account.summaryWindowKey(claudeUsage: store.claudeUsage).flatMap({ account.usageWindows[$0] }) else {
+        guard let limit = account.summaryLimit(claudeUsage: store.claudeUsage) else {
             return account.usagePercent.map { "\(max(0, 100 - $0))% left" }
         }
-        var detail = "\(max(0, 100 - window.usedPercent!))% left"
-        if let reset = retryDescription(window.resetAtUnix) {
+        var detail = Self.limitSummary(limit)
+        if let reset = retryDescription(limit.resetsAtUnix) {
             detail += " · \(reset)"
         }
         return detail
+    }
+
+    /// A limit's remaining share, named so it is never mistaken for another limit: "5h 82% left".
+    static func limitSummary(_ limit: UsageLimitSnapshot) -> String {
+        limit.shortLabel.isEmpty ? "\(limit.remainingPercent)% left" : "\(limit.shortLabel) \(limit.remainingPercent)% left"
+    }
+
+    /// Lists every limit, account-wide first, so the 5-hour, weekly, and model-scoped limits
+    /// each read as their own bucket.
+    private func addUsageLimits(_ account: AccountSnapshot, to submenu: NSMenu) {
+        let limits = account.limits
+        guard !limits.isEmpty, account.isSignedIn, !account.isInbound, !account.needsLoginAction else { return }
+        submenu.addItem(.sectionHeader(title: "Usage Limits"))
+        for limit in limits {
+            let parts = [
+                limit.label,
+                "\(limit.remainingPercent)% left",
+                retryDescription(limit.resetsAtUnix).map { "resets in \($0)" },
+            ]
+            let item = NSMenuItem(title: parts.compactMap { $0 }.joined(separator: " · "), action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            if !limit.affectsRouting {
+                item.toolTip = "Applies only to \(limit.scope.name ?? limit.label). Other usage on this account is unaffected."
+            }
+            submenu.addItem(item)
+        }
     }
 
     private func retryDescription(_ retryAtUnix: Int64?) -> String? {

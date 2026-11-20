@@ -180,8 +180,10 @@ struct AccountRing: View {
     let diameter: CGFloat
 
     var body: some View {
-        let fable = account.visibleFableWindow
-        let lineWidth = fable == nil ? max(3.5, diameter * 0.1) : max(3, diameter * 0.055)
+        // The outer ring is the account-wide summary limit; a model-scoped limit such as
+        // Fable gets its own inner ring. Each percentage in the center names its limit.
+        let scoped = account.visibleScopedWindow
+        let lineWidth = scoped == nil ? max(3.5, diameter * 0.1) : max(3, diameter * 0.055)
         let ringInset = lineWidth + max(2.5, diameter * 0.035)
         ZStack {
             UsageRing(
@@ -189,19 +191,25 @@ struct AccountRing: View {
                 tint: UsageLevel(account: account).tint,
                 lineWidth: lineWidth
             ) {
-                if fable == nil {
-                    AccountRingCenter(account: account, size: diameter * 0.27)
+                if scoped == nil {
+                    VStack(spacing: 0) {
+                        AccountRingCenter(account: account, size: diameter * 0.27)
+                        RingLimitLabel(account.visibleSummaryLabel, size: diameter * 0.12)
+                    }
                 }
             }
-            if let fable {
+            if let scoped {
                 UsageRing(
-                    fraction: Double(fable.remainingPercent) / 100,
-                    tint: UsageLevel(remaining: fable.remainingPercent).tint,
+                    fraction: Double(scoped.remainingPercent) / 100,
+                    tint: UsageLevel(remaining: scoped.remainingPercent).tint,
                     lineWidth: lineWidth
                 ) {
-                    VStack(spacing: 1) {
-                        AccountRingCenter(account: account, size: diameter * 0.23)
-                        PercentText(percent: fable.remainingPercent, size: diameter * 0.17)
+                    VStack(spacing: 0) {
+                        AccountRingCenter(account: account, size: diameter * 0.2)
+                        RingLimitLabel(account.visibleSummaryLabel, size: diameter * 0.1)
+                        PercentText(percent: scoped.remainingPercent, size: diameter * 0.15)
+                            .padding(.top, 1)
+                        RingLimitLabel(scoped.shortTitle, size: diameter * 0.1)
                     }
                 }
                 .padding(ringInset)
@@ -211,11 +219,43 @@ struct AccountRing: View {
     }
 }
 
+/// Names the limit a ring percentage belongs to, such as "5h" or "Fable".
+struct RingLimitLabel: View {
+    let text: String?
+    let size: CGFloat
+
+    init(_ text: String?, size: CGFloat) {
+        self.text = text
+        self.size = size
+    }
+
+    var body: some View {
+        if let text, !text.isEmpty {
+            Text(text)
+                .font(.system(size: max(7, size), weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+    }
+}
+
 extension UsageAccount {
     /// Authentication failures show the existing status symbol instead of stale model usage.
-    var visibleFableWindow: UsageWindow? {
-        guard provider == .claude, status == .available || status == .limited else { return nil }
-        return fableWindow
+    var visibleScopedWindow: UsageWindow? {
+        guard status == .available || status == .limited else { return nil }
+        return tightestScopedWindow
+    }
+
+    /// The summary limit's short name, shown only while the ring shows a percentage.
+    var visibleSummaryLabel: String? {
+        guard status == .available || status == .limited, remainingPercent != nil else { return nil }
+        return summaryWindow?.shortTitle
+    }
+
+    /// Every limit to list, account-wide limits first.
+    var visibleWindows: [UsageWindow] {
+        windows + (status == .available || status == .limited ? scopedWindows : [])
     }
 }
 
@@ -244,9 +284,13 @@ func updatedCaption(_ snapshot: UsageSnapshot, at date: Date) -> String? {
 }
 
 func accessibilityDescription(_ account: UsageAccount) -> String {
-    let usage = account.remainingPercent.map { "\($0) percent left" }
-    let fable = account.visibleFableWindow.map { "Fable \($0.remainingPercent) percent left" }
-    return [account.name, account.provider.title, usage, fable, accountCaption(account)]
+    let summary = account.summaryWindow.map { "\($0.title) " } ?? ""
+    let usage = account.remainingPercent.map { "\(summary)\($0) percent left" }
+    let scoped: [String?] = account.visibleScopedWindow == nil ? [] : account.scopedWindows.map {
+        "\($0.title) \($0.remainingPercent) percent left"
+    }
+    let parts: [String?] = [account.name, account.provider.title, usage] + scoped + [accountCaption(account)]
+    return parts
         .compactMap { $0 }
         .filter { !$0.isEmpty }
         .joined(separator: ", ")
@@ -296,11 +340,12 @@ struct WindowList: View {
                 .foregroundStyle(account.status == .needsSignIn ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
         } else {
             VStack(alignment: .leading, spacing: compact ? 4 : 8) {
-                ForEach(Array(account.windows.enumerated()), id: \.offset) { _, window in
+                ForEach(Array(account.visibleWindows.enumerated()), id: \.offset) { _, window in
                     HStack(spacing: 7) {
                         Text(compact ? window.shortTitle : window.title)
                             .foregroundStyle(.secondary)
-                            .frame(width: compact ? 20 : 44, alignment: .leading)
+                            .minimumScaleFactor(0.75)
+                            .frame(width: compact ? 30 : 64, alignment: .leading)
                         UsageBar(
                             fraction: Double(window.remainingPercent) / 100,
                             tint: UsageLevel(remaining: window.remainingPercent).tint,
@@ -366,10 +411,10 @@ func providerSections(_ accounts: [UsageAccount]) -> [ProviderSection] {
     return sections
 }
 
-/// Detail lines an account occupies: its name plus one per window, allowing for taller dual rings.
+/// Detail lines an account occupies: its name plus one per limit, allowing for taller dual rings.
 func detailLines(_ account: UsageAccount, showsRing: Bool = false) -> Int {
-    let lines = 1 + max(1, account.windows.count)
-    return showsRing && account.visibleFableWindow != nil ? max(3, lines) : lines
+    let lines = 1 + max(1, account.visibleWindows.count)
+    return showsRing && account.visibleScopedWindow != nil ? max(3, lines) : lines
 }
 
 /// The leading accounts whose details, including provider headings, fit in `lines`.
@@ -516,7 +561,7 @@ struct AccountRow: View {
     var body: some View {
         HStack(alignment: .center, spacing: roomy ? 14 : 12) {
             if showsRing {
-                AccountRing(account: account, diameter: account.visibleFableWindow == nil ? (roomy ? 48 : 36) : 56)
+                AccountRing(account: account, diameter: account.visibleScopedWindow == nil ? (roomy ? 48 : 36) : 56)
             }
             VStack(alignment: .leading, spacing: roomy ? 6 : 4) {
                 Text(account.name)

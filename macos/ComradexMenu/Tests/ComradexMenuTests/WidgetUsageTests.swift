@@ -23,62 +23,58 @@ private let fixture = #"""
 """#
 
 final class WidgetUsageTests: XCTestCase {
-    private func fableAccount(_ reporting: String, kind: String = "claude_home") throws -> UsageAccount {
+    private let fableLimit = #"""
+    {"id":"7d:model:fable","label":"Fable weekly","short_label":"Fable","scope":{"kind":"model","name":"Fable"},
+     "window_seconds":604800,"used_percent":%d,"resets_at_unix":1792454399,"affects_routing":false}
+    """#
+
+    private func fableAccount(_ used: Int?) throws -> UsageAccount {
+        let scoped = used.map { "," + String(format: fableLimit, $0) } ?? ""
         let json = """
-        {"accounts":[{"name":"claude","kind":"\(kind)","signed_in":true,
+        {"accounts":[{"name":"claude","kind":"claude_home","signed_in":true,
           "usage_windows":{"7d":{"used_percent":10,"limit_window_seconds":604800}},
-          "reporting_usage":\(reporting)}],"pools":[]}
+          "usage_limits":[{"id":"7d","label":"Weekly","short_label":"7d","scope":{"kind":"account"},
+            "window_seconds":604800,"used_percent":10,"affects_routing":true}\(scoped)]}],"pools":[]}
         """
         return try XCTUnwrap(UsageSnapshot(status: status(json), publishedAt: Date()).accounts.first)
     }
 
-    func testFableReportingFormatsStaySeparateFromSharedQuota() throws {
-        for reporting in [
-            #"{"seven_day_fable":{"utilization":25.5,"resets_at":"2026-11-15T12:00:00.123Z"}}"#,
-            #"{"limits":[{"kind":"weekly_scoped","group":"weekly","percent":25.5,"resets_at":"2026-11-15T12:00:00.123Z","is_active":false,"scope":{"model":{"display_name":"Fable"},"surface":null}}]}"#,
-        ] {
-            let account = try fableAccount(reporting)
-            XCTAssertEqual(account.fableWindow?.remainingPercent, 75)
-            XCTAssertEqual(account.fableWindow?.duration, 604_800)
-            XCTAssertNotNil(account.fableWindow?.resetsAt)
-            XCTAssertEqual(account.windows.count, 1)
-            XCTAssertEqual(account.remainingPercent, 90)
-            XCTAssertEqual(account.visibleFableWindow, account.fableWindow)
-            XCTAssertTrue(accessibilityDescription(account).contains("Fable 75 percent left"))
-            XCTAssertNil(try fableAccount(reporting, kind: "codex_home").fableWindow)
-        }
-        let exhausted = try fableAccount(#"{"seven_day_fable":{"utilization":100}}"#)
-        XCTAssertEqual(exhausted.fableWindow?.remainingPercent, 0)
+    func testScopedLimitsStaySeparateFromSharedQuota() throws {
+        let account = try fableAccount(25)
+        XCTAssertEqual(account.scopedWindows.map(\.remainingPercent), [75])
+        XCTAssertEqual(account.scopedWindows.first?.title, "Fable weekly")
+        XCTAssertEqual(account.scopedWindows.first?.shortTitle, "Fable")
+        XCTAssertNotNil(account.scopedWindows.first?.resetsAt)
+        XCTAssertEqual(account.windows.map(\.title), ["Weekly"])
+        XCTAssertEqual(account.remainingPercent, 90)
+        XCTAssertEqual(account.visibleScopedWindow, account.scopedWindows.first)
+        XCTAssertEqual(account.visibleWindows.map(\.shortTitle), ["7d", "Fable"])
+        XCTAssertEqual(accessibilityDescription(account), "claude, Claude, Weekly 90 percent left, Fable weekly 75 percent left")
+
+        let exhausted = try fableAccount(100)
+        XCTAssertEqual(exhausted.scopedWindows.first?.remainingPercent, 0)
         XCTAssertEqual(exhausted.status, .available)
         XCTAssertEqual(exhausted.remainingPercent, 90)
-        XCTAssertEqual(try fableAccount(#"{"seven_day_fable":{"utilization":0}}"#).fableWindow?.remainingPercent, 100)
     }
 
-    func testMissingOrInvalidFableReportingRetainsSingleGauge() throws {
-        for reporting in [
-            "null", "{}", #"{"seven_day_fable":null}"#,
-            #"{"seven_day_fable":{"utilization":-1}}"#,
-            #"{"seven_day_fable":{"utilization":101}}"#,
-            #"{"seven_day_fable":{"utilization":25,"resets_at":"invalid"}}"#,
-            #"{"limits":[{"kind":"weekly_scoped","group":"weekly","percent":25,"scope":{"model":{"display_name":"Opus"}}}]}"#,
-            #"{"limits":[{"kind":"weekly_scoped","group":"weekly","percent":25,"scope":{"model":{"display_name":"Fable"},"surface":{"display_name":"Code"}}}]}"#,
-        ] {
-            let account = try fableAccount(reporting)
-            XCTAssertNil(account.fableWindow, reporting)
-            XCTAssertEqual(account.remainingPercent, 90)
-        }
-        var account = try fableAccount(#"{"seven_day_fable":{"utilization":25}}"#)
+    func testAccountsWithoutScopedLimitsKeepASingleGauge() throws {
+        let account = try fableAccount(nil)
+        XCTAssertTrue(account.scopedWindows.isEmpty)
+        XCTAssertNil(account.visibleScopedWindow)
+        XCTAssertEqual(account.remainingPercent, 90)
+
+        var hidden = try fableAccount(25)
         for state in [UsageAccount.Status.needsSignIn, .signingIn, .unavailable] {
-            account.status = state
-            XCTAssertNil(account.visibleFableWindow)
-            XCTAssertFalse(accessibilityDescription(account).contains("Fable"))
+            hidden.status = state
+            XCTAssertNil(hidden.visibleScopedWindow)
+            XCTAssertFalse(accessibilityDescription(hidden).contains("Fable"))
         }
-        account.status = .limited
-        XCTAssertNotNil(account.visibleFableWindow)
+        hidden.status = .limited
+        XCTAssertNotNil(hidden.visibleScopedWindow)
     }
 
     @MainActor
-    func testFableChangesPublishAndRespectWidgetReloadBudget() throws {
+    func testScopedLimitChangesPublishAndRespectWidgetReloadBudget() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = UsageSnapshotStore(directory: directory)
@@ -86,26 +82,43 @@ final class WidgetUsageTests: XCTestCase {
         var reloads = 0
         let publisher = WidgetUsagePublisher(store: store, reloadTimelines: { reloads += 1 }, now: { now })
         func snapshot(_ percent: Int?) throws -> UIStatusSnapshot {
-            let reporting = percent.map { #", "reporting_usage":{"seven_day_fable":{"utilization":\#($0)}}"# } ?? ""
-            return try status(fixture.replacingOccurrences(of: #""usage_percent":11"#, with: #""usage_percent":11"# + reporting))
+            let shared = #"""
+            {"id":"5h","label":"5-hour","short_label":"5h","scope":{"kind":"account"},"window_seconds":18000,
+             "used_percent":11,"resets_at_unix":1791921599,"affects_routing":true},
+            {"id":"7d","label":"Weekly","short_label":"7d","scope":{"kind":"account"},"window_seconds":604800,
+             "used_percent":7,"resets_at_unix":1792454399,"affects_routing":true}
+            """#
+            let limits = percent.map { #", "usage_limits":["# + shared + "," + String(format: fableLimit, $0) + "]" } ?? ""
+            return try status(fixture.replacingOccurrences(of: #""usage_percent":11"#, with: #""usage_percent":11"# + limits))
         }
         publisher.publish(try snapshot(25), claudeUsage: .fiveHour)
         now += 1
         publisher.publish(try snapshot(100), claudeUsage: .fiveHour)
-        XCTAssertEqual(store.load()?.accounts.last?.fableWindow?.remainingPercent, 0)
+        XCTAssertEqual(store.load()?.accounts.last?.scopedWindows.first?.remainingPercent, 0)
         XCTAssertEqual(reloads, 1)
         now += WidgetUsagePublisher.usageReloadInterval
         publisher.publish(try snapshot(100), claudeUsage: .fiveHour)
         XCTAssertEqual(reloads, 2)
         now += WidgetUsagePublisher.structuralReloadInterval
         publisher.publish(try snapshot(nil), claudeUsage: .fiveHour)
-        XCTAssertNil(store.load()?.accounts.last?.fableWindow)
+        XCTAssertEqual(store.load()?.accounts.last?.scopedWindows, [])
         XCTAssertEqual(reloads, 3)
     }
 
-    func testLegacyWidgetSnapshotDecodesWithoutFable() throws {
-        let data = Data(#"{"publishedAt":0,"accounts":[{"name":"claude","provider":"claude","status":"available","windows":[]}]}"#.utf8)
-        XCTAssertNil(try JSONDecoder().decode(UsageSnapshot.self, from: data).accounts.first?.fableWindow)
+    func testWidgetSnapshotsDecodeAcrossVersions() throws {
+        let bare = Data(#"{"publishedAt":0,"accounts":[{"name":"claude","provider":"claude","status":"available","windows":[]}]}"#.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(UsageSnapshot.self, from: bare).accounts.first?.scopedWindows, [])
+
+        // Snapshots from older menu apps carry Fable as `fableWindow`.
+        let legacy = Data(#"{"publishedAt":0,"accounts":[{"name":"claude","provider":"claude","status":"available","windows":[],"fableWindow":{"duration":604800,"usedPercent":30}}]}"#.utf8)
+        let fable = try XCTUnwrap(try JSONDecoder().decode(UsageSnapshot.self, from: legacy).accounts.first?.scopedWindows.first)
+        XCTAssertEqual(fable.title, "Fable weekly")
+        XCTAssertEqual(fable.remainingPercent, 70)
+
+        // New snapshots still write `fableWindow` for older iPhone apps.
+        let written = try JSONSerialization.jsonObject(with: JSONEncoder().encode(UsageSnapshot.sample(at: Date())))
+        let accounts = try XCTUnwrap((written as? [String: Any])?["accounts"] as? [[String: Any]])
+        XCTAssertNotNil(accounts.last?["fableWindow"])
     }
 
     func testSnapshotListsUsageAccountsCodexFirstWithoutInboundLogins() throws {
@@ -174,7 +187,7 @@ final class WidgetUsageTests: XCTestCase {
         limited.status = .limited
         limited.retryAt = now.addingTimeInterval(3_600)
         XCTAssertEqual(accountCaption(limited, compact: true), "Limit reached")
-        XCTAssertEqual(accessibilityDescription(limited), "a, Codex, 75 percent left, Limit reached")
+        XCTAssertEqual(accessibilityDescription(limited), "a, Codex, Weekly 75 percent left, Limit reached")
         XCTAssertEqual(limited.remainingPercent, 75)
         let pending = UsageAccount(name: "a", provider: .codex, status: .available, windows: [])
         XCTAssertEqual(accountCaption(pending), "Usage pending")
@@ -185,7 +198,7 @@ final class WidgetUsageTests: XCTestCase {
         let now = Date(timeIntervalSince1970: 0)
         var account = UsageAccount(name: "claude", provider: .claude, status: .available, windows: [
             UsageWindow(duration: 604_800, usedPercent: 25, resetsAt: now.addingTimeInterval(3_600)),
-        ], fableWindow: UsageWindow(duration: 604_800, usedPercent: 50, resetsAt: now.addingTimeInterval(7_200)))
+        ], scopedWindows: [UsageWindow(duration: 604_800, usedPercent: 50, resetsAt: now.addingTimeInterval(7_200))])
         XCTAssertEqual(accountResetCountdown(account, at: now), "1h 0m")
         XCTAssertNil(accountResetCountdown(account, at: now.addingTimeInterval(3_600)))
         account.status = .limited
@@ -217,10 +230,11 @@ final class WidgetUsageTests: XCTestCase {
 
         var fableAccounts = (0..<8).map { account("claude-\($0)", .claude, windows: 1) }
         for index in fableAccounts.indices {
-            fableAccounts[index].fableWindow = UsageWindow(duration: 604_800, usedPercent: 25, resetsAt: nil)
+            fableAccounts[index].scopedWindows = [UsageWindow(duration: 604_800, usedPercent: 25, resetsAt: nil)]
         }
+        // Each account lists its name, its shared limit, and its Fable limit.
         XCTAssertEqual(accountsFitting(fableAccounts, lines: 15, showsRings: true).count, 4)
-        XCTAssertEqual(accountsFitting(fableAccounts, lines: 18).count, 8)
+        XCTAssertEqual(accountsFitting(fableAccounts, lines: 18).count, 5)
     }
 
     func testStoreRoundTripsThroughItsDirectoryAndNoGroupMeansNoFile() throws {
