@@ -36,99 +36,7 @@ fn configured_listener_addresses(config: &crate::config::Config) -> Vec<SocketAd
 }
 
 pub fn install(config_path: &Path, state_dir: &Path) -> Result<PathBuf> {
-    platform_check()?;
-    let config_path = fs::canonicalize(config_path)
-        .with_context(|| format!("resolve {}", config_path.display()))?;
-    let config = crate::config::Config::load(&config_path)?;
-    let listener_addresses: Vec<_> = configured_listener_addresses(&config);
-    if listener_addresses.iter().any(|address| address.port() == 0) {
-        bail!("service installation requires fixed non-zero listener ports")
-    }
-    let executable = stable_executable_path(
-        fs::canonicalize(std::env::current_exe()?)
-            .context("resolve current Comradex executable")?,
-    );
-    let plist_path = plist_path()?;
-    let parent = plist_path
-        .parent()
-        .context("LaunchAgents path has no parent")?;
-    fs::create_dir_all(parent)?;
-    fs::create_dir_all(state_dir)?;
-    let state_dir =
-        fs::canonicalize(state_dir).with_context(|| format!("resolve {}", state_dir.display()))?;
-    let stdout = state_dir.join("service.stdout.log");
-    let stderr = state_dir.join("service.stderr.log");
-    let working_directory = config_path.parent().unwrap_or(Path::new("/"));
-    let previous = match fs::read(&plist_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
-    };
-    // Retain the readiness identity when comparing an existing installation.
-    // Reinstalling the same service must not kill a launch still in progress.
-    let service_nonce = previous
-        .as_deref()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .and_then(|plist| plist_string_after(plist, "<key>COMRADEX_SERVICE_NONCE</key><string>"))
-        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
-    let plist = render_plist(
-        &executable,
-        &config_path,
-        working_directory,
-        &stdout,
-        &stderr,
-        &service_nonce,
-    );
-    if previous.as_deref() == Some(plist.as_bytes()) {
-        start()?;
-        return Ok(plist_path);
-    }
-    // A changed definition gets a new identity: an old listener must not
-    // satisfy readiness for its replacement.
-    let service_nonce = format!("{:032x}", rand::random::<u128>());
-    let plist = render_plist(
-        &executable,
-        &config_path,
-        working_directory,
-        &stdout,
-        &stderr,
-        &service_nonce,
-    );
-    let mut candidate = tempfile::NamedTempFile::new_in(parent)?;
-    candidate.write_all(plist.as_bytes())?;
-    candidate.as_file().sync_all()?;
-    validate_plist(candidate.path())?;
-
-    let domain = launchctl_domain();
-    let was_loaded = is_loaded(&domain)?;
-    if was_loaded && previous.is_none() {
-        bail!(
-            "LaunchAgent is loaded but {} is missing; refusing a replacement that cannot be rolled back",
-            plist_path.display()
-        )
-    }
-    replace_plist_transaction(
-        &plist_path,
-        candidate,
-        previous.as_deref(),
-        was_loaded,
-        || stop_if_loaded(&domain),
-        |path| {
-            bootstrap(&domain, path)?;
-            wait_until_ready(
-                &domain,
-                &listener_addresses,
-                Some(&service_nonce),
-                None,
-                READY_TIMEOUT,
-            )
-        },
-        |path| {
-            bootstrap(&domain, path)?;
-            wait_until_ready(&domain, &[], None, None, READY_TIMEOUT)
-        },
-    )?;
-    Ok(plist_path)
+    Service::default().install(config_path, state_dir)
 }
 
 fn render_plist(
@@ -138,6 +46,7 @@ fn render_plist(
     stdout: &Path,
     stderr: &Path,
     service_nonce: &str,
+    label: &str,
 ) -> String {
     // Codex responsiveness depends on this relay. Background throttles CPU and
     // I/O under load; Adaptive promotion requires XPC activity we do not use.
@@ -166,7 +75,7 @@ fn render_plist(
 </dict>
 </plist>
 "#,
-        label = LABEL,
+        label = label,
         executable = xml(executable),
         config = xml(config_path),
         working_directory = xml(working_directory),
@@ -253,28 +162,15 @@ where
 }
 
 pub fn uninstall() -> Result<Option<PathBuf>> {
-    platform_check()?;
-    let plist_path = plist_path()?;
-    let domain = launchctl_domain();
-    if is_loaded(&domain)? {
-        bootout(&domain)?;
-    }
-    if plist_path.exists() {
-        fs::remove_file(&plist_path)?;
-        Ok(Some(plist_path))
-    } else {
-        Ok(None)
-    }
+    Service::default().uninstall()
 }
 
 pub fn status() -> Result<bool> {
-    platform_check()?;
-    is_running(&launchctl_domain())
+    Service::default().status()
 }
 
 pub fn installed() -> Result<bool> {
-    platform_check()?;
-    Ok(plist_path()?.exists())
+    Service::default().installed()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,17 +184,7 @@ pub struct LastStderrLine {
 /// safe even when a log has grown large. It is diagnostic history, not proof
 /// that the latest launch attempt failed.
 pub fn last_stderr_line() -> Result<Option<LastStderrLine>> {
-    platform_check()?;
-    let plist_path = plist_path()?;
-    let plist = match fs::read_to_string(&plist_path) {
-        Ok(plist) => plist,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
-    };
-    let Some(path) = plist_string_after(&plist, "<key>StandardErrorPath</key><string>") else {
-        return Ok(None);
-    };
-    read_last_nonempty_line(Path::new(&path))
+    Service::default().last_stderr_line()
 }
 
 fn read_last_nonempty_line(path: &Path) -> Result<Option<LastStderrLine>> {
@@ -336,54 +222,7 @@ fn read_last_nonempty_line(path: &Path) -> Result<Option<LastStderrLine>> {
 /// previous loaded state is restored even when the maintenance operation
 /// fails, preventing the daemon from racing an external credential writer.
 pub fn while_daemon_stopped<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        action()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let plist_path = plist_path()?;
-        if !plist_path.exists() {
-            return action();
-        }
-        let domain = launchctl_domain();
-        if !is_loaded(&domain)? {
-            return action();
-        }
-
-        // Resolve everything needed to restore readiness before stopping service.
-        let plist = fs::read_to_string(&plist_path)
-            .with_context(|| format!("read {}", plist_path.display()))?;
-        let config_path = plist_program_config(&plist).with_context(|| {
-            format!("no --config argument recorded in {}", plist_path.display())
-        })?;
-        let config = crate::config::Config::load(&config_path)?;
-        let listener_addresses: Vec<_> = configured_listener_addresses(&config);
-        let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
-        if config.proxy.desktop.is_some() && service_nonce.is_none() {
-            bail!(
-                "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
-            )
-        }
-
-        maintenance_transaction(
-            true,
-            || bootout(&domain),
-            || {
-                bootstrap(&domain, &plist_path)?;
-                let (readiness_listeners, readiness_nonce) =
-                    readiness_probe(&listener_addresses, service_nonce.as_deref());
-                wait_until_ready(
-                    &domain,
-                    readiness_listeners,
-                    readiness_nonce,
-                    None,
-                    READY_TIMEOUT,
-                )
-            },
-            action,
-        )
-    }
+    Service::default().while_daemon_stopped(action)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -416,20 +255,7 @@ fn maintenance_transaction<T>(
 /// than the CLI, and the configuration is validated before the daemon is
 /// bounced so a broken edit fails here instead of taking the service down.
 pub fn restart() -> Result<()> {
-    platform_check()?;
-    let service = installed_service()?;
-    let domain = launchctl_domain();
-    let state = launchctl_print(&domain)?
-        .as_deref()
-        .map_or(LaunchAgentState::Unloaded, launchctl_output_state);
-    let previous_pid = state.pid();
-    match state {
-        LaunchAgentState::Unloaded => bootstrap(&domain, &service.plist_path)?,
-        LaunchAgentState::Starting
-        | LaunchAgentState::LoadedStopped { .. }
-        | LaunchAgentState::Running { .. } => kickstart(&domain)?,
-    }
-    service.wait_until_ready(&domain, previous_pid)
+    Service::default().restart()
 }
 
 /// Start an installed LaunchAgent without bouncing an already-running daemon.
@@ -439,21 +265,11 @@ pub fn restart() -> Result<()> {
 /// paths verify launchd state and, for current plists, the nonce-protected
 /// listener health endpoints before returning.
 pub fn start() -> Result<()> {
-    platform_check()?;
-    let service = installed_service()?;
-    let domain = launchctl_domain();
-    let state = launchctl_print(&domain)?
-        .as_deref()
-        .map_or(LaunchAgentState::Unloaded, launchctl_output_state);
-    execute_start(
-        state,
-        || bootstrap(&domain, &service.plist_path),
-        || kickstart(&domain),
-        |previous_pid| service.wait_until_ready(&domain, previous_pid),
-    )
+    Service::default().start()
 }
 
 struct InstalledService {
+    label: String,
     plist_path: PathBuf,
     listener_addresses: Vec<SocketAddr>,
     service_nonce: Option<String>,
@@ -463,7 +279,10 @@ impl InstalledService {
     fn wait_until_ready(&self, domain: &str, previous_pid: Option<u32>) -> Result<()> {
         let (readiness_listeners, readiness_nonce) =
             readiness_probe(&self.listener_addresses, self.service_nonce.as_deref());
-        wait_until_ready(
+        Service {
+            label: self.label.clone(),
+        }
+        .wait_until_ready(
             domain,
             readiness_listeners,
             readiness_nonce,
@@ -474,49 +293,6 @@ impl InstalledService {
 }
 
 /// Read and validate every installed input before changing launchd state.
-fn installed_service() -> Result<InstalledService> {
-    let plist_path = plist_path()?;
-    let plist = match fs::read_to_string(&plist_path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("service is not installed (run `comradex service install`)")
-        }
-        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
-    };
-    validate_plist(&plist_path)
-        .with_context(|| format!("validate installed service {}", plist_path.display()))?;
-    let config_path = plist_program_config(&plist)
-        .with_context(|| format!("no --config argument recorded in {}", plist_path.display()))?;
-    let executable = plist_executable(&plist).with_context(|| {
-        format!(
-            "no executable recorded in ProgramArguments in {}",
-            plist_path.display()
-        )
-    })?;
-    if !executable.is_file() {
-        bail!(
-            "the service executable {} no longer exists (removed by an upgrade?); \
-             run `comradex service install` to re-point the service at the current binary",
-            executable.display()
-        )
-    }
-    let config = crate::config::Config::load(&config_path)?;
-    let listener_addresses: Vec<_> = configured_listener_addresses(&config);
-    if listener_addresses.iter().any(|address| address.port() == 0) {
-        bail!("installed service configuration requires fixed non-zero listener ports")
-    }
-    let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
-    if config.proxy.desktop.is_some() && service_nonce.is_none() {
-        bail!(
-            "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
-        )
-    }
-    Ok(InstalledService {
-        plist_path,
-        listener_addresses,
-        service_nonce,
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LaunchAgentState {
@@ -642,29 +418,6 @@ fn xml_unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn kickstart(domain: &str) -> Result<()> {
-    let status = Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("{domain}/{LABEL}")])
-        .status()
-        .context("launch launchctl kickstart")?;
-    if !status.success() {
-        bail!("launchctl kickstart exited with {status}")
-    }
-    Ok(())
-}
-
-fn is_loaded(domain: &str) -> Result<bool> {
-    Ok(launchctl_print(domain)?.is_some())
-}
-
-fn is_running(domain: &str) -> Result<bool> {
-    Ok(launchctl_print(domain)?.is_some_and(|output| launchctl_output_is_running(&output)))
-}
-
-fn launchctl_print(domain: &str) -> Result<Option<String>> {
-    launchctl_print_target(&format!("{domain}/{LABEL}"))
-}
-
 fn launchctl_print_target(service_target: &str) -> Result<Option<String>> {
     let output = Command::new("launchctl")
         .args(["print", service_target])
@@ -704,41 +457,6 @@ fn launchctl_output_pid(output: &str) -> Option<u32> {
             .and_then(|pid| pid.parse::<u32>().ok())
             .filter(|pid| *pid > 0)
     })
-}
-
-fn wait_until_ready(
-    domain: &str,
-    listeners: &[SocketAddr],
-    service_nonce: Option<&str>,
-    previous_pid: Option<u32>,
-    timeout: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let launchctl = launchctl_print(domain)?;
-        let running = launchctl
-            .as_deref()
-            .is_some_and(launchctl_output_is_running);
-        let current_pid = launchctl.as_deref().and_then(launchctl_output_pid);
-        let replaced = previous_pid.is_none_or(|previous| current_pid != Some(previous));
-        if running && replaced && listeners_ready(listeners, service_nonce) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            let targets = listeners
-                .iter()
-                .filter(|address| address.port() != 0)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(readiness_deadline_error(
-                launchctl.as_deref(),
-                targets,
-                timeout,
-            ));
-        }
-        thread::sleep(READY_POLL_INTERVAL);
-    }
 }
 
 fn readiness_deadline_error(
@@ -812,47 +530,11 @@ fn launchctl_state_summary(output: &str) -> String {
 }
 
 pub fn status_description() -> Result<String> {
-    platform_check()?;
-    if !installed()? {
-        return Ok("service is not installed (run `comradex service install`)".into());
-    }
-    let Some(output) = launchctl_print(&launchctl_domain())? else {
-        return Ok("service is installed but not loaded; run `comradex service start`\nLogs: `comradex service logs` (includes historical output)".into());
-    };
-    let state = launchctl_output_state(&output);
-    let description = match state {
-        LaunchAgentState::Starting => "service is starting; macOS has not finished launching it",
-        LaunchAgentState::Running { .. } => {
-            let service = installed_service()?;
-            let (listeners, nonce) = readiness_probe(
-                &service.listener_addresses,
-                service.service_nonce.as_deref(),
-            );
-            if listeners_ready(listeners, nonce) {
-                "service is running and ready"
-            } else {
-                "service process is running but its listeners are not ready"
-            }
-        }
-        _ => "service is loaded but stopped; run `comradex service start`",
-    };
-    Ok(format!(
-        "{description}\n{}\nLogs: `comradex service logs` (includes historical output)",
-        launchctl_state_summary(&output)
-    ))
+    Service::default().status_description()
 }
 
 pub fn logs() -> Result<String> {
-    platform_check()?;
-    let plist = fs::read_to_string(plist_path()?)
-        .context("read installed LaunchAgent; service logs require an installed service")?;
-    let mut result = String::new();
-    for key in ["StandardOutPath", "StandardErrorPath"] {
-        if let Some(path) = plist_string_after(&plist, &format!("<key>{key}</key><string>")) {
-            result.push_str(&log_excerpt(Path::new(&path))?);
-        }
-    }
-    Ok(result)
+    Service::default().logs()
 }
 
 fn log_excerpt(path: &Path) -> Result<String> {
@@ -919,10 +601,6 @@ fn probe_address(mut address: SocketAddr) -> SocketAddr {
     address
 }
 
-fn bootout(domain: &str) -> Result<()> {
-    bootout_target(&format!("{domain}/{LABEL}"))
-}
-
 fn bootout_target(service_target: &str) -> Result<()> {
     let status = Command::new("launchctl")
         .args(["bootout", service_target])
@@ -958,13 +636,6 @@ fn wait_until_unloaded(
     }
 }
 
-fn stop_if_loaded(domain: &str) -> Result<()> {
-    if is_loaded(domain)? {
-        bootout(domain)?;
-    }
-    Ok(())
-}
-
 #[cfg(target_os = "macos")]
 fn launchctl_domain() -> String {
     format!("gui/{}", unsafe { libc::geteuid() })
@@ -973,13 +644,6 @@ fn launchctl_domain() -> String {
 #[cfg(not(target_os = "macos"))]
 fn launchctl_domain() -> String {
     String::new()
-}
-
-fn plist_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist")))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1031,9 +695,628 @@ fn platform_check() -> Result<()> {
     bail!("service management currently supports macOS LaunchAgents only")
 }
 
+/// The LaunchAgent owned by one configuration. Other configurations never share its lifecycle.
+#[derive(Clone)]
+pub struct Service {
+    label: String,
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self {
+            label: LABEL.into(),
+        }
+    }
+}
+
+/// Resolve symlinks so alternate spellings of one configuration target the same service.
+pub fn for_config(config_path: &Path) -> Result<Service> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config_path;
+        Ok(Service::default())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .context("HOME is not set")?;
+        for_config_home(config_path, Path::new(&home))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn for_config_home(config_path: &Path, home: &Path) -> Result<Service> {
+    use crate::config::resolve_config_path;
+
+    let config = resolve_config_path(config_path)?;
+    let default = lookup_path(&home.join(".config/comradex/comradex.toml"))?;
+    let alternate = alternate_label(&config);
+    let agents = home.join("Library/LaunchAgents");
+    let alternate_owner = recorded_config(&agents.join(format!("{alternate}.plist")))?;
+    let legacy_owner = recorded_config(&agents.join(format!("{LABEL}.plist")))?;
+    if alternate_owner
+        .as_ref()
+        .is_some_and(|owner| owner != &config)
+    {
+        bail!("the configuration's service label is already owned by another configuration")
+    }
+    if alternate_owner.is_some() && legacy_owner.as_ref() == Some(&config) {
+        bail!(
+            "the configuration is registered under two service labels; remove the duplicate before maintenance"
+        )
+    }
+    let label = if alternate_owner.is_some() {
+        alternate
+    } else if legacy_owner.as_ref() == Some(&config) {
+        LABEL.into()
+    } else if legacy_owner.is_none() {
+        label_for_paths(&config, &default)
+    } else {
+        alternate
+    };
+    Ok(Service { label })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn recorded_config(plist_path: &Path) -> Result<Option<PathBuf>> {
+    let plist = match fs::read_to_string(plist_path) {
+        Ok(plist) => plist,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", plist_path.display())),
+    };
+    let config = plist_program_config(&plist)
+        .with_context(|| format!("no --config recorded in {}", plist_path.display()))?;
+    Ok(Some(lookup_path(&config)?))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn lookup_path(path: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::path::absolute(path)?)
+        }
+        Err(error) => Err(error).with_context(|| format!("resolve {}", path.display())),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn label_for_paths(config: &Path, default: &Path) -> String {
+    if config == default {
+        LABEL.into()
+    } else {
+        alternate_label(config)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn alternate_label(config: &Path) -> String {
+    let digest = blake3::hash(config.as_os_str().as_encoded_bytes());
+    format!("{LABEL}.{}", &digest.to_hex()[..12])
+}
+
+impl Service {
+    pub fn install(&self, config_path: &Path, state_dir: &Path) -> Result<PathBuf> {
+        platform_check()?;
+        let config_path = fs::canonicalize(config_path)
+            .with_context(|| format!("resolve {}", config_path.display()))?;
+        let config = crate::config::Config::load(&config_path)?;
+        let listener_addresses: Vec<_> = configured_listener_addresses(&config);
+        if listener_addresses.iter().any(|address| address.port() == 0) {
+            bail!("service installation requires fixed non-zero listener ports")
+        }
+        let executable = stable_executable_path(
+            fs::canonicalize(std::env::current_exe()?)
+                .context("resolve current Comradex executable")?,
+        );
+        let plist_path = self.plist_path()?;
+        let parent = plist_path
+            .parent()
+            .context("LaunchAgents path has no parent")?;
+        fs::create_dir_all(parent)?;
+        fs::create_dir_all(state_dir)?;
+        let state_dir = fs::canonicalize(state_dir)
+            .with_context(|| format!("resolve {}", state_dir.display()))?;
+        let stdout = state_dir.join("service.stdout.log");
+        let stderr = state_dir.join("service.stderr.log");
+        let working_directory = config_path.parent().unwrap_or(Path::new("/"));
+        let previous = match fs::read(&plist_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", plist_path.display()));
+            }
+        };
+        // Retain the readiness identity when comparing an existing installation.
+        // Reinstalling the same service must not kill a launch still in progress.
+        let service_nonce = previous
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|plist| {
+                plist_string_after(plist, "<key>COMRADEX_SERVICE_NONCE</key><string>")
+            })
+            .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+        let plist = render_plist(
+            &executable,
+            &config_path,
+            working_directory,
+            &stdout,
+            &stderr,
+            &service_nonce,
+            &self.label,
+        );
+        if previous.as_deref() == Some(plist.as_bytes()) {
+            self.start()?;
+            return Ok(plist_path);
+        }
+        // A changed definition gets a new identity: an old listener must not
+        // satisfy readiness for its replacement.
+        let service_nonce = format!("{:032x}", rand::random::<u128>());
+        let plist = render_plist(
+            &executable,
+            &config_path,
+            working_directory,
+            &stdout,
+            &stderr,
+            &service_nonce,
+            &self.label,
+        );
+        let mut candidate = tempfile::NamedTempFile::new_in(parent)?;
+        candidate.write_all(plist.as_bytes())?;
+        candidate.as_file().sync_all()?;
+        validate_plist(candidate.path())?;
+
+        let domain = launchctl_domain();
+        let was_loaded = self.is_loaded(&domain)?;
+        if was_loaded && previous.is_none() {
+            bail!(
+                "LaunchAgent is loaded but {} is missing; refusing a replacement that cannot be rolled back",
+                plist_path.display()
+            )
+        }
+        replace_plist_transaction(
+            &plist_path,
+            candidate,
+            previous.as_deref(),
+            was_loaded,
+            || self.stop_if_loaded(&domain),
+            |path| {
+                bootstrap(&domain, path)?;
+                self.wait_until_ready(
+                    &domain,
+                    &listener_addresses,
+                    Some(&service_nonce),
+                    None,
+                    READY_TIMEOUT,
+                )
+            },
+            |path| {
+                bootstrap(&domain, path)?;
+                self.wait_until_ready(&domain, &[], None, None, READY_TIMEOUT)
+            },
+        )?;
+        Ok(plist_path)
+    }
+
+    pub fn uninstall(&self) -> Result<Option<PathBuf>> {
+        platform_check()?;
+        let plist_path = self.plist_path()?;
+        let domain = launchctl_domain();
+        if self.is_loaded(&domain)? {
+            self.bootout(&domain)?;
+        }
+        if plist_path.exists() {
+            fs::remove_file(&plist_path)?;
+            Ok(Some(plist_path))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn status(&self) -> Result<bool> {
+        platform_check()?;
+        self.is_running(&launchctl_domain())
+    }
+
+    pub fn installed(&self) -> Result<bool> {
+        platform_check()?;
+        Ok(self.plist_path()?.exists())
+    }
+
+    pub fn last_stderr_line(&self) -> Result<Option<LastStderrLine>> {
+        platform_check()?;
+        let plist_path = self.plist_path()?;
+        let plist = match fs::read_to_string(&plist_path) {
+            Ok(plist) => plist,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", plist_path.display()));
+            }
+        };
+        let Some(path) = plist_string_after(&plist, "<key>StandardErrorPath</key><string>") else {
+            return Ok(None);
+        };
+        read_last_nonempty_line(Path::new(&path))
+    }
+
+    pub fn while_daemon_stopped<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            action()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let plist_path = self.plist_path()?;
+            if !plist_path.exists() {
+                return action();
+            }
+            let domain = launchctl_domain();
+            if !self.is_loaded(&domain)? {
+                return action();
+            }
+
+            // Resolve everything needed to restore readiness before stopping service.
+            let plist = fs::read_to_string(&plist_path)
+                .with_context(|| format!("read {}", plist_path.display()))?;
+            let config_path = plist_program_config(&plist).with_context(|| {
+                format!("no --config argument recorded in {}", plist_path.display())
+            })?;
+            let config = crate::config::Config::load(&config_path)?;
+            let listener_addresses: Vec<_> = configured_listener_addresses(&config);
+            let service_nonce =
+                plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
+            if config.proxy.desktop.is_some() && service_nonce.is_none() {
+                bail!(
+                    "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
+                )
+            }
+
+            maintenance_transaction(
+                true,
+                || self.bootout(&domain),
+                || {
+                    bootstrap(&domain, &plist_path)?;
+                    let (readiness_listeners, readiness_nonce) =
+                        readiness_probe(&listener_addresses, service_nonce.as_deref());
+                    self.wait_until_ready(
+                        &domain,
+                        readiness_listeners,
+                        readiness_nonce,
+                        None,
+                        READY_TIMEOUT,
+                    )
+                },
+                action,
+            )
+        }
+    }
+
+    pub fn restart(&self) -> Result<()> {
+        platform_check()?;
+        let service = self.installed_service()?;
+        let domain = launchctl_domain();
+        let state = self
+            .launchctl_print(&domain)?
+            .as_deref()
+            .map_or(LaunchAgentState::Unloaded, launchctl_output_state);
+        let previous_pid = state.pid();
+        match state {
+            LaunchAgentState::Unloaded => bootstrap(&domain, &service.plist_path)?,
+            LaunchAgentState::Starting
+            | LaunchAgentState::LoadedStopped { .. }
+            | LaunchAgentState::Running { .. } => self.kickstart(&domain)?,
+        }
+        service.wait_until_ready(&domain, previous_pid)
+    }
+
+    pub fn start(&self) -> Result<()> {
+        platform_check()?;
+        let service = self.installed_service()?;
+        let domain = launchctl_domain();
+        let state = self
+            .launchctl_print(&domain)?
+            .as_deref()
+            .map_or(LaunchAgentState::Unloaded, launchctl_output_state);
+        execute_start(
+            state,
+            || bootstrap(&domain, &service.plist_path),
+            || self.kickstart(&domain),
+            |previous_pid| service.wait_until_ready(&domain, previous_pid),
+        )
+    }
+
+    fn installed_service(&self) -> Result<InstalledService> {
+        let plist_path = self.plist_path()?;
+        let plist = match fs::read_to_string(&plist_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!("service is not installed (run `comradex service install`)")
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", plist_path.display()));
+            }
+        };
+        validate_plist(&plist_path)
+            .with_context(|| format!("validate installed service {}", plist_path.display()))?;
+        let config_path = plist_program_config(&plist).with_context(|| {
+            format!("no --config argument recorded in {}", plist_path.display())
+        })?;
+        let executable = plist_executable(&plist).with_context(|| {
+            format!(
+                "no executable recorded in ProgramArguments in {}",
+                plist_path.display()
+            )
+        })?;
+        if !executable.is_file() {
+            bail!(
+                "the service executable {} no longer exists (removed by an upgrade?); \
+             run `comradex service install` to re-point the service at the current binary",
+                executable.display()
+            )
+        }
+        let config = crate::config::Config::load(&config_path)?;
+        let listener_addresses: Vec<_> = configured_listener_addresses(&config);
+        if listener_addresses.iter().any(|address| address.port() == 0) {
+            bail!("installed service configuration requires fixed non-zero listener ports")
+        }
+        let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
+        if config.proxy.desktop.is_some() && service_nonce.is_none() {
+            bail!(
+                "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
+            )
+        }
+        Ok(InstalledService {
+            label: self.label.clone(),
+            plist_path,
+            listener_addresses,
+            service_nonce,
+        })
+    }
+
+    fn kickstart(&self, domain: &str) -> Result<()> {
+        let status = Command::new("launchctl")
+            .args(["kickstart", "-k", &format!("{domain}/{}", self.label)])
+            .status()
+            .context("launch launchctl kickstart")?;
+        if !status.success() {
+            bail!("launchctl kickstart exited with {status}")
+        }
+        Ok(())
+    }
+
+    fn is_loaded(&self, domain: &str) -> Result<bool> {
+        Ok(self.launchctl_print(domain)?.is_some())
+    }
+
+    fn is_running(&self, domain: &str) -> Result<bool> {
+        Ok(self
+            .launchctl_print(domain)?
+            .is_some_and(|output| launchctl_output_is_running(&output)))
+    }
+
+    fn launchctl_print(&self, domain: &str) -> Result<Option<String>> {
+        launchctl_print_target(&format!("{domain}/{}", self.label))
+    }
+
+    fn wait_until_ready(
+        &self,
+        domain: &str,
+        listeners: &[SocketAddr],
+        service_nonce: Option<&str>,
+        previous_pid: Option<u32>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let launchctl = self.launchctl_print(domain)?;
+            let running = launchctl
+                .as_deref()
+                .is_some_and(launchctl_output_is_running);
+            let current_pid = launchctl.as_deref().and_then(launchctl_output_pid);
+            let replaced = previous_pid.is_none_or(|previous| current_pid != Some(previous));
+            if running && replaced && listeners_ready(listeners, service_nonce) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let targets = listeners
+                    .iter()
+                    .filter(|address| address.port() != 0)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(readiness_deadline_error(
+                    launchctl.as_deref(),
+                    targets,
+                    timeout,
+                ));
+            }
+            thread::sleep(READY_POLL_INTERVAL);
+        }
+    }
+
+    pub fn status_description(&self) -> Result<String> {
+        platform_check()?;
+        if !self.installed()? {
+            return Ok("service is not installed (run `comradex service install`)".into());
+        }
+        let Some(output) = self.launchctl_print(&launchctl_domain())? else {
+            return Ok("service is installed but not loaded; run `comradex service start`\nLogs: `comradex service logs` (includes historical output)".into());
+        };
+        let state = launchctl_output_state(&output);
+        let description = match state {
+            LaunchAgentState::Starting => {
+                "service is starting; macOS has not finished launching it"
+            }
+            LaunchAgentState::Running { .. } => {
+                let service = self.installed_service()?;
+                let (listeners, nonce) = readiness_probe(
+                    &service.listener_addresses,
+                    service.service_nonce.as_deref(),
+                );
+                if listeners_ready(listeners, nonce) {
+                    "service is running and ready"
+                } else {
+                    "service process is running but its listeners are not ready"
+                }
+            }
+            _ => "service is loaded but stopped; run `comradex service start`",
+        };
+        Ok(format!(
+            "{description}\n{}\nLogs: `comradex service logs` (includes historical output)",
+            launchctl_state_summary(&output)
+        ))
+    }
+
+    pub fn logs(&self) -> Result<String> {
+        platform_check()?;
+        let plist = fs::read_to_string(self.plist_path()?)
+            .context("read installed LaunchAgent; service logs require an installed service")?;
+        let mut result = String::new();
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            if let Some(path) = plist_string_after(&plist, &format!("<key>{key}</key><string>")) {
+                result.push_str(&log_excerpt(Path::new(&path))?);
+            }
+        }
+        Ok(result)
+    }
+
+    fn bootout(&self, domain: &str) -> Result<()> {
+        bootout_target(&format!("{domain}/{}", self.label))
+    }
+
+    fn stop_if_loaded(&self, domain: &str) -> Result<()> {
+        if self.is_loaded(domain)? {
+            self.bootout(domain)?;
+        }
+        Ok(())
+    }
+
+    fn plist_path(&self) -> Result<PathBuf> {
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        Ok(PathBuf::from(home)
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", self.label)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn register_owner(home: &Path, label: &str, config: &Path) -> PathBuf {
+        let agents = home.join("Library/LaunchAgents");
+        fs::create_dir_all(&agents).unwrap();
+        let plist = render_plist(
+            Path::new("/usr/local/bin/comradex"),
+            config,
+            home,
+            Path::new("/tmp/out"),
+            Path::new("/tmp/err"),
+            "nonce",
+            label,
+        );
+        let path = agents.join(format!("{label}.plist"));
+        fs::write(&path, plist).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_dangling_aliases_do_not_block_a_valid_service() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("valid.toml");
+        fs::write(&config, "").unwrap();
+        let label = for_config_home(&config, home.path()).unwrap().label;
+        register_owner(home.path(), &label, &config);
+        let default = home.path().join(".config/comradex/comradex.toml");
+        fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(home.path().join("missing-default"), &default).unwrap();
+        assert_eq!(for_config_home(&config, home.path()).unwrap().label, label);
+        fs::remove_file(default).unwrap();
+        let other = home.path().join("dangling-legacy.toml");
+        std::os::unix::fs::symlink(home.path().join("missing-legacy"), &other).unwrap();
+        register_owner(home.path(), LABEL, &other);
+        assert_eq!(for_config_home(&config, home.path()).unwrap().label, label);
+        assert!(for_config_home(&other, home.path()).is_err());
+    }
+
+    #[test]
+    fn named_default_ownership_survives_removal_of_the_legacy_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let default = home.path().join(".config/comradex/comradex.toml");
+        fs::create_dir_all(default.parent().unwrap()).unwrap();
+        fs::write(&default, "").unwrap();
+        let custom = home.path().join("custom.toml");
+        fs::write(&custom, "").unwrap();
+        let legacy = register_owner(home.path(), LABEL, &custom);
+        assert_eq!(for_config_home(&custom, home.path()).unwrap().label, LABEL);
+        let named = for_config_home(&default, home.path()).unwrap().label;
+        assert_ne!(named, LABEL);
+        register_owner(home.path(), &named, &default);
+        fs::remove_file(legacy).unwrap();
+        assert_eq!(for_config_home(&default, home.path()).unwrap().label, named);
+    }
+
+    #[test]
+    fn ambiguous_and_conflicting_registered_owners_are_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("custom.toml");
+        let other = home.path().join("other.toml");
+        fs::write(&config, "").unwrap();
+        fs::write(&other, "").unwrap();
+        let label = for_config_home(&config, home.path()).unwrap().label;
+        let named = register_owner(home.path(), &label, &other);
+        assert!(for_config_home(&config, home.path()).is_err());
+        fs::remove_file(named).unwrap();
+        register_owner(home.path(), &label, &config);
+        register_owner(home.path(), LABEL, &config);
+        assert!(for_config_home(&config, home.path()).is_err());
+    }
+
+    #[test]
+    fn alternate_configurations_have_distinct_service_labels() {
+        let default = Path::new("/Users/example/.config/comradex/comradex.toml");
+        let claude = Path::new("/Users/example/.config/comradex/claude/comradex.toml");
+        let other = Path::new("/Users/example/.config/comradex/other/comradex.toml");
+        assert_eq!(label_for_paths(default, default), LABEL);
+        assert_ne!(label_for_paths(claude, default), LABEL);
+        assert_ne!(
+            label_for_paths(claude, default),
+            label_for_paths(other, default)
+        );
+        assert_eq!(
+            label_for_paths(claude, default),
+            label_for_paths(claude, default)
+        );
+        assert!(label_for_paths(claude, default).starts_with("com.nicosuave.comradex."));
+    }
+
+    #[test]
+    fn existing_custom_install_keeps_its_legacy_service_label() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("custom.toml");
+        fs::write(&config, "").unwrap();
+        let agents = home.path().join("Library/LaunchAgents");
+        fs::create_dir_all(&agents).unwrap();
+        let plist = render_plist(
+            Path::new("/usr/local/bin/comradex"),
+            &config,
+            home.path(),
+            Path::new("/tmp/out"),
+            Path::new("/tmp/err"),
+            "nonce",
+            LABEL,
+        );
+        fs::write(agents.join(format!("{LABEL}.plist")), plist).unwrap();
+        assert_eq!(for_config_home(&config, home.path()).unwrap().label, LABEL);
+        assert_ne!(
+            for_config_home(&home.path().join("other.toml"), home.path())
+                .unwrap()
+                .label,
+            LABEL
+        );
+    }
     use std::cell::Cell;
 
     #[test]
@@ -1187,6 +1470,7 @@ mod tests {
             Path::new("/tmp/out.log"),
             Path::new("/tmp/err.log"),
             "nonce123",
+            LABEL,
         );
         assert_eq!(
             plist_executable(&plist).unwrap(),
@@ -1204,6 +1488,7 @@ mod tests {
             Path::new("/tmp/out.log"),
             Path::new("/tmp/err.log"),
             "nonce123",
+            LABEL,
         );
         assert_eq!(plist_program_config(&plist).unwrap(), config);
         assert_eq!(
@@ -1702,6 +1987,7 @@ mod tests {
             Path::new("/tmp/stdout.log"),
             Path::new("/tmp/stderr.log"),
             "test-nonce",
+            LABEL,
         );
         let mut file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
         file.write_all(plist.as_bytes()).unwrap();

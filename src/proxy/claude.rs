@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 mod maintenance;
@@ -37,15 +37,22 @@ pub(super) struct Claude {
     client: HttpClient,
     upstream: String,
     usage_url: String,
-    /// Per-account usage poll cooldown: (retry at, current throttle delay).
-    usage_backoff: Mutex<HashMap<String, (u64, u64)>>,
+    usage_backoff: Mutex<HashMap<String, UsageBackoff>>,
+    usage_locks: HashMap<String, Mutex<()>>,
     reporting_usage: Mutex<HashMap<String, ReportingUsage>>,
     activation: Mutex<Result<crate::claude::maintenance::ActivationLedger>>,
     sessions: Mutex<HashMap<String, Weak<Session>>>,
 }
+#[derive(Clone, Copy)]
+struct UsageBackoff {
+    retry_at: u64,
+    enforced_delay: u64,
+}
+
 struct ReportingUsage {
     owner: crate::auth::QuotaOwner,
-    value: serde_json::Map<String, serde_json::Value>,
+    observed_at: Instant,
+    value: Option<serde_json::Map<String, serde_json::Value>>,
 }
 #[derive(Default)]
 struct Session {
@@ -63,6 +70,11 @@ impl Claude {
             upstream: crate::claude::UPSTREAM.into(),
             usage_url: format!("{}/api/oauth/usage", crate::claude::UPSTREAM),
             usage_backoff: Mutex::new(HashMap::new()),
+            usage_locks: config
+                .accounts
+                .keys()
+                .map(|name| (name.clone(), Mutex::new(())))
+                .collect(),
             reporting_usage: Mutex::new(HashMap::new()),
             activation: Mutex::new(crate::claude::maintenance::ActivationLedger::open(
                 config
@@ -93,14 +105,24 @@ impl App {
         account: &str,
         owner: crate::auth::QuotaOwner,
         bytes: &[u8],
+        observed_at: Instant,
     ) {
         let value = crate::claude::maintenance::parse_reporting_usage(bytes);
         let mut observations = self.claude.reporting_usage.lock().await;
-        if let Some(value) = value {
-            observations.insert(account.into(), ReportingUsage { owner, value });
-        } else {
-            observations.remove(account);
+        if observations
+            .get(account)
+            .is_some_and(|previous| previous.observed_at > observed_at)
+        {
+            return;
         }
+        observations.insert(
+            account.into(),
+            ReportingUsage {
+                owner,
+                observed_at,
+                value,
+            },
+        );
     }
 
     pub(crate) async fn claude_reporting_usage(
@@ -121,7 +143,34 @@ impl App {
             .await
             .get(account)
             .filter(|observation| observation.owner == current.owner())
-            .map(|observation| observation.value.clone())
+            .and_then(|observation| observation.value.clone())
+    }
+
+    async fn claude_fable_observation(
+        &self,
+        owner: &crate::auth::QuotaOwner,
+        model: &str,
+        now: u64,
+    ) -> Option<(Instant, bool)> {
+        if !owner.is_known() {
+            return None;
+        }
+        self.claude
+            .reporting_usage
+            .lock()
+            .await
+            .values()
+            .filter(|observation| &observation.owner == owner)
+            .map(|observation| {
+                (
+                    observation.observed_at,
+                    observation
+                        .value
+                        .as_ref()
+                        .is_some_and(|usage| quota::fable_exhausted(usage, model, now)),
+                )
+            })
+            .max()
     }
 
     pub(super) async fn handle_claude(
@@ -202,6 +251,7 @@ impl App {
                 return self.claude_passthrough(request, admission).await;
             }
         };
+        let fable_message = message && quota::is_fable(&native.model);
         let routing_id = format!("claude:{}:{}", listener.pool, native.session);
         let session = self.claude.session(&routing_id).await;
         let _gate = tokio::time::timeout(Duration::from_secs(30), session.gate.lock())
@@ -323,6 +373,8 @@ impl App {
                 exact = None;
                 moved_from = Some(account);
             }
+            let selection_pool = fable_message.then(|| remaining.clone());
+            let dispatch_pool = selection_pool.as_ref().unwrap_or(pool);
             let selection = if let Some(account) = &exact {
                 self.router.select_exact(&remaining, account).await
             } else {
@@ -377,6 +429,10 @@ impl App {
                 AccountConfig::ClaudeInbound => None,
                 _ => unreachable!("validated provider pool"),
             };
+            let owner = credentials
+                .as_ref()
+                .map(auth::Credential::owner)
+                .unwrap_or_default();
             let identity = credentials
                 .as_ref()
                 .map(|c| format!("{}:{}", c.organization_uuid, c.account_uuid))
@@ -404,8 +460,27 @@ impl App {
                     "account-owned context cannot move to a different credential identity",
                 ));
             }
+            if fable_message
+                && self
+                    .claude_fable_observation(&owner, &native.model, auth::now())
+                    .await
+                    .is_some_and(|(_, exhausted)| exhausted)
+            {
+                if !movable {
+                    break;
+                }
+                if exact.take().is_some()
+                    || binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.account_id == account)
+                {
+                    moved_from = Some(account.clone());
+                }
+                self.router.forget_session(&key, &account).await;
+                continue;
+            }
             self.router
-                .validate_selection(&selected, &listener.pool, pool)
+                .validate_selection(&selected, &listener.pool, dispatch_pool)
                 .await
                 .map_err(|_| anyhow::anyhow!("Claude selection changed before dispatch"))?;
             let sent = match &credentials {
@@ -433,6 +508,7 @@ impl App {
                 .await?;
             self.router.begin(&account).await;
             let lease = DirectAccountLease::new_for_selection(self.router.clone(), &selected);
+            let mut dispatched_at = Instant::now();
             let mut response = self
                 .claude_send(
                     &parts.method,
@@ -454,9 +530,10 @@ impl App {
                     .await
                 {
                     self.router
-                        .validate_selection(&selected, &listener.pool, pool)
+                        .validate_selection(&selected, &listener.pool, dispatch_pool)
                         .await
                         .map_err(|_| anyhow::anyhow!("Claude selection changed during refresh"))?;
+                    dispatched_at = Instant::now();
                     response = self
                         .claude_send(
                             &parts.method,
@@ -476,22 +553,29 @@ impl App {
                 }
             }
             let now = auth::now();
-            let owner = credentials
-                .as_ref()
-                .map(auth::Credential::owner)
-                .unwrap_or_default();
             if let Some(snapshot) = quota::snapshot(response.headers(), now) {
                 self.router
                     .observe_usage_snapshot_for_owner(&account, snapshot, &owner)
                     .await;
             }
-            if response.status() == StatusCode::TOO_MANY_REQUESTS
-                && let Some(reset) = quota::shared_reset(response.headers(), now)
-            {
-                self.router
-                    .claude_quota_until(&account, reset, &owner)
-                    .await;
-                if movable {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                let exhausted = if let Some(reset) = quota::shared_reset(response.headers(), now) {
+                    self.router
+                        .claude_quota_until(&account, reset, &owner)
+                        .await;
+                    true
+                } else if fable_message && movable {
+                    self.refresh_fable_quota_after_rejection(
+                        &account,
+                        &owner,
+                        &native.model,
+                        dispatched_at,
+                    )
+                    .await
+                } else {
+                    false
+                };
+                if exhausted && movable {
                     if exact.take().is_some()
                         || binding.as_ref().is_some_and(|b| b.account_id == account)
                     {
@@ -808,6 +892,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use serde_json::json;
     use std::convert::Infallible;
+    use std::sync::atomic::AtomicBool;
     use tokio::net::TcpListener;
 
     include!("session_claude_tests.rs");
@@ -837,12 +922,29 @@ mod tests {
         }
         headers
     }
+    struct UsageFixture {
+        values: Mutex<HashMap<bool, serde_json::Value>>,
+        status: AtomicUsize,
+        hold: AtomicBool,
+        release: tokio::sync::Semaphore,
+    }
+    impl Default for UsageFixture {
+        fn default() -> Self {
+            Self {
+                values: Mutex::new(HashMap::new()),
+                status: AtomicUsize::new(0),
+                hold: AtomicBool::new(false),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
     struct Harness {
         _directory: tempfile::TempDir,
         app: Arc<App>,
         url: String,
         seen: Arc<Mutex<Vec<(HeaderMap, Bytes, String)>>>,
         release_stream: Arc<tokio::sync::Notify>,
+        usage: Arc<UsageFixture>,
         upstream_task: tokio::task::JoinHandle<()>,
         downstream_task: tokio::task::JoinHandle<Result<()>>,
     }
@@ -858,6 +960,8 @@ mod tests {
             let observed = seen.clone();
             let release_stream = Arc::new(tokio::sync::Notify::new());
             let release = release_stream.clone();
+            let usage = Arc::new(UsageFixture::default());
+            let usage_server = usage.clone();
             let upstream_task = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = upstream.accept().await else {
@@ -865,10 +969,12 @@ mod tests {
                     };
                     let seen = observed.clone();
                     let release = release.clone();
+                    let usage_server = usage_server.clone();
                     tokio::spawn(async move {
                         let service = service_fn(move |req: Request<Incoming>| {
                             let seen = seen.clone();
                             let release = release.clone();
+                            let usage_server = usage_server.clone();
                             async move {
                                 let (parts, body) = req.into_parts();
                                 let body = body.collect().await.unwrap().to_bytes();
@@ -879,6 +985,8 @@ mod tests {
                                 let hold = parts.headers.contains_key("x-test-hold");
                                 let reject = parts.headers.contains_key("x-test-quota");
                                 let ambiguous = parts.headers.contains_key("x-test-ambiguous");
+                                let fable_reject =
+                                    first && parts.headers.contains_key("x-test-fable-limit");
                                 let usage = parts.uri.path() == "/api/oauth/usage";
                                 let token = parts.uri.path() == "/token";
                                 seen.lock().await.push((
@@ -906,8 +1014,20 @@ mod tests {
                                             {"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":reset,"scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false,"severity":"critical"}
                                         ]);
                                     }
+                                    if let Some(value) =
+                                        usage_server.values.lock().await.get(&first).cloned()
+                                    {
+                                        data = value;
+                                    }
+                                    if usage_server.hold.load(Ordering::Acquire) {
+                                        usage_server.release.acquire().await.unwrap().forget();
+                                    }
+                                    let explicit_status =
+                                        usage_server.status.load(Ordering::Acquire);
                                     Response::builder()
-                                        .status(if status == StatusCode::TOO_MANY_REQUESTS {
+                                        .status(if explicit_status != 0 {
+                                            StatusCode::from_u16(explicit_status as u16).unwrap()
+                                        } else if status == StatusCode::TOO_MANY_REQUESTS {
                                             status
                                         } else {
                                             StatusCode::OK
@@ -917,6 +1037,16 @@ mod tests {
                                         .body(
                                             Full::new(Bytes::from(
                                                 serde_json::to_vec(&data).unwrap(),
+                                            ))
+                                            .boxed(),
+                                        )
+                                        .unwrap()
+                                } else if fable_reject {
+                                    Response::builder()
+                                        .status(StatusCode::TOO_MANY_REQUESTS)
+                                        .body(
+                                            Full::new(Bytes::from_static(
+                                                b"{\"error\":{\"type\":\"rate_limit_error\"}}",
                                             ))
                                             .boxed(),
                                         )
@@ -1043,6 +1173,7 @@ kind="claude_inbound"
                 url,
                 seen,
                 release_stream,
+                usage,
                 upstream_task,
                 downstream_task,
             }
@@ -2095,6 +2226,419 @@ kind="claude_inbound"
         }
         harness.close().await;
     }
+    #[tokio::test]
+    async fn exhausted_fable_allowance_routes_to_another_account_without_blocking_sonnet() {
+        assert_fable_scope_routing(json!({
+            "seven_day_fable": {"utilization": 100, "resets_at": null}
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_fable_allowance_routes_to_another_account_without_blocking_sonnet() {
+        assert_fable_scope_routing(json!({"limits": [{
+            "kind": "weekly_scoped", "group": "weekly", "percent": 100,
+            "resets_at": null, "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+            "is_active": false
+        }]})).await;
+    }
+
+    async fn assert_fable_scope_routing(usage: serde_json::Value) {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let AccountConfig::ClaudeHome { path } = &harness.app.config.accounts["grace"] else {
+            unreachable!()
+        };
+        let owner = auth::read(path).unwrap().owner();
+        let usage = serde_json::to_vec(&usage).unwrap();
+        harness
+            .app
+            .observe_claude_reporting_usage("grace", owner, &usage, std::time::Instant::now())
+            .await;
+        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["model"] = "claude-fable-5-2".into();
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen[0].0["authorization"], "Bearer sk-ant-oat01-ada");
+        assert!(harness.app.router.routing_snapshot().await.account_states["grace"].available);
+
+        // A fresh Sonnet conversation may still use the same subscription's shared quota.
+        let session = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let mut headers = native_headers();
+        headers.insert("x-claude-code-session-id", session.parse().unwrap());
+        let body = String::from_utf8(request_body())
+            .unwrap()
+            .replace(SESSION, session);
+        let response = harness.send(body.into_bytes(), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        let seen = forwarded(&harness).await;
+        assert_eq!(seen[1].0["authorization"], "Bearer sk-ant-oat01-grace");
+        harness.close().await;
+    }
+
+    async fn fable_usage(harness: &Harness, percent: u8, observed_at: Instant) {
+        let AccountConfig::ClaudeHome { path } = &harness.app.config.accounts["grace"] else {
+            unreachable!()
+        };
+        let owner = auth::read(path).unwrap().owner();
+        let bytes = serde_json::to_vec(
+            &json!({"seven_day_fable":{"utilization":percent,"resets_at":null}}),
+        )
+        .unwrap();
+        harness
+            .app
+            .observe_claude_reporting_usage("grace", owner, &bytes, observed_at)
+            .await;
+    }
+
+    async fn server_fable_usage(harness: &Harness, first_percent: u8) {
+        let reset = chrono::DateTime::from_timestamp((auth::now() + 3600) as i64, 0)
+            .unwrap()
+            .to_rfc3339();
+        for (first, percent) in [(true, first_percent), (false, 0)] {
+            harness.usage.values.lock().await.insert(first, json!({
+                "five_hour": null, "seven_day": {"utilization": 10, "resets_at": reset},
+                "limits": [{"kind":"weekly_scoped","group":"weekly","percent":percent,"resets_at":reset,
+                    "scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}]
+            }));
+        }
+    }
+
+    fn rejected_fable_request(session: &str) -> (Vec<u8>, HeaderMap) {
+        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["model"] = "claude-fable-5-2".into();
+        let body = String::from_utf8(serde_json::to_vec(&body).unwrap())
+            .unwrap()
+            .replace(SESSION, session);
+        let mut headers = native_headers();
+        headers.insert("x-claude-code-session-id", session.parse().unwrap());
+        headers.insert("x-test-fable-limit", "true".parse().unwrap());
+        (body.into_bytes(), headers)
+    }
+
+    async fn usage_requests(harness: &Harness) -> usize {
+        harness
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, _, path)| path.starts_with("/api/oauth/usage"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn fable_rejection_refreshes_usage_and_retries_only_after_confirmed_exhaustion() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        server_fable_usage(&harness, 100).await;
+        let (body, headers) = rejected_fable_request(SESSION);
+        let response = harness.send(body, headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(inference_accounts(&harness).await, ["grace", "ada"]);
+        assert_eq!(usage_requests(&harness).await, 1);
+        assert!(harness.app.router.routing_snapshot().await.account_states["grace"].available);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_fable_rejection_preserves_the_original_error() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        server_fable_usage(&harness, 25).await;
+        let (body, headers) = rejected_fable_request(SESSION);
+        let response = harness.send(body, headers).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            b"{\"error\":{\"type\":\"rate_limit_error\"}}".as_slice()
+        );
+        assert_eq!(inference_accounts(&harness).await, ["grace"]);
+        assert_eq!(usage_requests(&harness).await, 1);
+        assert!(harness.app.router.routing_snapshot().await.account_states["grace"].available);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn successive_ambiguous_fable_rejections_respect_a_minimum_usage_interval() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        server_fable_usage(&harness, 25).await;
+        for index in 1..=4 {
+            let session = format!("{index:08x}-cccc-4ccc-8ccc-cccccccccccc");
+            let (body, headers) = rejected_fable_request(&session);
+            let response = harness.send(body, headers).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            response.bytes().await.unwrap();
+        }
+        assert_eq!(usage_requests(&harness).await, 1);
+        // This interval must not impose provider backoff on normal shared-quota polling.
+        assert!(harness.app.refresh_claude_usage_at(auth::now(), true).await);
+        assert_eq!(usage_requests(&harness).await, 3);
+        // After the interval, stale non-exhausted metadata must permit a new check.
+        harness
+            .app
+            .claude
+            .reporting_usage
+            .lock()
+            .await
+            .get_mut("grace")
+            .unwrap()
+            .observed_at = Instant::now() - Duration::from_secs(61);
+        server_fable_usage(&harness, 100).await;
+        let (body, headers) = rejected_fable_request("dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        let response = harness.send(body, headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(usage_requests(&harness).await, 4);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn failed_fable_usage_refresh_backs_off_without_poisoning_shared_quota() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        harness.usage.status.store(503, Ordering::Release);
+        for session in [SESSION, "dddddddd-dddd-4ddd-8ddd-dddddddddddd"] {
+            let (body, headers) = rejected_fable_request(session);
+            let response = harness.send(body, headers).await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            response.bytes().await.unwrap();
+        }
+        assert_eq!(inference_accounts(&harness).await, ["grace", "grace"]);
+        assert_eq!(usage_requests(&harness).await, 1);
+        assert!(harness.app.router.routing_snapshot().await.account_states["grace"].available);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn fable_exhaustion_does_not_block_token_counting_or_override_a_model_pin() {
+        let harness = Harness::with(true, StatusCode::OK, |config| {
+            config
+                .pools
+                .get_mut("claude")
+                .unwrap()
+                .model_accounts
+                .insert("claude-fable-5-2".into(), "grace".into());
+        })
+        .await;
+        fable_usage(&harness, 100, Instant::now()).await;
+        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["model"] = "claude-fable-5-2".into();
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/messages/count_tokens?beta=true",
+                harness.url
+            ))
+            .headers(native_headers())
+            .body(serde_json::to_vec(&body).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(forwarded(&harness).await.len(), 1);
+        assert_eq!(
+            forwarded(&harness).await[0].0["authorization"],
+            "Bearer sk-ant-oat01-grace"
+        );
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn latest_fable_observation_follows_the_physical_owner_across_aliases() {
+        let harness = Harness::with(true, StatusCode::OK, |config| {
+            let AccountConfig::ClaudeHome { path } = &config.accounts["grace"] else {
+                unreachable!()
+            };
+            let mut credential = auth::read(path).unwrap();
+            credential.access_token = "sk-ant-oat01-alias".into();
+            credential.refresh_token = "synthetic-alias".into();
+            credential.device_id = "c".repeat(64);
+            let alias = path.parent().unwrap().join("alias");
+            std::fs::create_dir(&alias).unwrap();
+            std::fs::write(
+                alias.join("claude-auth.json"),
+                serde_json::to_vec(&credential).unwrap(),
+            )
+            .unwrap();
+            config
+                .accounts
+                .insert("alias".into(), AccountConfig::ClaudeHome { path: alias });
+            config
+                .pools
+                .get_mut("claude")
+                .unwrap()
+                .members
+                .push("alias".into());
+        })
+        .await;
+        let earlier = Instant::now() - Duration::from_secs(10);
+        fable_usage(&harness, 100, earlier).await;
+        let AccountConfig::ClaudeHome { path } = &harness.app.config.accounts["alias"] else {
+            unreachable!()
+        };
+        let owner = auth::read(path).unwrap().owner();
+        harness
+            .app
+            .observe_claude_reporting_usage(
+                "alias",
+                owner.clone(),
+                br#"{"seven_day_fable":{"utilization":0}}"#,
+                earlier + Duration::from_secs(1),
+            )
+            .await;
+        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["model"] = "claude-fable-5-2".into();
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert!(
+            !harness
+                .app
+                .refresh_fable_quota_after_rejection(
+                    "grace",
+                    &owner,
+                    "claude-fable-5-2",
+                    Instant::now()
+                )
+                .await
+        );
+        assert_eq!(usage_requests(&harness).await, 0);
+        harness
+            .app
+            .observe_claude_reporting_usage(
+                "alias",
+                owner,
+                br#"{"five_hour":null,"seven_day":{"utilization":10},"limits":[]}"#,
+                earlier + Duration::from_secs(2),
+            )
+            .await;
+        let session = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let mut headers = native_headers();
+        headers.insert("x-claude-code-session-id", session.parse().unwrap());
+        let body = String::from_utf8(serde_json::to_vec(&body).unwrap())
+            .unwrap()
+            .replace(SESSION, session);
+        let response = harness.send(body.into_bytes(), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(inference_accounts(&harness).await, ["grace", "grace"]);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_fable_rejections_share_a_single_usage_refresh() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        server_fable_usage(&harness, 100).await;
+        harness.usage.hold.store(true, Ordering::Release);
+        let requests = (1..=8).map(|index| {
+            let session = format!("{index:08x}-cccc-4ccc-8ccc-cccccccccccc");
+            let (body, headers) = rejected_fable_request(&session);
+            harness.send(body, headers)
+        });
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while inference_accounts(&harness).await.len() < 8 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            harness.usage.hold.store(false, Ordering::Release);
+            harness.usage.release.add_permits(8);
+        };
+        let (responses, ()) = tokio::join!(futures_util::future::join_all(requests), release);
+        for response in responses {
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap();
+        }
+        assert_eq!(usage_requests(&harness).await, 1);
+        assert_eq!(
+            inference_accounts(&harness)
+                .await
+                .iter()
+                .filter(|account| *account == "ada")
+                .count(),
+            8
+        );
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn stale_fable_poll_cannot_clear_newer_exhaustion_and_recovery_keeps_the_new_owner() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let earlier = Instant::now();
+        fable_usage(&harness, 100, earlier + Duration::from_secs(1)).await;
+        fable_usage(&harness, 0, earlier).await;
+        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["model"] = "claude-fable-5-2".into();
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        fable_usage(&harness, 0, earlier + Duration::from_secs(2)).await;
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(inference_accounts(&harness).await, ["ada", "ada"]);
+        let session = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let mut headers = native_headers();
+        headers.insert("x-claude-code-session-id", session.parse().unwrap());
+        let body = String::from_utf8(serde_json::to_vec(&body).unwrap())
+            .unwrap()
+            .replace(SESSION, session);
+        let response = harness.send(body.into_bytes(), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(inference_accounts(&harness).await, ["ada", "ada", "grace"]);
+        harness.close().await;
+    }
+
+    #[tokio::test]
+    async fn fable_quota_moves_signed_history_but_never_account_owned_files() {
+        let harness = Harness::new(true, StatusCode::OK).await;
+        let mut body: serde_json::Value = serde_json::from_slice(&request_body()).unwrap();
+        body["model"] = "claude-fable-5-2".into();
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        fable_usage(&harness, 100, Instant::now()).await;
+        let mut owned = body.clone();
+        owned["messages"] = json!([{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_1"}}]}]);
+        let response = harness
+            .send(serde_json::to_vec(&owned).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(inference_accounts(&harness).await, ["grace"]);
+        body["messages"] = json!([{"role":"user","content":"Ada Lovelace says hello."},{"role":"assistant","content":[{"type":"thinking","thinking":"synthetic","signature":"opaque"}]},{"role":"user","content":"continue"}]);
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        fable_usage(&harness, 0, Instant::now()).await;
+        let response = harness
+            .send(serde_json::to_vec(&body).unwrap(), native_headers())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+        assert_eq!(inference_accounts(&harness).await, ["grace", "ada", "ada"]);
+        assert!(harness.app.router.routing_snapshot().await.account_states["grace"].available);
+        harness.close().await;
+    }
+
     #[tokio::test]
     async fn background_usage_poll_reports_fable_without_changing_shared_quota() {
         let harness = Harness::new(true, StatusCode::OK).await;

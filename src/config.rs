@@ -486,11 +486,23 @@ impl Config {
     }
 }
 
+/// Follow existing configuration symlinks and make paths for new configurations absolute.
+pub fn resolve_config_path(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::canonicalize(path).with_context(|| format!("resolve {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::path::absolute(path)?)
+        }
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
 /// Atomically replace a configuration file only after the full loader accepts the candidate.
 /// The temporary file lives beside the target so relative paths resolve from the same directory.
 pub fn write_validated(path: &Path, text: &str) -> Result<()> {
     use std::io::Write;
 
+    let path = resolve_config_path(path)?;
     let parent = path.parent().unwrap_or(Path::new("."));
     let mut temp = tempfile::Builder::new()
         .suffix(".toml")
@@ -498,10 +510,10 @@ pub fn write_validated(path: &Path, text: &str) -> Result<()> {
     temp.write_all(text.as_bytes())?;
     temp.as_file().sync_all()?;
     Config::load(temp.path()).context("validate updated configuration")?;
-    if let Ok(metadata) = fs::metadata(path) {
+    if let Ok(metadata) = fs::metadata(&path) {
         temp.as_file().set_permissions(metadata.permissions())?;
     }
-    temp.persist(path).map_err(|error| error.error)?;
+    temp.persist(&path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -555,6 +567,23 @@ members = ["caller"]
 kind = "inbound"
 "#
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validated_config_writes_preserve_symlinks_and_update_the_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target_directory = directory.path().join("target");
+        fs::create_dir(&target_directory).unwrap();
+        let target = target_directory.join("comradex.toml");
+        fs::write(&target, config_text(None)).unwrap();
+        let alias = directory.path().join("alias.toml");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let updated = config_text(None).replace("[proxy]", "[proxy]\nswitch_at = 75");
+        write_validated(&alias, &updated).unwrap();
+        assert!(alias.is_symlink());
+        assert_eq!(fs::read_to_string(&target).unwrap(), updated);
+        assert_eq!(Config::load(&alias).unwrap().proxy.switch_at, 75);
     }
 
     #[test]

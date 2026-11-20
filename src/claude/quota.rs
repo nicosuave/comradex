@@ -6,6 +6,65 @@ fn header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key)?.to_str().ok()
 }
 
+pub fn is_fable(model: &str) -> bool {
+    model == "claude-fable" || model.starts_with("claude-fable-")
+}
+
+pub fn fable_exhausted(
+    usage: &serde_json::Map<String, serde_json::Value>,
+    model: &str,
+    now: u64,
+) -> bool {
+    if !is_fable(model) {
+        return false;
+    }
+    let exhausted = |window: &serde_json::Value, percent: &str| {
+        if window.get(percent).and_then(serde_json::Value::as_f64) != Some(100.0) {
+            return false;
+        }
+        match window.get("resets_at") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(at)) => chrono::DateTime::parse_from_rfc3339(at)
+                .ok()
+                .is_some_and(|reset| {
+                    let reset_second = reset
+                        .timestamp()
+                        .saturating_add(i64::from(reset.timestamp_subsec_nanos() != 0));
+                    i128::from(reset_second) > i128::from(now)
+                }),
+            _ => false,
+        }
+    };
+    usage
+        .get("seven_day_fable")
+        .is_some_and(|window| exhausted(window, "utilization"))
+        || usage
+            .get("limits")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|limits| {
+                limits.iter().any(|limit| {
+                    if limit["kind"] != "weekly_scoped"
+                        || limit["group"] != "weekly"
+                        || limit
+                            .get("scope")
+                            .and_then(|scope| scope.get("surface"))
+                            .is_some_and(|surface| !surface.is_null())
+                    {
+                        return false;
+                    }
+                    let scope = &limit["scope"]["model"];
+                    let matches = match scope.get("id") {
+                        Some(serde_json::Value::String(id)) => id == model,
+                        None | Some(serde_json::Value::Null) => scope["display_name"]
+                            .as_str()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("Fable")),
+                        _ => false,
+                    };
+                    matches && exhausted(limit, "percent")
+                })
+            })
+}
+
 pub fn shared_reset(headers: &HeaderMap, now: u64) -> Option<u64> {
     // Overage/model-specific rejection does not establish whole-account exhaustion.
     ["5h", "7d"]
@@ -61,6 +120,107 @@ pub fn snapshot(headers: &HeaderMap, now: u64) -> Option<UsageSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fable_usage_is_scoped_to_its_model_and_current_window() {
+        let usage = |percent, reset| {
+            serde_json::json!({
+                "seven_day_fable": {"utilization": percent, "resets_at": reset}
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        };
+        let future = "1970-01-01T00:03:20Z";
+        assert!(fable_exhausted(
+            &usage(100.0, Some(future)),
+            "claude-fable-5-2",
+            100
+        ));
+        assert!(!fable_exhausted(
+            &usage(99.9, Some(future)),
+            "claude-fable-5-2",
+            100
+        ));
+        assert!(!fable_exhausted(
+            &usage(100.0, Some(future)),
+            "claude-fable-5-2",
+            200
+        ));
+        assert!(!fable_exhausted(
+            &usage(100.0, Some("invalid")),
+            "claude-fable-5-2",
+            100
+        ));
+        assert!(fable_exhausted(
+            &usage(100.0, None),
+            "claude-fable-5-2",
+            100
+        ));
+        assert!(!fable_exhausted(
+            &usage(100.0, None),
+            "claude-sonnet-5-5",
+            100
+        ));
+    }
+
+    #[test]
+    fn fable_scopes_do_not_apply_to_another_model_or_surface() {
+        let scoped = |id, name, surface| {
+            serde_json::json!({"limits": [{
+            "kind": "weekly_scoped", "group": "weekly", "percent": 100,
+            "resets_at": null, "scope": {"model": {"id": id, "display_name": name}, "surface": surface}
+        }]}).as_object().unwrap().clone()
+        };
+        let model = "claude-fable-5-2";
+        assert!(fable_exhausted(
+            &scoped(None, "Fable", serde_json::Value::Null),
+            model,
+            100
+        ));
+        assert!(fable_exhausted(
+            &scoped(Some(model), "Fable 5.2", serde_json::Value::Null),
+            model,
+            100
+        ));
+        assert!(!fable_exhausted(
+            &scoped(Some("claude-fable-5-3"), "Fable", serde_json::Value::Null),
+            model,
+            100
+        ));
+        assert!(!fable_exhausted(
+            &scoped(None, "Opus", serde_json::Value::Null),
+            model,
+            100
+        ));
+        assert!(!fable_exhausted(
+            &scoped(
+                None,
+                "Fable",
+                serde_json::json!({"display_name":"Claude Chat"})
+            ),
+            model,
+            100
+        ));
+        let mut other_kind = scoped(None, "Fable", serde_json::Value::Null);
+        other_kind.get_mut("limits").unwrap()[0]["kind"] = "weekly_all".into();
+        assert!(!fable_exhausted(&other_kind, model, 100));
+        let mut other_group = scoped(None, "Fable", serde_json::Value::Null);
+        other_group.get_mut("limits").unwrap()[0]["group"] = "session".into();
+        assert!(!fable_exhausted(&other_group, model, 100));
+    }
+
+    #[test]
+    fn fractional_fable_reset_does_not_expire_early_on_a_whole_second_clock() {
+        let usage = serde_json::json!({"seven_day_fable": {
+            "utilization": 100, "resets_at": "1970-01-01T00:03:20.5Z"
+        }})
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(fable_exhausted(&usage, "claude-fable-5-2", 200));
+        assert!(!fable_exhausted(&usage, "claude-fable-5-2", 201));
+    }
     #[test]
     fn only_explicit_shared_exhaustion_authorizes_rollover() {
         let mut headers = HeaderMap::new();

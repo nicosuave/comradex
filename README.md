@@ -145,10 +145,10 @@ time as Unix seconds. Accounts awaiting usage or sign-in return an unavailable
 result. Token credentials are never returned.
 
 Claude responses also retain provider quota entries in `limits`, including
-Fable's `weekly_scoped` entry, from the latest successful background poll.
+Fable's `weekly_scoped` entry, from the latest successful usage check.
 The literal `seven_day_fable` format is also retained when reported. These
-model-specific windows are reporting data only; they do not affect shared-quota
-routing, failover, or reset warming. Missing, null, or malformed quota entries
+Fable windows guide Fable inference admission and failover without changing the
+subscription's shared quota, other models, or reset warming. Missing, null, or malformed quota entries
 are omitted without discarding valid shared usage. Unknown reset times remain
 unknown. Cached reporting data stays tied to the managed account identity.
 
@@ -445,13 +445,15 @@ comradex service restart
 comradex service uninstall
 ```
 
-`service start` is idempotent: it loads an installed but unloaded LaunchAgent, revives a stopped job, and leaves an already-running or starting job uninterrupted while waiting for its listeners. `service restart` validates the edited configuration before stopping anything, then restarts the LaunchAgent and waits for every listener to answer a health probe. A broken edit fails validation and leaves the running daemon untouched. Both commands use the configuration path recorded in the installed plist regardless of `--config`.
+Each configuration owns a separate LaunchAgent. Pass `--config /path/to/comradex.toml` to service and account commands to select that configuration's daemon. Configuration symlinks resolve to the same service and remain symlinks after account edits. The default configuration normally uses `com.nicosuave.comradex`; other configurations receive a stable label derived from their canonical path. A configuration already installed under the legacy singleton label keeps it during upgrade. If that singleton belongs to another configuration, the default receives its own path-derived label and keeps that label after the legacy service is removed.
+
+`service start` is idempotent: it loads an installed but unloaded LaunchAgent, revives a stopped job, and leaves an already-running or starting job uninterrupted while waiting for its listeners. `service restart` validates the edited configuration before stopping anything, then restarts the selected LaunchAgent and waits for every listener to answer a health probe. A broken edit fails validation and leaves the running daemon untouched. Once the service is selected, both commands read its configuration path from the installed plist.
 
 The installer records the exact executable and configuration paths, validates the generated plist, starts the daemon at login, and writes logs beneath Comradex's state directory. Repeating `service install` with the same service definition starts or waits for the existing job without replacing it. WebSocket TLS uses bundled Mozilla roots, avoiding macOS trust-store enumeration during startup. Installation waits for launchd to report a running PID and verifies every configured listener with a Comradex-specific HTTP probe. If the readiness wait expires while the job is still starting, it remains loaded so macOS can finish launching it; the timeout does not kill and replace it. A failed replacement restores the previous Comradex plist and loaded job when possible.
 
 When the service definition changes, installation waits up to 30 seconds for launchd to remove the old job before replacing the plist. If the old job does not disappear in that time, installation reports its last launchd state and keeps the previous plist. Rollback also waits for job removal before restoring the previous service.
 
-The service manages only `com.nicosuave.comradex`; it does not inspect, stop, or remove OpenCodex or any other relay. Stop OpenCodex first if it owns the same listener port. Codex configuration installation and service installation are separate reversible operations.
+Service operations manage only the selected configuration's LaunchAgent. They do not stop another Comradex configuration, OpenCodex, or any other relay. Each daemon needs its own listener ports, state directory, and credential grants. Stop a conflicting relay first if it owns the same listener port. Codex configuration installation and service installation are separate reversible operations.
 
 `service status` distinguishes a ready daemon, a running process whose listeners are not ready, a starting job, a stopped job, and an unloaded service. It includes the last exit result when available and directs you to `service logs`, which shows up to 40 lines from the final 64 KiB of each stdout and stderr log, their paths, and human-readable modification times. These logs are historical: an old stderr line is not evidence of the current startup failure. Launchctl permission and communication failures are reported as errors instead of being mistaken for an unloaded job.
 
@@ -575,6 +577,8 @@ Prompts, tools, thinking, cache controls, beta headers, and response bytes pass 
 
 New sessions go first to included quota that would otherwise expire unused, shared among the sessions active on each account in the last 30 minutes; see [Quotas, retries, and streaming](#quotas-retries-and-streaming). Accounts past `switch_at` take new sessions only when every other eligible account is past it too. A preferred account still takes new sessions first while below `switch_at`, and a preserved account takes them only from its surplus over an even pace, or when nothing else is eligible. Once placed, a session stays on its account so its prompt cache stays warm. An explicit shared 5-hour or 7-day quota rejection can move a request to another account before its response is forwarded.
 
+Fable inference also skips an account with confirmed exhausted Fable allowance. A Fable rejection without shared-quota evidence refreshes that account's usage before deciding whether portable history can move. Concurrent rejection checks share one refresh, and failed or throttled checks back off. When usage does not confirm exhaustion, the original error is forwarded. Token counting remains independent of the Fable counter; account-owned state, explicit session assignments and model pins retain their required account.
+
 Signed thinking, compaction summaries (including their signatures), and a session with another stream in flight stay with their account until its included 5-hour or 7-day quota is exhausted, then move to another account. Compaction summaries remain usable across accounts. Anthropic drops thinking signed by another organization rather than rejecting the request, so the moved request can lose that earlier reasoning and miss the prompt cache. The new account becomes the conversation and session owner, including when compaction replaces the beginning of the history; later compactions do not move it back when the old window resets. Files, containers, fallback-credit tokens, server-side thread continuations (`thread.type: continue`), encrypted search results, other opaque server state, and configured model pins never move; those requests wait for their account or return an error. Permission errors, ambiguous limits, login problems, and interrupted streams never move a conversation.
 
 Completed `web_fetch` calls with matching inline plain-text results can move with their history. Other server tools and unmatched fetch calls remain account-bound. `diagnostics.previous_message_id` and the native billing-header `cc_prev_req` hint do not pin an account; they pass through unchanged and may lose cache diagnostics after migration. These exceptions were checked with same-account controls and cross-account replay on distinct Claude organizations using Opus: plain-text web fetches replayed successfully, file references returned 404, encrypted search results were rejected, and server-side thread continuation returned `thread_not_found`. Container creation was unavailable during the probe, and fallback-credit tokens were not tested, so their restrictions remain conservative.
@@ -667,10 +671,18 @@ GitHub Actions builds and publishes the Linux artifacts after a version tag is p
 After the tagged Linux release workflow succeeds, publish both signed and notarized macOS architectures and update the Homebrew tap with:
 
 ```sh
-scripts/release_macos_local.sh 0.9.3
+scripts/release_macos_local.sh
 ```
 
-The script requires the tag to point at `HEAD`, refuses uncommitted Rust source changes, uses the first local Developer ID Application identity, and uses the `sidequery-notarization` Keychain profile by default. Override those with `CODESIGN_IDENTITY` or `NOTARY_PROFILE` when necessary. It replaces the matching macOS GitHub release assets, waits for the Homebrew update workflow, and retries that update once if GitHub's asset CDN has not settled.
+The script requires the tag to point at `HEAD`, refuses uncommitted source and packaging changes, uses the first local Developer ID Application identity, and uses the `sidequery-notarization` Keychain profile by default. Override those with `CODESIGN_IDENTITY` or `NOTARY_PROFILE` when necessary. It replaces the matching macOS GitHub release assets, waits for the Homebrew update workflow, and retries that update once if GitHub's asset CDN has not settled.
+
+For a private installation from a clean, committed branch, build only the current Mac's architecture without publishing a release:
+
+```sh
+NOTARY_PROFILE=your-notary-profile scripts/release_macos_local.sh --local
+```
+
+Local mode builds an immutable Git snapshot, signs and notarizes the executable, and writes the archive under `target/local-release/local-<version>-<commit>/`. It does not upload GitHub assets, build the menu app, or update Homebrew. `CARGO_TARGET_DIR` selects the build cache. Packaging replaces the Nix libiconv reference with macOS's system library and rejects other non-system runtime dependencies. Only an `Accepted` notarization result produces an installable archive.
 
 ## Status and statistics
 

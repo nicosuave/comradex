@@ -40,6 +40,8 @@ jobs:
         run: mbx clippy --all-targets --locked -- -D warnings
       - name: Test
         run: mbx test --locked
+      - name: Test local release packaging
+        run: python3 -B -m unittest discover -s tests -p test_local_release.py -v
 
   docker:
     name: Production Docker image

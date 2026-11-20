@@ -21,9 +21,18 @@ not establish an independent inference route. If the route is uncertain, treat
 the affected relay as required by this session. A second Mac can use the same
 relay.
 
-On macOS, service commands target the singleton `com.nicosuave.comradex`
-LaunchAgent. `service start` and `service restart` use its recorded configuration,
-regardless of the CLI's `--config` argument.
+The service rules below describe this checkout. Confirm the installed executable's
+source revision or pinned build receipt before assuming it has configuration-scoped
+service support. Stock v0.19.6 and earlier target the singleton regardless of
+`--config`; an installed binary can lag this checkout even when package versions match.
+
+On macOS builds with scoped service support, `--config` selects the configuration's
+LaunchAgent for service and account-maintenance commands. The default configuration normally uses
+`com.nicosuave.comradex`; other configurations use a label derived from their
+canonical path. An existing legacy singleton stays with its recorded configuration;
+another configuration, including the default, receives its own named service.
+Inspect the actual installed definition before a lifecycle change. `service start`
+and `service restart` read readiness and configuration paths from that definition.
 
 ## Test separately by default
 
@@ -34,10 +43,10 @@ regardless of the CLI's `--config` argument.
   normal client settings on the serving relay.
 - Use inbound accounts when they cover the behavior. Managed-account tests need
   their own native login grant; do not clone or share rotating credentials.
-- Do not use `account add`, `account login`, or `account connect` as isolated
-  setup commands just because `--config` names a test file. They can restart or
-  unload the installed LaunchAgent. Prepare the test config separately; use the
-  test daemon's control protocol for managed login when needed.
+- Account commands can restart or unload the service belonging to their
+  configuration. Keep test configuration and credential paths separate from
+  live paths, including symlink targets. Use the test daemon's control protocol
+  for managed login when needed.
 - Test launchd behavior with a distinct dummy label and isolated paths.
 - Clean up only the exact test processes, jobs, and files created by this task.
 
