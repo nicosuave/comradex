@@ -39,8 +39,9 @@ impl App {
                             .store(now, Ordering::Relaxed);
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     self.stats.refresh_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(account, error = %error, "Claude credential refresh failed");
                     if self.claude.auth.needs_login(path).await {
                         self.router.reauth_required(account).await;
                         self.stats

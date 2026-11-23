@@ -1076,7 +1076,32 @@ fn human_duration(seconds: u64) -> String {
 }
 
 /// Short, plain-language state for one account.
-fn account_state(account: &comradex::config::AccountConfig) -> String {
+///
+/// `live` is `None` when the daemon is unreachable, and `Some(None)` when it is running
+/// but has no state for this account yet; either way the credential files decide.
+fn account_state(
+    account: &comradex::config::AccountConfig,
+    live: Option<Option<&comradex::routing::AccountRoutingStatus>>,
+) -> String {
+    let prefix = match account {
+        comradex::config::AccountConfig::ClaudeHome { .. } => "Claude ",
+        comradex::config::AccountConfig::CodexHome { .. } => "",
+        // Inbound accounts borrow the client's login; there is nothing of ours to sign in.
+        _ => return account_file_state(account),
+    };
+    if let Some(Some(status)) = live {
+        if status.unavailable_reason.as_deref() == Some("needs_login") {
+            return format!("{prefix}sign-in required");
+        }
+        if status.available && status.reauth_required {
+            return format!("{prefix}signed in, renewal needs sign-in");
+        }
+    }
+    account_file_state(account)
+}
+
+/// Sign-in state as far as the credential files on disk can tell.
+fn account_file_state(account: &comradex::config::AccountConfig) -> String {
     match account {
         comradex::config::AccountConfig::ClaudeInbound => "Claude Code client's login".to_owned(),
         comradex::config::AccountConfig::ClaudeHome { path } => {
@@ -1360,20 +1385,45 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
         }
         AccountCommand::List => {
             let config = load_config(config_path)?;
-            let width = config.accounts.keys().map(String::len).max().unwrap_or(0);
-            for (name, account) in &config.accounts {
-                let pools: Vec<&str> = config
-                    .pools
-                    .iter()
-                    .filter(|(_, pool)| pool.members.iter().any(|member| member == name))
-                    .map(|(pool_name, _)| pool_name.as_str())
-                    .collect();
-                let pools = if pools.is_empty() {
-                    "none (unused)".to_owned()
-                } else {
-                    pools.join(", ")
-                };
-                println!("{name:width$}  {:16}  pool {pools}", account_state(account));
+            // The daemon is the authority on sign-in: a credential file can exist on disk
+            // after its refresh grant was rejected, which only the daemon has observed.
+            let live =
+                control::routing_status(&state_dir(&config), &config.proxy.installation_secret)
+                    .ok();
+            let rows: Vec<(&String, String, String)> = config
+                .accounts
+                .iter()
+                .map(|(name, account)| {
+                    let pools: Vec<&str> = config
+                        .pools
+                        .iter()
+                        .filter(|(_, pool)| pool.members.iter().any(|member| member == name))
+                        .map(|(pool_name, _)| pool_name.as_str())
+                        .collect();
+                    let pools = if pools.is_empty() {
+                        "none (unused)".to_owned()
+                    } else {
+                        pools.join(", ")
+                    };
+                    let state = account_state(
+                        account,
+                        live.as_ref()
+                            .map(|routing| routing.account_states.get(name)),
+                    );
+                    (name, state, pools)
+                })
+                .collect();
+            let name_width = rows.iter().map(|(name, ..)| name.len()).max().unwrap_or(0);
+            let state_width = rows
+                .iter()
+                .map(|(_, state, _)| state.len())
+                .max()
+                .unwrap_or(0);
+            for (name, state, pools) in &rows {
+                println!("{name:name_width$}  {state:state_width$}  pool {pools}");
+            }
+            if live.is_none() {
+                println!("(daemon not reachable: sign-in state reflects credential files only)");
             }
             Ok(())
         }
@@ -1918,6 +1968,35 @@ mod tests {
         assert_eq!(
             account_status_state(&account, Some(&status)),
             "sign-in required"
+        );
+    }
+
+    #[test]
+    fn account_list_trusts_daemon_over_credential_file() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("claude-auth.json"),
+            format!(
+                r#"{{"access_token":"sk-ant-oat-test","refresh_token":"r","expires_at":1,"account_uuid":"{u}","organization_uuid":"{u}","device_id":"{d}"}}"#,
+                u = "00000000-0000-4000-8000-000000000000",
+                d = "0".repeat(64),
+            ),
+        )
+        .unwrap();
+        let account = comradex::config::AccountConfig::ClaudeHome {
+            path: directory.path().to_owned(),
+        };
+        let rejected = comradex::routing::AccountRoutingStatus {
+            available: false,
+            unavailable_reason: Some("needs_login".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(account_state(&account, None), "Claude signed in");
+        assert_eq!(account_state(&account, Some(None)), "Claude signed in");
+        assert_eq!(
+            account_state(&account, Some(Some(&rejected))),
+            "Claude sign-in required"
         );
     }
 
