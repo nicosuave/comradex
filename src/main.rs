@@ -1077,11 +1077,10 @@ fn human_duration(seconds: u64) -> String {
 
 /// Short, plain-language state for one account.
 ///
-/// `live` is `None` when the daemon is unreachable, and `Some(None)` when it is running
-/// but has no state for this account yet; either way the credential files decide.
+/// The credential files remain the fallback when the daemon has no state for an account.
 fn account_state(
     account: &comradex::config::AccountConfig,
-    live: Option<Option<&comradex::routing::AccountRoutingStatus>>,
+    status: Option<&comradex::routing::AccountRoutingStatus>,
 ) -> String {
     let prefix = match account {
         comradex::config::AccountConfig::ClaudeHome { .. } => "Claude ",
@@ -1089,15 +1088,18 @@ fn account_state(
         // Inbound accounts borrow the client's login; there is nothing of ours to sign in.
         _ => return account_file_state(account),
     };
-    if let Some(Some(status)) = live {
-        if status.unavailable_reason.as_deref() == Some("needs_login") {
-            return format!("{prefix}sign-in required");
-        }
-        if status.available && status.reauth_required {
-            return format!("{prefix}signed in, renewal needs sign-in");
-        }
-    }
-    account_file_state(account)
+    let Some(status) = status else {
+        return account_file_state(account);
+    };
+
+    let label = match status.unavailable_reason.as_deref() {
+        Some("needs_login") => "sign-in required",
+        Some("login_in_progress") => "login in progress",
+        Some("access_token_rejected") => "access token rejected",
+        _ if status.reauth_required => "signed in, renewal needs sign-in",
+        _ => return account_file_state(account),
+    };
+    format!("{prefix}{label}")
 }
 
 /// Sign-in state as far as the credential files on disk can tell.
@@ -1388,8 +1390,8 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             // The daemon is the authority on sign-in: a credential file can exist on disk
             // after its refresh grant was rejected, which only the daemon has observed.
             let live =
-                control::routing_status(&state_dir(&config), &config.proxy.installation_secret)
-                    .ok();
+                control::routing_status(&state_dir(&config), &config.proxy.installation_secret);
+            let live_routing = live.as_ref().ok();
             let rows: Vec<(&String, String, String)> = config
                 .accounts
                 .iter()
@@ -1407,8 +1409,7 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
                     };
                     let state = account_state(
                         account,
-                        live.as_ref()
-                            .map(|routing| routing.account_states.get(name)),
+                        live_routing.and_then(|routing| routing.account_states.get(name)),
                     );
                     (name, state, pools)
                 })
@@ -1422,8 +1423,10 @@ fn account_command(config_path: &Path, command: AccountCommand) -> Result<()> {
             for (name, state, pools) in &rows {
                 println!("{name:name_width$}  {state:state_width$}  pool {pools}");
             }
-            if live.is_none() {
-                println!("(daemon not reachable: sign-in state reflects credential files only)");
+            if let Err(error) = &live {
+                println!(
+                    "(could not read daemon status: {error:#}; sign-in state reflects credential files only)"
+                );
             }
             Ok(())
         }
@@ -1993,10 +1996,68 @@ mod tests {
         };
 
         assert_eq!(account_state(&account, None), "Claude signed in");
-        assert_eq!(account_state(&account, Some(None)), "Claude signed in");
         assert_eq!(
-            account_state(&account, Some(Some(&rejected))),
+            account_state(&account, Some(&rejected)),
             "Claude sign-in required"
+        );
+    }
+
+    #[test]
+    fn account_list_shows_live_auth_reasons_and_renewal_state() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"test-access-token"}}"#,
+        )
+        .unwrap();
+        let account = comradex::config::AccountConfig::CodexHome {
+            path: directory.path().to_owned(),
+        };
+        let renewal = "signed in, renewal needs sign-in";
+        for (reason, reauth_required, expected) in [
+            (Some("quota"), true, renewal),
+            (Some("temporary_failure"), true, renewal),
+            (Some("login_in_progress"), true, "login in progress"),
+            (
+                Some("access_token_rejected"),
+                false,
+                "access token rejected",
+            ),
+            (Some("needs_login"), true, "sign-in required"),
+            (None, true, renewal),
+        ] {
+            let status = comradex::routing::AccountRoutingStatus {
+                available: reason.is_none(),
+                unavailable_reason: reason.map(str::to_owned),
+                reauth_required,
+                ..Default::default()
+            };
+            assert_eq!(
+                account_state(&account, Some(&status)),
+                expected,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_list_keeps_inbound_login_semantics() {
+        let status = comradex::routing::AccountRoutingStatus {
+            available: false,
+            unavailable_reason: Some("needs_login".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            account_state(&comradex::config::AccountConfig::Inbound, Some(&status)),
+            "Requesting client's login"
+        );
+        assert_eq!(
+            account_state(
+                &comradex::config::AccountConfig::ClaudeInbound,
+                Some(&status)
+            ),
+            "Claude Code client's login"
         );
     }
 
