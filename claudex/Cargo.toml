@@ -1,13 +1,11 @@
 [package]
 name = "claude-codex-server"
-version = "0.2.18"
+version.workspace = true
 edition = "2024"
 license = "MIT"
-description = "A Rust Codex app-server protocol facade for Claude Code"
-readme = "README.md"
-# Distribution is an allowlist: never ship local transcripts, extracted app
-# bundles, private work notes, installation state, or compiler output.
-include = ["src/**", "tests/**", "examples/**", "scripts/**", "protocol/**", "licenses/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "DESKTOP.md", "COMPATIBILITY.md", "LICENSE", "NOTICE"]
+description = "Codex app-server protocol facade and desktop router"
+publish = false
+autobins = false
 
 [dependencies]
 anyhow = "1"
@@ -15,61 +13,19 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
+jsonschema = { version = "0.33", default-features = false }
 libc = "0.2"
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls-manual-roots-no-provider"] }
+# Enable the relay's provider without activating reqwest's ring default.
+rustls.workspace = true
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
-jsonschema = { version = "0.33", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.28"
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "fake-claude"
-path = "tests/fixtures/fake_claude.rs"
-required-features = ["test-backend"]
-
-[[bin]]
-name = "fake-acp"
-path = "tests/fixtures/fake_acp.rs"
-required-features = ["test-backend"]
-
-[[bin]]
-name = "fake-reviewer"
-path = "tests/fixtures/fake_reviewer.rs"
-required-features = ["test-backend"]
-
-[features]
-test-backend = []
-
-[[bin]]
-name = "fake-codex"
-path = "tests/fixtures/fake_codex.rs"
-required-features = ["test-backend"]
-
-[[bin]]
-name = "approval-claude"
-path = "tests/fixtures/approval_claude.rs"
-required-features = ["test-backend"]
-
-# Schema validation runs at facade startup and on every frame in the fake
-# protocol peers; unoptimized it dominates test time.
-[profile.dev.package.jsonschema]
-opt-level = 3
-[profile.dev.package.referencing]
-opt-level = 3
-[profile.dev.package.serde_json]
-opt-level = 3
-[profile.dev.package.fancy-regex]
-opt-level = 3
-[profile.dev.package.regex-automata]
-opt-level = 3
-[profile.dev.package.regex-syntax]
-opt-level = 3
-[profile.dev.package.ahash]
-opt-level = 3

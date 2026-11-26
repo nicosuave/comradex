@@ -15,7 +15,8 @@ fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) {
 
 fn fixture() -> (tempfile::TempDir, Config) {
     let dir = tempfile::tempdir().unwrap();
-    let executable = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin_runtime.sh");
+    let executable =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("claudex/tests/fixtures/plugin_runtime.sh");
     fs::create_dir(dir.path().join("home")).unwrap();
     let config = Config {
         executable,
@@ -421,7 +422,8 @@ async fn claude_facade_smoke(
         claude.is_absolute(),
         "CLAUDE_PLUGIN_SMOKE_EXECUTABLE must be absolute"
     );
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args(["app-server", "--stdio", "--claude"])
         .arg(claude)
         .args([

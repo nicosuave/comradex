@@ -4,6 +4,13 @@
 
 Comradex is a small Rust relay that gives native Codex and Claude Code sticky, quota-aware account pools.
 
+The same executable includes the former Claudex desktop router. It adds native
+Claude Code and ACP chats alongside GPT in Codex Desktop and supports self-hosted
+Responses models such as MLX-Serve. Each chat stays with its original runtime.
+See [Codex Desktop routing](claudex/README.md) for setup and migration.
+The [Claude Desktop gateway](docs/claude-desktop.md) exposes local ACP agents,
+MLX-Serve models, and GPT models from managed ChatGPT subscriptions.
+
 The [macOS menu app](macos/ComradexMenu/README.md) and desktop widget show remaining quota for your Codex and Claude accounts. The menu also shows reset times.
 
 <p>

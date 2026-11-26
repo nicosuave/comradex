@@ -1,4 +1,4 @@
-#![cfg(all(feature = "test-backend", unix))]
+#![cfg(all(feature = "desktop-test-backends", unix))]
 //! The local router between genuine Codex (a deterministic stand-in here) and
 //! the Claude facade, exercised end to end through its stdio transport.
 
@@ -131,7 +131,8 @@ impl Facade {
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_comradex"));
+        command.arg("desktop");
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
         for name in DEPLOYMENT_ENV {
@@ -186,7 +187,8 @@ impl Facade {
         claude: &str,
         model: &str,
     ) -> Child {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_comradex"));
+        command.arg("desktop");
         for name in DEPLOYMENT_ENV {
             command.env_remove(name);
         }
@@ -242,7 +244,8 @@ impl Desktop {
         codex: &str,
         deadline: Duration,
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_comradex"));
+        command.arg("desktop");
         for name in DEPLOYMENT_ENV {
             command.env_remove(name);
         }
@@ -505,7 +508,8 @@ async fn failed_local_codex_exec_does_not_leave_the_router_running() {
     let temp = tempfile::tempdir().unwrap();
     let output = tokio::time::timeout(
         DEADLINE,
-        Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+        Command::new(env!("CARGO_BIN_EXE_comradex"))
+            .arg("desktop")
             .arg("--sock")
             .arg(temp.path().join("absent.sock"))
             .args(["route", "--codex"])
@@ -1466,7 +1470,8 @@ async fn nested_delegation_keeps_one_tree_across_both_harnesses() {
 async fn ssh_proxy_lists_both_backends_and_runs_claude_over_websocket() {
     use tokio_tungstenite::tungstenite::Message;
     let facade = Facade::start(env!("CARGO_BIN_EXE_fake-claude")).await;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_comradex"));
+    command.arg("desktop");
     for name in DEPLOYMENT_ENV {
         command.env_remove(name);
     }
@@ -2416,7 +2421,8 @@ async fn current_desktop_projectless_task_submits_first_and_followup_messages() 
             json!({"threadId":thread,"projectId":""}),
         )
         .await;
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/desktop-turn.json")).unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/desktop-turn.json")).unwrap();
     for _ in 0..2 {
         let mut request = fixture["request"].clone();
         request["threadId"] = json!(thread);
@@ -2661,7 +2667,8 @@ async fn dropped_images_reach_claude_inline_when_steering_and_queueing() {
 
 #[tokio::test]
 async fn other_codex_invocations_run_genuine_codex() {
-    let output = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let output = Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args([
             "route",
             "--codex",

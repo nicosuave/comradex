@@ -11,7 +11,8 @@ use claude_codex_server::ssh_proxy;
 use serde_json::json;
 
 fn helper(port: u16) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_comradex"));
+    command.arg("desktop");
     command
         .args(["sandbox-proxy-connect", "github.com", "22"])
         .env("CLOUDSDK_PROXY_ADDRESS", "localhost")

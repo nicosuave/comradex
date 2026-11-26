@@ -1,4 +1,4 @@
-// Opt-in native integration: bun tests/native_hooks.cjs [facade-binary] [claude-binary]
+// Opt-in native integration: bun claudex/tests/native_hooks.cjs [comradex-binary] [claude-binary]
 // Uses a local canned Anthropic endpoint, generated configuration and no paid API.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -7,7 +7,7 @@ const http = require('node:http');
 const { spawn, execFileSync } = require('node:child_process');
 const { once } = require('node:events');
 
-const facade = path.resolve(process.argv[2] || 'target/debug/claude-codex-server');
+const facade = path.resolve(process.argv[2] || 'target/debug/comradex');
 const native = process.argv[3] || process.env.CLAUDE_BINARY || 'claude';
 // Optional real-network regression; reads refs only, using normal SSH auth.
 const sshRepository = process.env.NATIVE_SSH_REPOSITORY;
@@ -160,7 +160,7 @@ async function main() {
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`, ANTHROPIC_API_KEY: 'local-fixture-not-a-credential',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
   for (const key of ['CLAUDECODE', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODEX_PLUGIN_EXECUTABLE', 'CLAUDE_CODEX_PLUGIN_ARGS']) delete env[key];
-  child = spawn(facade, ['app-server', '--stdio', '--claude', native, '--state-dir', path.join(root, 'state'), '--model', 'opus',
+  child = spawn(facade, ['desktop', 'app-server', '--stdio', '--claude', native, '--state-dir', path.join(root, 'state'), '--model', 'opus',
     '--claude-arg=--strict-mcp-config', '--claude-arg=--tools=Skill,Read,Write,Bash'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
   child.stderr.on('data', bytes => stderr += bytes);
   child.on('exit', (code, signal) => {

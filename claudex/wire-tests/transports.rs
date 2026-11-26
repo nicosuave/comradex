@@ -1,4 +1,4 @@
-#![cfg(feature = "test-backend")]
+#![cfg(feature = "desktop-test-backends")]
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -13,7 +13,8 @@ use tokio_tungstenite::{
 };
 
 async fn start(state: &Path, endpoint: &str) -> (Child, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args([
             "--listen",
             endpoint,
@@ -292,8 +293,9 @@ async fn desktop_bootstrap_and_proxy_carry_websocket_chat_and_approval() {
         .tempdir_in("/tmp")
         .unwrap();
     let sockets = temp.path().join("sockets");
-    let binary = env!("CARGO_BIN_EXE_claude-codex-server");
+    let binary = env!("CARGO_BIN_EXE_comradex");
     let mut server = Command::new(binary)
+        .arg("desktop")
         .args([
             "-c",
             "features.code_mode_host=true",
@@ -322,6 +324,7 @@ async fn desktop_bootstrap_and_proxy_carry_websocket_chat_and_approval() {
     assert!(ready.starts_with("Listening on unix://"), "{ready}");
     assert!(!temp.path().join("real-codex-do-not-touch").exists());
     let mut proxy = Command::new(binary)
+        .arg("desktop")
         .args(["app-server", "proxy", "--sock"])
         .arg(sockets.join("app-server-control.sock"))
         .env_remove("CLAUDE_CODEX_SOCKET_DIR")

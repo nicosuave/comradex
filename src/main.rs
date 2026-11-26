@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -39,6 +40,8 @@ enum CommandName {
     Init,
     Check,
     Serve,
+    /// Manage Codex Desktop routing, native Claude and ACP sessions, and local models.
+    Desktop,
     Install {
         /// Claude settings.json to update (only for a Claude listener)
         #[arg(long, conflicts_with_all = ["codex_config", "desktop", "restart_codex"])]
@@ -242,8 +245,26 @@ enum ServiceCommand {
     Restart,
 }
 
+fn main() -> Result<()> {
+    let mut arguments = std::env::args_os();
+    let executable = arguments.next().context("Missing executable name")?;
+    let mut arguments = arguments.peekable();
+    // The local desktop launch has to fork before Tokio starts worker threads.
+    if arguments
+        .peek()
+        .is_some_and(|arg| arg == claude_codex_server::cli::DESKTOP_COMMAND)
+    {
+        arguments.next();
+    } else if !Path::new(&executable).file_name().is_some_and(|name| {
+        name == OsStr::new("claude-codex-server") || name == OsStr::new("claudex")
+    }) {
+        return relay_main();
+    }
+    claude_codex_server::cli::run_cli(std::iter::once(executable).chain(arguments))
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn relay_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -256,6 +277,7 @@ async fn main() -> Result<()> {
         None => default_config_path(std::env::var_os("HOME"))?,
     };
     match cli.command {
+        CommandName::Desktop => bail!("Use comradex desktop before any desktop options"),
         CommandName::Init => init(&config_path),
         CommandName::Check => {
             let c = load_config(&config_path)?;
@@ -587,6 +609,9 @@ async fn serve_once(path: &Path) -> Result<bool> {
     }
     if let Some(listener) = config.proxy.desktop.clone() {
         tasks.spawn(app.clone().run_desktop_listener(listener));
+    }
+    if let Some(listener) = config.proxy.claude_desktop.clone() {
+        tasks.spawn(app.clone().run_claude_desktop_listener(listener));
     }
     let background_config = config.clone();
     let background_router = router.clone();

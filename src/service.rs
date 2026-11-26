@@ -12,6 +12,7 @@ use std::{
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use claude_codex_server::cli::stable_executable_path;
 
 const LABEL: &str = "com.nicosuave.comradex";
 // Replay spooling plus the configured bridge/session ceilings can legitimately
@@ -32,6 +33,13 @@ fn configured_listener_addresses(config: &crate::config::Config) -> Vec<SocketAd
         .values()
         .chain(config.proxy.desktop.iter())
         .map(|listener| listener.address)
+        .chain(
+            config
+                .proxy
+                .claude_desktop
+                .iter()
+                .map(|listener| listener.address),
+        )
         .collect()
 }
 
@@ -360,7 +368,9 @@ pub fn while_daemon_stopped<T>(action: impl FnOnce() -> Result<T>) -> Result<T> 
         let config = crate::config::Config::load(&config_path)?;
         let listener_addresses: Vec<_> = configured_listener_addresses(&config);
         let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
-        if config.proxy.desktop.is_some() && service_nonce.is_none() {
+        if (config.proxy.desktop.is_some() || config.proxy.claude_desktop.is_some())
+            && service_nonce.is_none()
+        {
             bail!(
                 "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
             )
@@ -506,7 +516,9 @@ fn installed_service() -> Result<InstalledService> {
         bail!("installed service configuration requires fixed non-zero listener ports")
     }
     let service_nonce = plist_string_after(&plist, "<key>COMRADEX_SERVICE_NONCE</key><string>");
-    if config.proxy.desktop.is_some() && service_nonce.is_none() {
+    if (config.proxy.desktop.is_some() || config.proxy.claude_desktop.is_some())
+        && service_nonce.is_none()
+    {
         bail!(
             "Desktop readiness requires a service nonce; run `comradex service install` to update the legacy LaunchAgent"
         )
@@ -595,37 +607,6 @@ fn plist_program_config(plist: &str) -> Option<PathBuf> {
 fn plist_executable(plist: &str) -> Option<PathBuf> {
     let array = plist.split("<key>ProgramArguments</key>").nth(1)?;
     plist_string_after(array, "<string>").map(PathBuf::from)
-}
-
-/// Homebrew keg paths (`<prefix>/Cellar/<formula>/<version>/...`) are deleted
-/// when the formula is upgraded, which strands the LaunchAgent with a missing
-/// executable. Prefer the version-independent `<prefix>/opt/<formula>/...`
-/// symlink when it resolves to the same binary.
-fn stable_executable_path(canonical: PathBuf) -> PathBuf {
-    let components: Vec<_> = canonical.components().collect();
-    let Some(cellar) = components
-        .iter()
-        .position(|component| component.as_os_str() == "Cellar")
-    else {
-        return canonical;
-    };
-    // <prefix>/Cellar/<formula>/<version>/<rest...>
-    if components.len() < cellar + 4 {
-        return canonical;
-    }
-    let mut candidate = PathBuf::new();
-    for component in &components[..cellar] {
-        candidate.push(component);
-    }
-    candidate.push("opt");
-    candidate.push(components[cellar + 1]);
-    for component in &components[cellar + 3..] {
-        candidate.push(component);
-    }
-    match fs::canonicalize(&candidate) {
-        Ok(resolved) if resolved == canonical => candidate,
-        _ => canonical,
-    }
 }
 
 fn plist_string_after(plist: &str, marker: &str) -> Option<String> {

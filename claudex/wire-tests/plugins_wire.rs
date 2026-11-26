@@ -15,7 +15,8 @@ struct Client {
 }
 impl Client {
     async fn start(root: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+            .arg("desktop")
             .args(["app-server", "--stdio", "--claude"])
             .arg(root.join("claude"))
             .arg("--state-dir")

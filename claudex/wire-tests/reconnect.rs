@@ -1,4 +1,4 @@
-#![cfg(all(feature = "test-backend", unix))]
+#![cfg(all(feature = "desktop-test-backends", unix))]
 
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Stdio, time::Duration};
@@ -30,7 +30,8 @@ impl Server {
             .tempdir_in("/tmp")
             .unwrap();
         let socket = state.path().join("rpc.sock");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+            .arg("desktop")
             .args(["app-server", "--claude", env!("CARGO_BIN_EXE_fake-claude")])
             .arg("--approval-timeout-seconds")
             .arg(seconds.to_string())

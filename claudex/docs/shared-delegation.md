@@ -136,5 +136,5 @@ instruction overrides, boundary injection and follow-up recall.
 ```sh
 CLAUDEX_NATIVE_CODEX=/absolute/path/to/codex \
 CLAUDEX_NATIVE_CLAUDE=/absolute/path/to/claude \
-mbx test --locked --features test-backend --test router native_shared_delegation -- --ignored --nocapture
+mbx test --locked --features desktop-test-backends --test desktop-router native_shared_delegation -- --ignored --nocapture
 ```

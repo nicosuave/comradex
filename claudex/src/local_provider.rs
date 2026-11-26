@@ -7,6 +7,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -145,7 +146,16 @@ impl Config {
     pub async fn refresh(&self) -> Result<Self> {
         self.validate_endpoint()?;
         let mut config = self.clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let client = reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
             .timeout(Duration::from_secs(3))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;

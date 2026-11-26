@@ -1,21 +1,20 @@
-# Claudex
+# Codex Desktop routing
 
-Use Claude Code alongside Codex in the same desktop window. Claudex adds Claude
+Use Claude Code alongside Codex in the same desktop window. The former Claudex router adds Claude
 models to the model picker, combines both backends' chats in the sidebar, and
 routes each conversation to its native runtime. GPT chats run through genuine
 Codex; Claude chats run through your installed, authenticated Claude Code.
 
 The router also lets Codex and Claude delegate work to each other through shared
 agent tools. You can connect from another computer over SSH, use other agents
-through ACP, or run Claudex as a standalone Codex-compatible app-server.
+through ACP, or run the standalone Codex-compatible app-server.
 
-Claudex is written in Rust. It does not modify the desktop app bundle or replace
-either agent's authentication.
+The router ships with Comradex and preserves each agent’s authentication and the desktop app bundle.
 
 ## Install
 
 ```sh
-brew install nicosuave/tap/claudex
+brew install nicosuave/tap/comradex
 ```
 
 You need macOS, the Codex desktop app, and Claude Code. Sign in with
@@ -23,7 +22,7 @@ You need macOS, the Codex desktop app, and Claude Code. Sign in with
 sessions require Claude Code 2.1.294 or newer.
 
 Prebuilt macOS and Linux binaries for ARM64 and x86-64, with SHA-256 checksums,
-are on [GitHub Releases](https://github.com/nicosuave/claudex/releases).
+are on [GitHub Releases](https://github.com/nicosuave/comradex/releases).
 macOS binaries are Developer ID signed and notarized. Desktop installation is
 macOS-only; Linux can run the standalone app-server.
 
@@ -33,7 +32,7 @@ Set up the Claude service and local desktop router as your login user, without
 `sudo`:
 
 ```sh
-claudex install --no-ssh
+comradex desktop install --no-ssh
 ```
 
 Quit and reopen the desktop app once so it picks up the router. Stay on the
@@ -42,12 +41,12 @@ ordinary local connection, start a new chat, and choose a Claude model such as
 same window. This setup does not require Remote Login.
 
 To also create a separate Claude-only connection, enable **System Settings >
-General > Sharing > Remote Login** for your user and run `claudex install`
+General > Sharing > Remote Login** for your user and run `comradex desktop install`
 without `--no-ssh`. Select `claude-codex-local` in **Settings > Connections**.
 See [desktop setup](DESKTOP.md#install) for identity-file selection and other
 connection settings.
 
-## Ways to use Claudex
+## Ways to use desktop routing
 
 | Mode | Use it for |
 | --- | --- |
@@ -82,7 +81,7 @@ conversations and executes its own tools.
 
 The installer configures `CODEX_CLI_PATH` for the desktop login session and
 restores it at each login. The generated launcher at
-`~/Library/Application Support/claude-codex/router/codex` runs `claudex route`
+`~/Library/Application Support/claude-codex/router/codex` runs `comradex desktop route`
 for desktop app-server launches and genuine Codex for other commands. The
 default is the Codex binary bundled with the desktop;
 `CLAUDE_CODEX_ROUTER_CODEX` can select another executable.
@@ -93,7 +92,7 @@ creation, model selection, metadata, and reconnection behavior. Claude
 [prompt-bar predictions](docs/prompt-predictions.md) also use the router.
 
 To add self-hosted Responses-compatible models to the same picker, use
-`claudex local-provider`; `claudex mlx` is the MLX-Serve preset. Reopen the
+`comradex desktop local-provider`; `comradex desktop mlx` is the MLX-Serve preset. Reopen the
 desktop app to load the models. These chats use genuine Codex's tools and
 permissions with direct inference; GPT, Claude and ACP routing stay available.
 See [self-hosted setup](DESKTOP.md#self-hosted-models-in-the-local-picker).
@@ -121,7 +120,7 @@ arguments, permission boundaries, and lifecycle behavior.
 
 ## Connect from another computer
 
-On the remote Mac, install Claudex and run `claudex install` as the user you
+On the remote Mac, install Claudex and run `comradex desktop install` as the user you
 connect to. Enable Remote Login there, then reconnect that Mac's ordinary SSH
 connection in the client desktop. GPT and Claude models appear together using
 your existing SSH authentication and Codex home.
@@ -140,7 +139,7 @@ local desktop picker, use [local ACP setup](DESKTOP.md#acp-models-in-the-local-p
 For a separate desktop connection, use:
 
 ```sh
-claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
+comradex desktop install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
 ```
 
 Select `claude-codex-opencode` in **Settings > Connections**. Each agent gets its
@@ -178,30 +177,18 @@ uses `dontAsk`. MCP integrations and hooks remain trusted services outside the
 Bash sandbox. See [sandbox settings](DESKTOP.md#development-sandbox-settings)
 and [COMPATIBILITY.md](COMPATIBILITY.md) for exact behavior and limitations.
 
-## Updates and troubleshooting
-
-Wait for active chats to finish, then update both the Homebrew command and the
-separate binary used by the service:
+## Troubleshooting
 
 ```sh
-brew upgrade nicosuave/tap/claudex
-claudex install --no-ssh
-```
-
-If you use the dedicated SSH connection, run `claudex install` without
-`--no-ssh` instead. Reconnect remote desktop connections after upgrading.
-Reinstallation preserves conversations and the dedicated SSH identity.
-
-```sh
-claudex doctor             # Check the installed setup; makes no model request
-claudex service status     # Show installed, loaded, and ready state
-claudex service restart    # Restart an idle service
+comradex desktop doctor             # Check the installed setup; makes no model request
+comradex desktop service status     # Show installed, loaded, and ready state
+comradex desktop service restart    # Restart an idle service
 ```
 
 If Claude models are missing after the first install, quit and reopen the
 desktop app. Logs live under
 `~/Library/Application Support/claude-codex/logs/`: `router.log` for routing and
-`server.log` for the Claude service. `claudex uninstall` removes the managed
+`server.log` for the Claude service. `comradex desktop uninstall` removes the managed
 service and routing setup while retaining conversations, binaries, logs, and
 identity files. See [service management](DESKTOP.md#manage-the-service).
 
@@ -210,15 +197,15 @@ identity files. See [service management](DESKTOP.md#manage-the-service).
 For a client that accepts an app-server command:
 
 ```sh
-claudex app-server --stdio
+comradex desktop app-server --stdio
 ```
 
 This serves Claude directly, without the combined Codex router. Other agents can
 use the same interface:
 
 ```sh
-claudex app-server --stdio --acp-agent opencode --acp-arg=acp --provider-name OpenCode
-claudex app-server --stdio --acp-agent gemini --acp-arg=--experimental-acp --provider-name Gemini
+comradex desktop app-server --stdio --acp-agent opencode --acp-arg=acp --provider-name OpenCode
+comradex desktop app-server --stdio --acp-agent gemini --acp-arg=--experimental-acp --provider-name Gemini
 ```
 
 The facade targets the vendored Codex CLI **0.170.0** schema. Unsupported methods
@@ -239,4 +226,4 @@ state storage, a JSON-RPC client exchange, and verification commands.
 | [Native loading and permissions](docs/native-skill-settings-boundary.md) | Claude skills, settings, file guards, and sandbox boundaries |
 | [App-server development](docs/app-server.md) | Source builds, protocol examples, transports, tests, and implementation references |
 | [Desktop integration audit](docs/desktop-integration-audit.md) | Recorded transport and live-model evidence, with validation limits |
-| [Releasing](docs/releasing.md) | CI, release artifacts, macOS signing, and Homebrew delivery |
+| [Releasing](../README.md#releasing) | CI, release artifacts, macOS signing, and Homebrew delivery |

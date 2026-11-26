@@ -88,7 +88,8 @@ async fn native_guardian_workspace_payload_runs_without_manual_approvals() {
     let workspace = fixture.path().join("workspace");
     let state = fixture.path().join("state");
     std::fs::create_dir(&workspace).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args(["app-server", "--stdio", "--model", "opus", "--state-dir"])
         .arg(&state)
         .args([
@@ -233,7 +234,8 @@ async fn native_auto_review_handles_different_ssh_commands_without_manual_prompt
     let workspace = fixture.path().join("workspace");
     let state = fixture.path().join("state");
     std::fs::create_dir(&workspace).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args(["app-server", "--stdio", "--model", "opus", "--state-dir"])
         .arg(&state)
         .args([
@@ -320,7 +322,8 @@ async fn native_auto_review_handles_different_ssh_commands_without_manual_prompt
 #[ignore = "requires installed authenticated Claude"]
 async fn native_resume_updates_instructions_and_preserves_history() {
     let fixture = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args(["app-server", "--stdio", "--model", "opus", "--state-dir"])
         .arg(fixture.path().join("state"))
         .args([

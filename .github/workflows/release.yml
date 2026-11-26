@@ -36,14 +36,14 @@ jobs:
           manifest_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           test "${tag_version}" = "${manifest_version}"
       - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --bin comradex --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           artifact="comradex-${version}-linux-${{ matrix.arch }}.tar.gz"
-          tar -C target/${{ matrix.target }}/release -czf "${artifact}" comradex
+          bash scripts/package-archive.sh "target/${{ matrix.target }}/release/comradex" "${artifact}"
           sha256sum "${artifact}" > "${artifact}.sha256"
       - name: Upload artifact
         uses: actions/upload-artifact@v7

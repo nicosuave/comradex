@@ -25,7 +25,7 @@ DEADLINE = float(os.environ.get("E2E_DEADLINE", "240"))
 class Facade:
     def __init__(self, binary, args, state):
         self.process = subprocess.Popen(
-            [binary, "app-server", "--stdio", "--state-dir", state, *args],
+            [binary, "desktop", "app-server", "--stdio", "--state-dir", state, *args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,

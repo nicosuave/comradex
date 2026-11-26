@@ -1,4 +1,4 @@
-#![cfg(feature = "test-backend")]
+#![cfg(feature = "desktop-test-backends")]
 
 use serde_json::{Value, json};
 use std::{
@@ -283,7 +283,8 @@ impl Client {
 
     async fn spawn_with_env(state: &Path, extra: &[&str], env: &[(&str, &Path)]) -> Self {
         schemas();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+            .arg("desktop")
             .args([
                 "app-server",
                 "--stdio",
@@ -798,7 +799,8 @@ async fn installed_desktop_turn_builder_payload_submits_first_and_followup_turns
             json!({"threadId":thread,"projectId":""}),
         )
         .await;
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/desktop-turn.json")).unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("../tests/fixtures/desktop-turn.json")).unwrap();
     for summary in ["detailed", "none", "auto", "concise"] {
         let mut request = fixture["request"].clone();
         request["threadId"] = json!(thread);
@@ -821,7 +823,7 @@ async fn read_only_desktop_helpers_are_tool_free_and_cannot_change_mode() {
     let state = tempfile::tempdir().unwrap();
     let home = state.path().join("codex-home");
     std::fs::create_dir(&home).unwrap();
-    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_scope.sh");
+    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("claudex/tests/fixtures/codex_scope.sh");
     let mut client = Client::spawn_with_env(
         state.path(),
         &[],
@@ -1311,7 +1313,7 @@ async fn thread_scoped_hooks_and_mcp_status_use_the_thread_workspace() {
     let state = tempfile::tempdir().unwrap();
     let home = state.path().join("codex-home");
     std::fs::create_dir(&home).unwrap();
-    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_scope.sh");
+    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("claudex/tests/fixtures/codex_scope.sh");
     let mut client = Client::spawn_with_env(
         state.path(),
         &[],
@@ -2408,7 +2410,8 @@ async fn desktop_active_resume_from_second_client_keeps_running_settings() {
         .tempdir_in("/tmp")
         .unwrap();
     let endpoint = format!("unix-lines://{}", state.path().join("rpc.sock").display());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args([
             "--listen",
             &endpoint,

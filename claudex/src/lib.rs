@@ -3,6 +3,7 @@ pub mod approvals;
 pub mod attachments;
 pub mod auto_review;
 pub mod backend;
+pub mod cli;
 pub mod commands;
 #[cfg(unix)]
 pub mod delegation;

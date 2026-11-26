@@ -15,24 +15,24 @@ executable. Claude uses its normal configured authentication. The facade neither
 reads credentials nor changes login settings.
 
 ```sh
-mbx build --locked --bin claude-codex-server
-./target/debug/claude-codex-server app-server --stdio
+mbx build --locked --bin comradex
+./target/debug/comradex desktop app-server --stdio
 ```
 
-Use `cargo build` if Boxington (`mbx`) is unavailable. The Cargo target is named
-`claude-codex-server`; release archives and Homebrew expose it as `claudex`.
+Use `cargo build` if Boxington (`mbx`) is unavailable. The facade is a command
+of the `comradex` executable.
 The default model is `sonnet`; override it with `--model opus` or a Claude model
 identifier.
 
 For a client that lets you configure its app-server command, set the executable
-to the built binary and arguments to `app-server --stdio`. For desktop
+to the built binary and arguments to `desktop app-server --stdio`. For desktop
 connections, see [desktop setup](../DESKTOP.md).
 
 Other transports:
 
 ```sh
-./target/debug/claude-codex-server --listen ws://127.0.0.1:4510
-./target/debug/claude-codex-server --listen unix:///tmp/claude-codex.sock
+./target/debug/comradex desktop --listen ws://127.0.0.1:4510
+./target/debug/comradex desktop --listen unix:///tmp/claude-codex.sock
 ```
 
 WebSockets accept loopback IP bindings only. All browser Origin headers are
@@ -126,8 +126,8 @@ plugin services using the existing plugin registry and authentication; see
 ## Verification
 
 ```sh
-mbx test --locked --all-targets --features test-backend
-mbx clippy --locked --all-targets --features test-backend -- -D warnings
+mbx test --workspace --locked --all-targets --features desktop-test-backends
+mbx clippy --workspace --locked --all-targets --features desktop-test-backends -- -D warnings
 cargo fmt --all -- --check
 ```
 
@@ -135,7 +135,7 @@ The deterministic suite drives the real facade executable with fake native
 backends. It checks responses, notifications, and approvals against the vendored
 schema, plus stream reconciliation, interruption, background continuations,
 restart, fork metadata, history pagination, socket transports, routing, and shared
-delegation. Fake backends are available only with the `test-backend` feature.
+delegation. Fake backends are available only with the `desktop-test-backends` feature.
 They do not prove that native OS sandboxing is enforced or that the desktop
 renders every interaction correctly.
 
@@ -146,15 +146,16 @@ and [guide](shared-delegation.md#verification).
 
 On a heavily loaded host, use `RUST_TEST_THREADS=1 TOKIO_WORKER_THREADS=2`.
 If the local `mbx` test launcher stalls, compile with
-`mbx test --no-run --all-targets --features test-backend`, then run the reported
+`mbx test --no-run --all-targets --features desktop-test-backends`, then run the reported
 test executables directly; this preserves compiler caching.
 
 The live smoke example exercises inference, recall after restarting the facade,
 and a fork that remains anchored while the source conversation advances:
 
 ```sh
-mbx build --locked --bin claude-codex-server --example smoke
-./target/debug/examples/smoke ./target/debug/claude-codex-server
+mbx build --locked --bin comradex
+mbx build --locked -p claude-codex-server --example smoke
+./target/debug/examples/smoke ./target/debug/comradex
 ```
 
 To also verify a real command approval, add `--exercise-approval`. The example
@@ -194,5 +195,5 @@ See the [0.170 conformance notes](codex-0.170-conformance.md) for changes since
 0.166.0.
 
 CI runs formatting, Clippy, and deterministic tests on Linux and macOS. See
-[releasing](releasing.md) for the tagged Linux workflow, local macOS signing,
+[releasing](../../README.md#releasing) for the tagged Linux workflow, local macOS signing,
 and Homebrew update process.

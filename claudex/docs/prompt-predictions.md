@@ -92,7 +92,7 @@ The native test makes real Claude requests and requires a normal authenticated
 Claude installation:
 
 ```sh
-mbx test --locked --features test-backend --test history_wire \
+mbx test --locked --features desktop-test-backends --test desktop-history-wire \
   native_prediction_reuses_cache_without_tools_or_hooks -- --ignored --nocapture
 ```
 

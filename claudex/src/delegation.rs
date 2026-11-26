@@ -433,7 +433,7 @@ impl Bridge {
     }
     pub fn config(&self) -> Result<Value> {
         Ok(
-            json!({"command":std::env::current_exe()?,"args":["mcp-bridge","--socket",self.socket],
+            json!({"command":std::env::current_exe()?,"args":[crate::cli::DESKTOP_COMMAND,"mcp-bridge","--socket",self.socket],
             "tool_timeout_sec":120,"enabled":true}),
         )
     }
