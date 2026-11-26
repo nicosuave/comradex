@@ -53,8 +53,8 @@ workspace-write and automatic-review payload, rather than substituting full acce
 
 ## Native self-hosted providers
 
-The opt-in `claudex local-provider` configuration adds a Responses-compatible
-endpoint to the merged picker; `claudex mlx` supplies the MLX-Serve preset.
+The opt-in `comradex desktop local-provider` configuration adds a Responses-compatible
+endpoint to the merged picker; `comradex desktop mlx` supplies the MLX-Serve preset.
 These models stay on genuine Codex. Only their start/resume/fork
 requests receive the local provider and generated model catalog; GPT's global
 provider, catalog and inference URL are retained. The catalog uses the server's

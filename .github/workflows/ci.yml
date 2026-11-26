@@ -37,9 +37,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
-        run: mbx clippy --all-targets --locked -- -D warnings
+        run: mbx clippy --workspace --all-targets --locked --features desktop-test-backends -- -D warnings
       - name: Test
-        run: mbx test --locked
+        run: mbx test --workspace --all-targets --locked --features desktop-test-backends
 
   docker:
     name: Production Docker image

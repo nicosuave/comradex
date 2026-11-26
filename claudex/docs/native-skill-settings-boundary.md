@@ -96,7 +96,7 @@ configuration, with no paid calls:
 
 ```sh
 mbx build --locked --bin claude-codex-server
-bun tests/native_hooks.cjs target/debug/claude-codex-server /path/to/claude
+bun claudex/tests/native_hooks.cjs target/debug/comradex /path/to/claude
 ```
 
 It exercises the actual facade and native CLI across one persisted session:

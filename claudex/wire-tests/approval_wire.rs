@@ -1,4 +1,4 @@
-#![cfg(feature = "test-backend")]
+#![cfg(feature = "desktop-test-backends")]
 
 use serde_json::{Value, json};
 use std::{path::Path, process::Stdio, time::Duration};
@@ -17,7 +17,8 @@ struct Client {
 
 impl Client {
     async fn spawn(state: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+            .arg("desktop")
             .args([
                 "app-server",
                 "--stdio",
@@ -418,7 +419,8 @@ async fn native_user_review_after_auto_selection_prompts_before_mcp_execution() 
     let note_path = fixture.path().join("approved-note.txt");
     let nonce = uuid::Uuid::new_v4().to_string();
     let mcp = json!({"mcpServers":{"approval_fixture":{"command":env!("CARGO_BIN_EXE_approval-claude"),"args":["--mcp-fixture",note_path]}}});
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+        .arg("desktop")
         .args(["app-server", "--stdio", "--model", "opus", "--state-dir"])
         .arg(fixture.path().join("state"))
         .args([

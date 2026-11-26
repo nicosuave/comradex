@@ -1,5 +1,8 @@
 claude-codex-server
 
+The desktop router was imported into Comradex from
+https://github.com/nicosuave/claudex/commit/4e5079f7bce81409358b8990d870fbfc2462df5e.
+
 protocol/codex-0.170.0.json is generated from OpenAI Codex 0.170.0.
 OpenAI Codex
 Copyright 2025 OpenAI

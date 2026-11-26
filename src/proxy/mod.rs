@@ -4,6 +4,7 @@ mod accepted_retry_tests;
 #[cfg(test)]
 mod account_pin_tests;
 mod claude;
+mod claude_desktop;
 #[cfg(test)]
 mod compression_tests;
 mod context;
@@ -8269,7 +8270,7 @@ mod tests {
         direct_test_app_with_upstream(dir, ProxyConfig::default().upstream)
     }
 
-    fn direct_test_app_with_upstream(
+    pub(super) fn direct_test_app_with_upstream(
         dir: &std::path::Path,
         upstream: String,
     ) -> (Arc<App>, ListenerConfig, Arc<Router>, Arc<Stats>) {

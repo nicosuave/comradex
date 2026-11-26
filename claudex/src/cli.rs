@@ -1,20 +1,24 @@
-use std::{path::PathBuf, time::Duration};
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use claude_codex_server::{
+use crate as claude_codex_server;
+use crate::{
     backend::{BackendConfig, BackendProtocol},
     server::{Event, Server, ServerConfig},
     store::Store,
     transport,
 };
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+pub const DESKTOP_COMMAND: &str = "desktop";
 
 #[derive(Parser)]
 #[command(
     version = concat!("0.170.0 (claude-codex-server ", env!("CARGO_PKG_VERSION"), "; core protocol subset)"),
-    name = "claude-codex-server",
+    name = "desktop",
+    bin_name = "comradex desktop",
     about = "Codex app-server protocol over Claude Code's streaming subprocess"
 )]
 struct Args {
@@ -188,8 +192,8 @@ enum AppServerAction {
     Proxy,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+pub fn run_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
+    let args = Args::parse_from(arguments);
     #[cfg(unix)]
     if let Some(Command::Route {
         codex,
@@ -535,4 +539,35 @@ fn termination() -> Result<impl std::future::Future<Output = ()>> {
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
     })
+}
+
+/// Homebrew keg paths (`<prefix>/Cellar/<formula>/<version>/...`) are deleted
+/// when the formula is upgraded, which strands the LaunchAgent with a missing
+/// executable. Prefer the version-independent `<prefix>/opt/<formula>/...`
+/// symlink when it resolves to the same binary.
+pub fn stable_executable_path(canonical: PathBuf) -> PathBuf {
+    let components: Vec<_> = canonical.components().collect();
+    let Some(cellar) = components
+        .iter()
+        .position(|component| component.as_os_str() == "Cellar")
+    else {
+        return canonical;
+    };
+    // <prefix>/Cellar/<formula>/<version>/<rest...>
+    if components.len() < cellar + 4 {
+        return canonical;
+    }
+    let mut candidate = PathBuf::new();
+    for component in &components[..cellar] {
+        candidate.push(component);
+    }
+    candidate.push("opt");
+    candidate.push(components[cellar + 1]);
+    for component in &components[cellar + 3..] {
+        candidate.push(component);
+    }
+    match std::fs::canonicalize(&candidate) {
+        Ok(resolved) if resolved == canonical => candidate,
+        _ => canonical,
+    }
 }

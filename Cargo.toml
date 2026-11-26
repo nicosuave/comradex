@@ -1,7 +1,18 @@
+[workspace]
+members = ["claudex"]
+resolver = "3"
+
+[workspace.package]
+version = "0.19.7"
+
+[workspace.dependencies]
+rustls = { version = "=0.23.36", default-features = false, features = ["aws_lc_rs", "std"] }
+
 [package]
 name = "comradex"
-version = "0.19.7"
+version.workspace = true
 edition = "2024"
+default-run = "comradex"
 license = "MIT OR Apache-2.0"
 description = "A bounded, sticky account-pool router for native Codex and Claude Code traffic"
 repository = "https://github.com/nicosuave/comradex"
@@ -29,6 +40,7 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-linux-x8
 [features]
 default = []
 memory-diagnostics = []
+desktop-test-backends = ["dep:jsonschema", "dep:uuid"]
 
 [dependencies]
 anyhow = "1"
@@ -39,17 +51,19 @@ blake3 = "1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
+claude-codex-server = { path = "claudex" }
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "=0.27.7", features = ["http1", "http2", "webpki-roots"] }
 hyper-tls = "=0.6.0"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "tokio"] }
+jsonschema = { version = "0.33", default-features = false, optional = true }
 libc = "0.2"
 native-tls = "=0.2.14"
 rand = "0.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-rustls = { version = "=0.23.36", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
@@ -62,12 +76,114 @@ toml = "0.9"
 toml_edit = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v7"], optional = true }
 webpki-roots = "1"
 
 [dev-dependencies]
 md-5 = "0.10"
 reqwest = "=0.12.28"
 
+[[test]]
+name = "desktop-acp-wire"
+path = "claudex/wire-tests/acp_wire.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-approval-wire"
+path = "claudex/wire-tests/approval_wire.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-auto-wire"
+path = "claudex/wire-tests/auto_wire.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-history-wire"
+path = "claudex/wire-tests/history_wire.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-plugin-runtime"
+path = "claudex/wire-tests/plugin_runtime.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-plugins-wire"
+path = "claudex/wire-tests/plugins_wire.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-reconnect"
+path = "claudex/wire-tests/reconnect.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-router"
+path = "claudex/wire-tests/router.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-ssh-proxy"
+path = "claudex/wire-tests/ssh_proxy.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-steering"
+path = "claudex/wire-tests/steering.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-transports"
+path = "claudex/wire-tests/transports.rs"
+required-features = ["desktop-test-backends"]
+
+[[test]]
+name = "desktop-wire"
+path = "claudex/wire-tests/wire.rs"
+required-features = ["desktop-test-backends"]
+
+[[bin]]
+name = "fake-claude"
+path = "claudex/tests/fixtures/fake_claude.rs"
+required-features = ["desktop-test-backends"]
+
+[[bin]]
+name = "fake-acp"
+path = "claudex/tests/fixtures/fake_acp.rs"
+required-features = ["desktop-test-backends"]
+
+[[bin]]
+name = "fake-reviewer"
+path = "claudex/tests/fixtures/fake_reviewer.rs"
+required-features = ["desktop-test-backends"]
+
+[[bin]]
+name = "fake-codex"
+path = "claudex/tests/fixtures/fake_codex.rs"
+required-features = ["desktop-test-backends"]
+
+[[bin]]
+name = "approval-claude"
+path = "claudex/tests/fixtures/approval_claude.rs"
+required-features = ["desktop-test-backends"]
+
 [profile.release]
 lto = "thin"
 strip = true
+
+# Facade fixtures validate the upstream JSON schemas on every frame.
+[profile.dev.package.jsonschema]
+opt-level = 3
+[profile.dev.package.referencing]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.ahash]
+opt-level = 3

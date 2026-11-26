@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     net::SocketAddr,
+    num::NonZeroU32,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -75,6 +76,8 @@ pub struct ProxyConfig {
     /// Optional native Desktop backend listener. Omitted by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<ListenerConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_desktop: Option<ClaudeDesktopConfig>,
     #[serde(default = "default_upstream")]
     pub upstream: String,
     #[serde(default = "default_switch")]
@@ -129,6 +132,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             desktop: None,
+            claude_desktop: None,
             upstream: default_upstream(),
             switch_at: default_switch(),
             max_inflight: default_inflight(),
@@ -158,6 +162,56 @@ impl Default for ProxyConfig {
 pub struct ListenerConfig {
     pub address: SocketAddr,
     pub pool: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeDesktopConfig {
+    pub address: SocketAddr,
+    pub api_key: String,
+    pub mlx_serve: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlx_response_timeout_seconds: Option<NonZeroU32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<ClaudeDesktopCodexConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub acp: BTreeMap<String, ClaudeDesktopAcpConfig>,
+}
+
+impl ClaudeDesktopConfig {
+    pub fn mlx_response_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.mlx_response_timeout_seconds
+                .map_or(300, |value| value.get())
+                .into(),
+        )
+    }
+}
+
+pub const CLAUDE_DESKTOP_CODEX_PREFIX: &str = "claude-sonnet-gpt-";
+pub const CLAUDE_DESKTOP_ACP_PREFIX: &str = "claude-sonnet-acp-";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeDesktopCodexConfig {
+    pub pool: String,
+    /// Claude-visible aliases mapped to models available to this Codex pool.
+    pub models: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeDesktopAcpConfig {
+    pub executable: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// PATH for this agent and its tools. An unset value inherits the relay's PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -470,6 +524,97 @@ impl Config {
                 }
             }
         }
+        if let Some(desktop) = &self.proxy.claude_desktop {
+            if !desktop.address.ip().is_loopback() || desktop.address.port() == 0 {
+                bail!("proxy.claude_desktop.address must use loopback and a nonzero port");
+            }
+            if desktop.api_key.len() < 32
+                || !desktop.api_key.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                bail!("proxy.claude_desktop.api_key must be at least 32 visible ASCII characters");
+            }
+            let addresses = self
+                .listeners
+                .values()
+                .map(|listener| listener.address)
+                .chain(self.proxy.desktop.iter().map(|listener| listener.address));
+            if addresses
+                .clone()
+                .any(|address| addresses_conflict(address, desktop.address))
+            {
+                bail!("proxy.claude_desktop.address conflicts with another listener");
+            }
+            if let Some(upstream) = desktop.mlx_serve {
+                if !upstream.ip().is_loopback() || upstream.port() == 0 {
+                    bail!("proxy.claude_desktop.mlx_serve must use loopback and a nonzero port");
+                }
+                if addresses_conflict(desktop.address, upstream)
+                    || addresses
+                        .clone()
+                        .any(|address| addresses_conflict(address, upstream))
+                {
+                    bail!("proxy.claude_desktop.mlx_serve points to a Comradex listener");
+                }
+            }
+            if let Some(codex) = &desktop.codex {
+                let pool = self
+                    .pools
+                    .get(&codex.pool)
+                    .context("proxy.claude_desktop.codex references a missing pool")?;
+                if pool.members.is_empty()
+                    || pool.members.iter().any(|member| {
+                        !matches!(
+                            self.accounts.get(member),
+                            Some(AccountConfig::CodexHome { .. })
+                        )
+                    })
+                {
+                    bail!(
+                        "proxy.claude_desktop.codex pool must contain only managed Codex accounts"
+                    );
+                }
+                if codex.models.is_empty()
+                    || codex.models.iter().any(|(alias, model)| {
+                        !valid_desktop_alias(alias, CLAUDE_DESKTOP_CODEX_PREFIX)
+                            || model.trim().is_empty()
+                            || model.len() > 512
+                    })
+                {
+                    bail!(
+                        "proxy.claude_desktop.codex.models requires {CLAUDE_DESKTOP_CODEX_PREFIX}… aliases and valid model IDs"
+                    );
+                }
+            }
+            for (alias, agent) in &desktop.acp {
+                if !valid_desktop_alias(alias, CLAUDE_DESKTOP_ACP_PREFIX) {
+                    bail!("proxy.claude_desktop.acp requires {CLAUDE_DESKTOP_ACP_PREFIX}… aliases");
+                }
+                if !agent.executable.is_absolute() || !agent.cwd.is_absolute() {
+                    bail!(
+                        "Claude Desktop ACP agent {alias} requires absolute executable and cwd paths"
+                    );
+                }
+                if let Some(path) = &agent.path
+                    && (path.contains('\0')
+                        || std::env::split_paths(path).any(|dir| !dir.is_absolute()))
+                {
+                    bail!("Claude Desktop ACP agent {alias} requires absolute directories in path");
+                }
+                if agent.display_name.trim().is_empty()
+                    || agent
+                        .model
+                        .as_ref()
+                        .is_some_and(|model| model.trim().is_empty() || model.len() > 512)
+                {
+                    bail!(
+                        "Claude Desktop ACP agent {alias} requires a display name and a valid optional model ID"
+                    );
+                }
+            }
+            if desktop.mlx_serve.is_none() && desktop.codex.is_none() && desktop.acp.is_empty() {
+                bail!("proxy.claude_desktop requires mlx_serve, codex, or acp");
+            }
+        }
         Ok(())
     }
 
@@ -484,6 +629,21 @@ impl Config {
             .and_then(|member| self.accounts.get(member))
             .is_some_and(AccountConfig::is_claude)
     }
+}
+
+fn valid_desktop_alias(alias: &str, prefix: &str) -> bool {
+    alias.len() <= 128
+        && alias.strip_prefix(prefix).is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        })
+}
+
+fn addresses_conflict(left: SocketAddr, right: SocketAddr) -> bool {
+    left.port() == right.port()
+        && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
 }
 
 /// Atomically replace a configuration file only after the full loader accepts the candidate.
@@ -555,6 +715,48 @@ members = ["caller"]
 kind = "inbound"
 "#
         )
+    }
+
+    #[test]
+    fn claude_desktop_codex_requires_an_opt_in_pool_of_managed_accounts() {
+        let mut config: Config = toml::from_str(&config_text(None)).unwrap();
+        assert!(config.proxy.claude_desktop.is_none());
+        config.proxy.claude_desktop = Some(
+            toml::from_str(
+                r#"
+            address = "127.0.0.1:10550"
+            api_key = "fixture-secret-for-claude-desktop-only"
+            [codex]
+            pool = "default"
+            [codex.models]
+            claude-sonnet-gpt-example = "gpt-example"
+        "#,
+            )
+            .unwrap(),
+        );
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("managed Codex accounts")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        config.accounts.insert(
+            "caller".into(),
+            AccountConfig::CodexHome {
+                path: directory.path().join("codex"),
+            },
+        );
+        assert!(config.validate().is_ok());
+        config.proxy.claude_desktop.as_mut().unwrap().address = "127.0.0.1:10100".parse().unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts")
+        );
     }
 
     #[test]

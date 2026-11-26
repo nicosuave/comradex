@@ -33,7 +33,11 @@ pub fn add_hook(settings: &mut Value, executable: &Path) -> Result<()> {
         .as_array_mut()
         .context("invalid SessionStart hooks")?;
     // SSH performs its own token expansion and shell parsing of ProxyCommand.
-    let proxy = format!("{} sandbox-proxy-connect %h %p", quote(executable));
+    let proxy = format!(
+        "{} {} sandbox-proxy-connect %h %p",
+        quote(executable),
+        crate::cli::DESKTOP_COMMAND,
+    );
     let command = format!(
         "ssh -o ControlMaster=no -o ControlPath=none -o {}",
         quote(&format!("ProxyCommand={proxy}"))

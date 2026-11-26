@@ -221,6 +221,7 @@ impl AcpBackend {
         for key in FACADE_ENVIRONMENT {
             command.env_remove(key);
         }
+        command.env_remove("COMRADEX_SERVICE_NONCE");
         if let Some(environment) = options.native_settings["env"].as_object() {
             for (key, value) in environment {
                 if let Some(value) = value.as_str() {
@@ -1005,13 +1006,14 @@ impl Driver {
                 };
                 let interrupted = self.cancelled || stop == "cancelled";
                 self.cancelled = false;
-                self.emit(result_frame(
+                let mut result = result_frame(
                     interrupted,
                     error.as_deref(),
                     Some(&response["usage"]),
                     self.context_window,
-                ))
-                .await?;
+                );
+                result["acp_stop_reason"] = json!(stop);
+                self.emit(result).await?;
             }
             Err(error) => {
                 self.queue.clear();
@@ -1401,7 +1403,7 @@ impl Bridge {
     fn server_entry(&self) -> Result<Value> {
         let executable = std::env::current_exe().context("locating facade executable")?;
         Ok(json!({"name":DESKTOP_SERVER,"command":executable,
-            "args":["mcp-bridge","--socket",self.socket],"env":[]}))
+            "args":[crate::cli::DESKTOP_COMMAND,"mcp-bridge","--socket",self.socket],"env":[]}))
     }
 }
 

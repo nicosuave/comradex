@@ -117,6 +117,7 @@ impl LocalAcp {
         };
         let mut command = Command::new(binary);
         command
+            .arg(crate::cli::DESKTOP_COMMAND)
             .arg("app-server")
             .arg("--listen")
             .arg(format!("unix://{}", Self::socket(&root).display()))

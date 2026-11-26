@@ -761,6 +761,9 @@ fn run_prompt(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(pid_file) = args.iter().find_map(|arg| arg.strip_prefix("--pid-file=")) {
+        std::fs::write(pid_file, std::process::id().to_string()).unwrap();
+    }
     let store = args
         .iter()
         .find_map(|arg| arg.strip_prefix("--store="))

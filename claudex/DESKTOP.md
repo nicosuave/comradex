@@ -1,7 +1,6 @@
 # Codex desktop through a dedicated localhost SSH connection
 
-The macOS installer copies the facade to a stable per-user location and creates a
-login-session LaunchAgent, a dedicated localhost SSH identity, and the
+The macOS installer creates a launcher for Comradex, a login-session LaunchAgent, a dedicated localhost SSH identity, and the
 `claude-codex-local` SSH alias. Claude runs in the GUI login session, where its
 normal authentication is available. SSH transports the desktop connection.
 
@@ -15,28 +14,28 @@ enable Remote Login or change system settings. Run these commands as your normal
 login user, without `sudo`:
 
 ```sh
-brew install nicosuave/tap/claudex
-claudex install
+brew install nicosuave/tap/comradex
+comradex desktop install
 ```
 
 Homebrew installs the signed, notarized release binary; Rust is not required.
-`claudex install` sets up the desktop service and connection and checks readiness.
-For optional diagnostics afterward, run `claudex doctor`; it does not install or
+`comradex desktop install` sets up the desktop service and connection and checks readiness.
+For optional diagnostics afterward, run `comradex desktop doctor`; it does not install or
 upgrade anything.
 You can also unpack the matching archive from
-[GitHub Releases](https://github.com/nicosuave/claudex/releases), verify its
-`.sha256` checksum, and run `./claudex install`.
+[GitHub Releases](https://github.com/nicosuave/comradex/releases), verify its
+`.sha256` checksum, and run `./comradex desktop install`.
 
 To build from source instead, install Rust with edition 2024 support and run:
 
 ```sh
-cargo build --locked --release --bin claude-codex-server
-./target/release/claude-codex-server install
+cargo build --locked --release --bin comradex
+./target/release/comradex desktop install
 ```
 
 Use `mbx build` in place of `cargo build` when Boxington is installed.
-After installation, the checkout can move: the installed binary lives at
-`~/Library/Application Support/claude-codex/bin/claude-codex-server`.
+For a source installation, place the executable at a stable path before running
+the installer. The service launcher uses that path.
 
 The installer resolves `claude` and genuine `codex` from PATH, with a fallback to
 `/Applications/Codex.app/Contents/Resources/codex` for Codex. Use `--claude
@@ -59,7 +58,7 @@ connection: Claude models appear in the same model picker and Claude chats in
 the same sidebar. The desktop app is not modified. It honors `CODEX_CLI_PATH`
 for its local Codex CLI, and the installer writes a stand-in at
 `~/Library/Application Support/claude-codex/router/codex`. Use
-`claudex install --no-ssh` if you don't want the SSH connection; Remote Login is
+`comradex desktop install --no-ssh` if you don't want the SSH connection; Remote Login is
 then not required.
 
 Install sets `CODEX_CLI_PATH` to the stand-in for your login session with
@@ -68,7 +67,7 @@ again at each login. The desktop then uses the stand-in however it is opened:
 Dock, Spotlight, login item, or its own relaunch after an update. A desktop that
 was already running keeps its old environment, so quit and reopen it once after
 the first install. The Codex CLI doesn't read the variable, so terminals that
-inherit it are unaffected. `claudex uninstall` removes the LaunchAgent and the
+inherit it are unaffected. `comradex desktop uninstall` removes the LaunchAgent and the
 variable. ACP instances don't set it; launch the desktop with their stand-in
 explicitly:
 
@@ -78,7 +77,7 @@ open -a ChatGPT --env CODEX_CLI_PATH="$HOME/Library/Application Support/claude-c
 
 The stand-in runs the Codex CLI bundled with the desktop app,
 unchanged, for every command except the desktop's own app-server launch. That
-launch gets a router (`claudex route`) which:
+launch gets a router (`comradex desktop route`) which:
 
 - sends everything to genuine Codex, with your normal `~/.codex` home and login,
   except Claude models and Claude chats, which go to the Claude service;
@@ -113,15 +112,16 @@ With the local Claudex router already installed, sign in to the agent in its
 own CLI and run:
 
 ```sh
-claudex local-acp --acp-agent agy --acp-arg=acp \
+comradex desktop local-acp --acp-agent agy --acp-arg=acp \
   --provider-name Antigravity --model gemini-4-argon \
   --include-model gemini-4-neon --include-model gemini-4-hydrogen \
   --include-model gemini-pro-orchestrator-neon \
   --include-model gemini-pro-orchestrator-g1-pro
 ```
 
-This updates the installed Claudex binary and restarts the existing login
-service. That service supervises the ACP facade on a private local Unix socket.
+This points the installed facade launcher at `comradex` and restarts the
+existing login service. That service supervises the ACP facade on a private
+local Unix socket.
 The command uses the existing desktop launcher and needs neither SSH nor another
 LaunchAgent. The ACP provider has its own saved threads.
 
@@ -132,7 +132,7 @@ the combined picker, and existing chats keep their backend. The picker exposes
 the models selected through `--model` and repeated `--include-model` arguments
 when the agent advertises them in its ACP catalog. Use ACP model identifiers.
 
-To change the selection, rerun `claudex local-acp` with the desired models. To
+To change the selection, rerun `comradex desktop local-acp` with the desired models. To
 disable local ACP, remove the installer's `local-acp.json` from
 `~/Library/Application Support/claude-codex`, restart the idle service, and reopen
 Codex Desktop. The ACP chat store remains under `state/local-acp`.
@@ -142,11 +142,11 @@ Codex Desktop. The ACP chat store remains under `state/local-acp`.
 With the local Claudex router already installed and MLX-Serve running:
 
 ```sh
-claudex mlx
+comradex desktop mlx
 # A different MLX-Serve endpoint:
-claudex mlx --url http://127.0.0.1:11234/v1
+comradex desktop mlx --url http://127.0.0.1:11234/v1
 # A generic Responses-compatible server (context is a fallback when not advertised):
-claudex local-provider --url http://server:8080/v1 --name vLLM \
+comradex desktop local-provider --url http://server:8080/v1 --name vLLM \
   --model local/qwen --context-window 32768
 ```
 
@@ -187,7 +187,7 @@ messages, start a new chat to switch between self-hosted and another provider.
 
 ### Connect from another computer
 
-On the remote Mac, run `claudex install`, then reconnect that Mac's
+On the remote Mac, run `comradex desktop install`, then reconnect that Mac's
 existing SSH connection in the client desktop. This enables the combined
 Codex/Claude model picker over ordinary desktop SSH, using your existing SSH
 authentication and normal Codex home. Local desktop routing alone does not
@@ -199,7 +199,7 @@ login-shell payload, preserves an existing `CODEX_INSTALL_DIR` override, and
 skips the ordinary Codex daemon bootstrap. `codex app-server proxy` then opens
 a stdio router connection to genuine Codex and the running Claude service.
 Ordinary SSH shells and CLI commands keep their existing behavior. Remote routing
-is included by default; `claudex uninstall` removes the managed shell block.
+is included by default; `comradex desktop uninstall` removes the managed shell block.
 Remote installation currently supports zsh and bash login shells.
 
 Use **Workspace write** and **Approve for me** for native Claude auto review.
@@ -285,22 +285,19 @@ recover one action; explicit deny rules and managed restrictions still apply.
 An [ACP](https://agentclientprotocol.com) agent installs as a separate connection, next to the Claude one. Sign in with the agent's own CLI first:
 
 ```sh
-claudex install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
+comradex desktop install --acp-agent opencode --acp-arg=acp --provider-name OpenCode
 ```
 
 This creates `~/Library/Application Support/claude-codex-<provider-id>`, LaunchAgent `com.claude-codex.desktop.<provider-id>` and SSH host `claude-codex-<provider-id>` (here `claude-codex-opencode`), each independent of the Claude installation. Pass the same `--acp-agent` (or `--provider-id`) to `doctor`, `service` and `uninstall` to select that instance. `--provider-id` defaults to the executable name. Use `--initialize-timeout-seconds` for agents that start slowly. Automatic review for the agent uses the installed, signed-in Claude Code CLI as its reviewer; without it, every automatically reviewed request is denied (fail closed) and can be approved from the desktop.
 
 ## Manage the service
 
-Use the installed executable after moving or removing the build checkout:
-
 ```sh
-facade="$HOME/Library/Application Support/claude-codex/bin/claude-codex-server"
-"$facade" doctor
-"$facade" service status
-"$facade" service stop
-"$facade" service start
-"$facade" service restart
+comradex desktop doctor
+comradex desktop service status
+comradex desktop service stop
+comradex desktop service start
+comradex desktop service restart
 ```
 
 `doctor` checks native executable compatibility, the private WebSocket handshake,
@@ -312,33 +309,24 @@ The service label is `com.claude-codex.desktop`; logs are in
 Native Claude authentication can differ between the macOS login security session
 and a separate service security session. New installations use the login session;
 upgrades preserve the existing service's choice. To change it, run
-`claudex install --auth-session login` or `claudex install --auth-session isolated`.
+`comradex desktop install --auth-session login` or `comradex desktop install --auth-session isolated`.
 The choice is saved for later reinstalls and shown by `service status`. This does
 not copy credentials or change Claude's login. If a native request works in your
 terminal but the service reports expired OAuth, try the other session and retry
 the chat. `doctor` checks native auth status in its caller's context; it does not
 prove that a service model request can authenticate.
 
-To upgrade, run `brew upgrade nicosuave/tap/claudex`, then `claudex install`.
-Homebrew updates the command-line tool; the second command refreshes the separate
-stable binary used by the desktop service. Both steps are currently required.
-For a source installation, build the new source and run its `install` command again. The
-installer copies the binary and refreshes the service, preserving conversation
-state, the dedicated identity, and unrelated SSH entries. Wait for active chats
-to finish first. Stop, restart, and uninstall refuse active saved turns unless
-you explicitly pass `--force`; forcing interrupts those turns. SSH transport
-reconnection preserves live turns, but restarting the facade process does not.
+Stop, restart, and uninstall refuse active saved turns unless you explicitly
+pass `--force`. Restarting the facade interrupts its active turns.
 
 ```sh
-"$facade" service uninstall  # Remove only the service LaunchAgent; keep the SSH connection and desktop routing.
-"$facade" uninstall          # Also remove managed SSH entries and desktop launch routing.
+comradex desktop service uninstall  # Remove only the service LaunchAgent; keep the SSH connection and desktop routing.
+comradex desktop uninstall          # Also remove managed SSH entries and desktop launch routing.
 ```
 
 Both retain conversations, binaries, logs, and identity files. Full uninstall
 removes only the exact dedicated key authorization, not other authorized keys.
-Existing SSH config symlinks and file permissions are preserved. Legacy shell
-entry points delegate to the native installer/service manager; preparation-only
-mode is no longer available.
+Existing SSH config symlinks and file permissions are preserved.
 
 ## Installation boundary
 
@@ -385,7 +373,7 @@ checks and opt-in live model probes cover separate parts of the integration.
 These optional probes make real Claude model requests and archive their test chats:
 
 ```sh
-mbx build --locked --example desktop_smoke --example reconnect_smoke
+mbx build --locked -p claude-codex-server --example desktop_smoke --example reconnect_smoke
 ./target/debug/examples/desktop_smoke claude-codex-local opus
 ./target/debug/examples/reconnect_smoke claude-codex-local opus
 ```

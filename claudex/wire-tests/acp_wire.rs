@@ -1,4 +1,4 @@
-#![cfg(feature = "test-backend")]
+#![cfg(feature = "desktop-test-backends")]
 //! The Codex app-server surface driven by an ACP agent. The fake agent checks
 //! every frame the facade sends against the ACP schema; these tests check every
 //! frame the facade sends to Codex against the Codex schema.
@@ -119,7 +119,8 @@ impl Client {
         env: &[(&str, &Path)],
     ) -> Self {
         schemas();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_comradex"));
+        command.arg("desktop");
         command
             .args([
                 "app-server",
@@ -936,7 +937,8 @@ async fn desktop_tools_reach_the_agent_through_the_mcp_bridge() {
 #[tokio::test]
 async fn codex_connector_tools_are_discoverable_in_new_and_resumed_acp_sessions() {
     let state = tempfile::tempdir().unwrap();
-    let codex = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin_runtime.sh");
+    let codex =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("claudex/tests/fixtures/plugin_runtime.sh");
     let mut client = Client::spawn_with_env(
         state.path(),
         &[],

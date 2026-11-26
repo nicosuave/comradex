@@ -22,7 +22,7 @@ if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "$tag^{commit}")" ]]; then
   echo "HEAD must be the commit tagged $tag" >&2
   exit 1
 fi
-if ! git diff --quiet HEAD -- Cargo.toml Cargo.lock src macos scripts; then
+if ! git diff --quiet HEAD -- Cargo.toml Cargo.lock src claudex macos scripts; then
   echo "Refusing to release with uncommitted macOS source changes" >&2
   exit 1
 fi
@@ -50,7 +50,11 @@ build_package_notarize() {
   local artifact="comradex-${version}-macos-${arch}.tar.gz"
   local notary_zip="$artifacts/comradex-${version}-macos-${arch}-notarization.zip"
 
-  cargo build --locked --release --target "$target"
+  if command -v mbx >/dev/null 2>&1; then
+    mbx build --locked --release --bin comradex --target "$target"
+  else
+    cargo build --locked --release --bin comradex --target "$target"
+  fi
   codesign --force --options runtime --timestamp \
     --sign "$identity" \
     --identifier com.nicosuave.comradex \
@@ -62,7 +66,7 @@ build_package_notarize() {
     --keychain-profile "$notary_profile" \
     --wait
 
-  tar -C "$(dirname "$executable")" -czf "$artifacts/$artifact" comradex
+  bash scripts/package-archive.sh "$executable" "$artifacts/$artifact"
   (cd "$artifacts" && shasum -a 256 "$artifact" > "$artifact.sha256")
   rm -f "$notary_zip"
 }

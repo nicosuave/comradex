@@ -18,6 +18,7 @@ struct Client {
 impl Client {
     async fn start(binary: &Path, state: &Path, cwd: &Path) -> Result<Self> {
         let mut child = Command::new(binary)
+            .arg("desktop")
             .arg("--state-dir")
             .arg(state)
             .arg("--claude-arg=--safe-mode")

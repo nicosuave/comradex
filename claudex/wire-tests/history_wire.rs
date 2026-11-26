@@ -1,4 +1,4 @@
-#![cfg(feature = "test-backend")]
+#![cfg(feature = "desktop-test-backends")]
 
 use serde_json::{Value, json};
 use std::{path::Path, process::Stdio, time::Duration};
@@ -26,7 +26,8 @@ impl Peer {
     }
 
     async fn open_backend(state: &Path, backend: &str, extra: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_claude-codex-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_comradex"))
+            .arg("desktop")
             .args(["app-server", "--stdio", "--claude", backend])
             .args(extra)
             .arg("--state-dir")
